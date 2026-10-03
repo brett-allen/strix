@@ -1,7 +1,7 @@
 # Strix Storage Format
 
-**Version:** 0.4.3  
-**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1)  
+**Version:** 0.4.5  
+**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1); heap row payload (E2); index catalog payload **v2** + index key tags (E5)  
 **Companion:** [`storage-engine.md`](storage-engine.md), [`btrees.md`](btrees.md), [`sql-execute.md`](sql-execute.md)
 
 Strix uses a **native** single-file, page-oriented format. It is **not** SQLite-compatible.
@@ -156,7 +156,7 @@ Names are case-sensitive. Keys sort with all `index:` entries before `table:` (`
 
 All multi-byte integers are **little-endian**.
 
-#### Index rows (v1 — unchanged)
+#### Index rows v1 (legacy)
 
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|
@@ -166,7 +166,27 @@ All multi-byte integers are **little-endian**.
 | 6 | 2 | `parent_name_len` | Byte length of parent table name |
 | 8 | `parent_name_len` | `parent_table` | UTF-8 table name |
 
-Index rows are `8 + parent_name_len`. Index column lists wait until execute phase E5.
+Legacy index rows are `8 + parent_name_len` (no column list). Readers still accept v1. SQL `CREATE INDEX` (E5) writes **v2**. Indexes without column metadata cannot be maintained by UPDATE/DELETE/INSERT — the executor rejects those mutations with `Has_Indexes`.
+
+#### Index rows v2 (current — E5)
+
+| Offset | Size | Field | Notes |
+|--------|------|-------|-------|
+| 0 | 1 | `version` | `2` |
+| 1 | 1 | `kind` | `2` = index |
+| 2 | 4 | `root_page` | Index btree root |
+| 6 | 2 | `parent_name_len` | Byte length of parent table name |
+| 8 | `parent_name_len` | `parent_table` | UTF-8 table name |
+| 8+N | 2 | `col_count` | Number of indexed columns |
+| … | … | `columns[]` | Repeated `col_count` times (below) |
+
+Each index column record:
+
+| Field | Size | Notes |
+|-------|------|-------|
+| `name_len` | u16 LE | |
+| `name` | `name_len` | UTF-8 column name (must exist on parent table) |
+| `flags` | u8 | bit0 = `DESC` (catalog only; key bytes are always ASC-encoded for v1 keys) |
 
 #### Table rows v1 (legacy)
 
@@ -185,7 +205,7 @@ Legacy **6-byte** table rows (roots only). Readers still accept v1; new `CREATE 
 | 0 | 1 | `version` | `2` |
 | 1 | 1 | `kind` | `1` = table |
 | 2 | 4 | `root_page` | Heap btree root |
-| 6 | 8 | `next_rowid` | High-water for implicit / `INTEGER PRIMARY KEY` rowid allocation; starts at `1` |
+| 6 | 8 | `next_rowid` | High-water for implicit / IPK (`INTEGER` or `INT PRIMARY KEY`) rowid allocation; starts at `1` |
 | 14 | 2 | `col_count` | Number of columns |
 | 16 | … | `columns[]` | Repeated `col_count` times (see below) |
 
@@ -197,21 +217,69 @@ Each column record:
 | `name` | `name_len` | UTF-8 column name |
 | `type_name_len` | u16 | `0` if type omitted |
 | `type_name` | `type_name_len` | UTF-8 type name string (affinity later) |
-| `flags` | u8 | bit0 = `NOT NULL`, bit1 = `PRIMARY KEY` |
+| `flags` | u8 | bit0 = `NOT NULL`, bit1 = `PRIMARY KEY`, bit2 = `Has_Default` |
+| `default` | … | Present only when `Has_Default` is set (see below) |
 
-Empty tables (engine register with no schema) use `col_count = 0` and still store `next_rowid`. Root updates rewrite the same version/size in place.
+Default payload (when `Has_Default`):
+
+| Field | Size | Notes |
+|-------|------|-------|
+| `default_kind` | u8 | `1`=NULL, `2`=integer, `3`=float, `4`=text, `5`=blob |
+| payload | … | NULL: empty; integer: i64 LE; float: f64 LE; text/blob: u32 LE length + bytes |
+
+Columns without `Has_Default` omit the default trailer (same layout as E1 v2 columns). Empty tables (engine register with no schema) use `col_count = 0` and still store `next_rowid`. Root / `next_rowid` updates rewrite the same version/size in place.
 
 ### User table data btree
 
 - **Key:** 8-byte **big-endian** `rowid` (`u64`) for memcmp numeric order.
-- **Payload:** opaque row bytes (engine-defined until SQL layer).
+- **Payload:** heap row record (below).
+
+### Heap row payload (E2)
+
+Leaf payloads for user tables are encoded by `src/exec` (`encode_heap_row` / `decode_heap_row`). All multi-byte integers in the payload are **little-endian**.
+
+```text
+version u8 | col_count u16 | null_bitmap | concatenated field encodings
+```
+
+| Field | Size | Notes |
+|-------|------|-------|
+| `version` | u8 | `1` |
+| `col_count` | u16 LE | Number of columns (matches catalog order) |
+| `null_bitmap` | `ceil(col_count / 8)` bytes | Bit `i` set ⇒ column `i` is NULL |
+| fields | … | One encoding per **non-NULL** column, in column index order |
+
+Non-NULL field encoding:
+
+| `tag` (u8) | Payload |
+|------------|---------|
+| `1` Integer | i64 LE |
+| `2` Float | f64 LE |
+| `3` Text | u32 LE byte length + UTF-8 bytes |
+| `4` Blob | u32 LE byte length + bytes |
+
+NULL columns appear only in the null bitmap (no tag/payload). A sole `INTEGER` or `INT PRIMARY KEY` column (IPK) aliases the btree rowid key; the column value is still stored in the payload when present. Composite / non-integer PRIMARY KEY shapes are rejected by the executor until UNIQUE enforcement exists.
 
 ### Secondary index btree
 
 - **Key:** `index_key_bytes` || **8-byte BE rowid** (composite unique key).
 - **Payload:** empty in v1 (rowid is in the key suffix).
 
-Registration and opens go through `engine` catalog APIs (`catalog_register_*`, `catalog_open_*`).
+Registration and opens go through `engine` catalog APIs (`catalog_register_*`, `catalog_open_*`, `catalog_unregister_index`).
+
+#### Secondary index key bytes (E5)
+
+`index_key_bytes` is the concatenation of one tagged field per indexed column (ASC encoding; `DESC` is catalog metadata only):
+
+| Tag (u8) | Payload |
+|----------|---------|
+| `0` NULL | (none) |
+| `1` Integer | u64 BE of `i64` bits with high bit flipped (signed memcmp order) |
+| `2` Float | u64 BE of IEEE-754 bits |
+| `3` Text | u32 BE length + UTF-8 bytes + `0x00` |
+| `4` Blob | u32 BE length + bytes + `0x00` |
+
+Executor helpers: `encode_index_key` / `index_insert_entry` / `index_delete_entry` / `index_collect_rowids`.
 
 ### Root ownership rule (mandatory)
 
@@ -273,3 +341,5 @@ Rollback (no durability, and only when not fenced): `paging.discard_dirty` drops
 | 0.4.1 | 2026-10-03 | Root write-through; schema_cookie txn semantics; flush_failed fence |
 | 0.4.2 | 2026-10-03 | Mandatory root ownership (`Caller_Root` / catalog bind / `.Unbound_Root`) |
 | 0.4.3 | 2026-10-03 | Table catalog payload v2 (`columns[]` + `next_rowid`); index rows remain v1 |
+| 0.4.4 | 2026-10-03 | Heap row payload v1; optional column `Has_Default` trailer on catalog v2 |
+| 0.4.5 | 2026-10-03 | Index catalog payload v2 (`columns[]` + DESC flag); index key byte tags (E5) |

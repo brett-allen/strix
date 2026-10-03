@@ -2,9 +2,11 @@ package cli_tests
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import cli "../../cli"
 import engine "../../engine"
+import exec "../../exec"
 
 @(test)
 test_parse_sql_command_args_variants :: proc(t: ^testing.T) {
@@ -53,6 +55,12 @@ test_parse_sql_command_args_variants :: proc(t: ^testing.T) {
 	testing.expect(t, i.ok)
 	testing.expect_value(t, i.input, cli.Sql_Input_Kind.Command)
 	testing.expect_value(t, i.sql_or_file, "DROP TABLE t;")
+
+	j := cli.parse_sql_command_args([]string{"--continue-on-error", "demo", "script.sql"})
+	testing.expect(t, j.ok)
+	testing.expect(t, j.continue_on_error)
+	testing.expect_value(t, j.db_path, "demo")
+	testing.expect_value(t, j.input, cli.Sql_Input_Kind.File)
 }
 
 @(test)
@@ -92,7 +100,121 @@ test_run_sql_open_failure_and_exec_failure :: proc(t: ^testing.T) {
 	path := fmt.tprintf("/tmp/strix-e1-cli-bad-%d.strix", os.get_pid())
 	defer os.remove(path)
 	testing.expect_value(t, cli.init_database(path), 0)
+	// Unknown table still fails
 	testing.expect(t, cli.run_sql(path, "INSERT INTO t VALUES (1);") != 0)
+	// Unsupported ALTER still fails
+	testing.expect_value(t, cli.run_sql(path, "CREATE TABLE t (a INT);"), 0)
+	testing.expect(t, cli.run_sql(path, "ALTER TABLE t ADD COLUMN b INT;") != 0)
+}
+
+@(test)
+test_run_sql_update_delete_rows_affected :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-e4-cli-ud-%d.strix", os.get_pid())
+	defer os.remove(path)
+
+	testing.expect_value(t, cli.init_database(path), 0)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);"),
+		0,
+	)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "INSERT INTO t (n) VALUES ('a'), ('b'), ('c');"),
+		0,
+	)
+	testing.expect_value(t, cli.run_sql(path, "UPDATE t SET n = 'B' WHERE id = 2;"), 0)
+	testing.expect_value(t, cli.run_sql(path, "DELETE FROM t WHERE id = 3;"), 0)
+
+	session, err := exec.session_open(path)
+	testing.expect(t, !exec.has_error(err))
+	defer exec.free_error(err)
+	defer exec.session_close(&session)
+	r, eerr := exec.exec_statement(&session, "SELECT id, n FROM t ORDER BY id;")
+	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+	testing.expect_value(t, len(r.rows), 2)
+	testing.expect_value(t, r.rows[0][1], "a")
+	testing.expect_value(t, r.rows[1][1], "B")
+	exec.free_error(eerr)
+	exec.free_result(r)
+}
+
+@(test)
+test_run_sql_select_prints_result_set :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-e3-cli-select-%d.strix", os.get_pid())
+	defer os.remove(path)
+
+	testing.expect_value(t, cli.init_database(path), 0)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);"),
+		0,
+	)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "INSERT INTO t (name) VALUES ('a'), ('b');"),
+		0,
+	)
+	testing.expect_value(t, cli.run_sql(path, "SELECT id, name FROM t ORDER BY id;"), 0)
+
+	// Aligned table content (header + rows), not only exit 0
+	session, err := exec.session_open(path)
+	testing.expect(t, !exec.has_error(err))
+	defer exec.free_error(err)
+	defer exec.session_close(&session)
+	r, eerr := exec.exec_statement(&session, "SELECT id, name FROM t ORDER BY id;")
+	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+	testing.expect_value(t, r.kind, exec.Result_Kind.Result_Set)
+	text := cli.format_result_set(r)
+	defer delete(text)
+	testing.expect(t, strings.contains(text, "id"))
+	testing.expect(t, strings.contains(text, "name"))
+	testing.expect(t, strings.contains(text, "1"))
+	testing.expect(t, strings.contains(text, "a"))
+	testing.expect(t, strings.contains(text, "2"))
+	testing.expect(t, strings.contains(text, "b"))
+	exec.free_error(eerr)
+	exec.free_result(r)
+}
+
+@(test)
+test_run_sql_create_insert_survives_reopen :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-e2-cli-insert-%d.strix", os.get_pid())
+	defer os.remove(path)
+
+	testing.expect_value(t, cli.init_database(path), 0)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);"),
+		0,
+	)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "INSERT INTO items (name) VALUES ('a'), ('b');"),
+		0,
+	)
+
+	e, err := engine.engine_open(path)
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+
+	entry, gerr := engine.catalog_get_table_entry(&e, "items")
+	testing.expect(t, engine.ok(gerr))
+	testing.expect_value(t, entry.next_rowid, u64(3))
+	engine.free_catalog_entry(entry)
+
+	tree, oerr := engine.catalog_open_table(&e, "items")
+	testing.expect(t, engine.ok(oerr))
+	payload, perr := engine.table_get_row(&tree, 2)
+	testing.expect(t, engine.ok(perr))
+	defer delete(payload)
+
+	vals, derr := exec.decode_heap_row(payload)
+	testing.expectf(t, !exec.has_error(derr), "%s", derr.message)
+	defer exec.free_error(derr)
+	defer exec.free_values(vals)
+	testing.expect_value(t, vals[0].i, i64(2))
+	testing.expect_value(t, string(vals[1].bytes), "b")
 }
 
 @(test)

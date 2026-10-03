@@ -40,6 +40,12 @@ print_statement :: proc(stmt: Statement, allocator := context.allocator) -> stri
 		return print_update(stmt.data.(Update_Stmt), allocator)
 	case .Delete:
 		return print_delete(stmt.data.(Delete_Stmt), allocator)
+	case .Begin:
+		return strings.clone("BEGIN", allocator)
+	case .Commit:
+		return strings.clone("COMMIT", allocator)
+	case .Rollback:
+		return strings.clone("ROLLBACK", allocator)
 	}
 	return "(unknown statement)"
 }

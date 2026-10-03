@@ -280,7 +280,7 @@ Freeze details in `docs/storage-format.md` during S0.
 
 Superseded by **[`docs/sql-execute.md`](sql-execute.md)** (bind + execute on `feature/sql-execute`).
 
-- [ ] See execute plan phases E1–E4 (CREATE/DROP → INSERT → SELECT → UPDATE/DELETE + CLI `sql`)
+- [x] See execute plan phases E1–E4 (CREATE/DROP → INSERT → SELECT → UPDATE/DELETE + CLI `sql`) — done in [`sql-execute.md`](sql-execute.md)
 
 ---
 

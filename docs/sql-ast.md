@@ -16,7 +16,7 @@ Semi-stable after Phase 5. Spans are stored on statements and most nodes for dia
 - `Script` → `[]Statement`
 - `Statement` → tagged `Statement_Kind` + `Statement_Data` union
 
-Kinds: `Create_Table`, `Drop_Table`, `Create_Index`, `Drop_Index`, `Alter_Table`, `Select`, `Insert`, `Update`, `Delete`.
+Kinds: `Create_Table`, `Drop_Table`, `Create_Index`, `Drop_Index`, `Alter_Table`, `Select`, `Insert`, `Update`, `Delete`, `Begin`, `Commit`, `Rollback`.
 
 ## DDL
 

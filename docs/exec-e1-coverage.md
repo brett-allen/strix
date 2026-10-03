@@ -1,6 +1,7 @@
 # E1 Symbol Coverage Inventory
 
 **Phase:** E1 (session + catalog v2 + CREATE/DROP TABLE + CLI `sql`)  
+**E2 follow-on:** [`exec-e2-coverage.md`](exec-e2-coverage.md) (row codec + INSERT).  
 **Method:** Manual inventory (no llvm-cov in toolchain). A symbol counts as covered only if a test asserts a **code and/or durable outcome** on a meaningful branch — not “compiles” or bare `has_error` without classification.
 
 **Coverage ratio:** **36 / 37 = 97.3%** (≥ 80% required)
@@ -59,7 +60,7 @@ Uncovered (1): `cli.print_usage` — help text only; not part of the DDL execute
 | Symbol | File | Tested? | Test name(s) | Branches covered |
 |--------|------|---------|--------------|------------------|
 | `parse_sql_command_args` | cli.odin | yes | `test_parse_sql_command_args_variants` | `-c` / `--command`; path+`-c`; `.sql` file; stdin intent; `-c` missing value |
-| `run_sql` | cli.odin | yes | `test_run_sql_create_drop_via_session_path`, open/exec failure | CREATE durable; DROP; open fail; INSERT unsupported exit≠0 |
+| `run_sql` | cli.odin | yes | `test_run_sql_create_drop_via_session_path`, open/exec failure | CREATE durable; DROP; open fail; unknown-table INSERT / unsupported SELECT exit≠0 |
 | `run_sql_command` | cli.odin | yes | `test_run_sql_command_missing_c_arg`, via `run` sql | parse error exit 1; dispatch to `run_sql` |
 | `read_file_or_stdin` | cli.odin | yes | `test_read_file_or_stdin_file` | file happy; missing file fail (stdin not unit-tested — process-coupled) |
 | `ensure_strix_path` | cli.odin | yes | `test_ensure_strix_path_default_and_suffix` | default; suffix; already `.strix` |
@@ -92,7 +93,8 @@ Uncovered (1): `cli.print_usage` — help text only; not part of the DDL execute
 | session_open vs adopt | yes |
 | session_close owned/adopt/idempotent | yes |
 | format_error / free_error | yes |
-| Unsupported SELECT/INSERT/UPDATE/DELETE/CREATE INDEX/DROP INDEX/ALTER | yes — `Unsupported_Ast` each |
+| Unsupported CREATE INDEX/DROP INDEX/ALTER (SELECT/INSERT/UPDATE/DELETE moved to later phases) | yes — `Unsupported_Ast` each |
+| Unsupported column DEFAULT non-literal | yes — `Unsupported_Ast` (literal DEFAULT accepted in E2) |
 
 ---
 

@@ -38,6 +38,10 @@ test_format_error_with_and_without_span :: proc(t: ^testing.T) {
 	defer delete(f2)
 	testing.expect_value(t, f2, "3:8: boom")
 
+	f3 := exec.format_error(with_span, "demo.sql")
+	defer delete(f3)
+	testing.expect_value(t, f3, "demo.sql:3:8: boom")
+
 	empty := exec.format_error(exec.ok_error())
 	testing.expect_value(t, empty, "")
 }
@@ -80,6 +84,8 @@ test_from_engine_error_mapping :: proc(t: ^testing.T) {
 		{.Io, .Io},
 		{.Invalid_Argument, .Invalid_Schema},
 		{.Corrupt, .Engine},
+		{.In_Txn, .In_Txn},
+		{.No_Txn, .No_Txn},
 	}
 	for c in cases {
 		got := exec.from_engine_error(c.eng)

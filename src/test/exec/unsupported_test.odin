@@ -19,12 +19,9 @@ test_unsupported_statement_kinds :: proc(t: ^testing.T) {
 	exec.free_result(r0)
 
 	cases := []string{
-		"SELECT * FROM t;",
-		"INSERT INTO t VALUES (1);",
-		"UPDATE t SET a = 2;",
-		"DELETE FROM t;",
-		"CREATE INDEX idx ON t (a);",
-		"DROP INDEX idx;",
+		"SELECT DISTINCT a FROM t;",
+		"SELECT * FROM t JOIN t AS u ON t.a = u.a;",
+		"SELECT a FROM t GROUP BY a;",
 		"ALTER TABLE t ADD COLUMN b INT;",
 	}
 	for sql_text in cases {
@@ -48,6 +45,9 @@ test_statement_kind_labels :: proc(t: ^testing.T) {
 	testing.expect_value(t, exec.statement_kind_label(.Insert), "INSERT")
 	testing.expect_value(t, exec.statement_kind_label(.Update), "UPDATE")
 	testing.expect_value(t, exec.statement_kind_label(.Delete), "DELETE")
+	testing.expect_value(t, exec.statement_kind_label(.Begin), "BEGIN")
+	testing.expect_value(t, exec.statement_kind_label(.Commit), "COMMIT")
+	testing.expect_value(t, exec.statement_kind_label(.Rollback), "ROLLBACK")
 }
 
 @(test)

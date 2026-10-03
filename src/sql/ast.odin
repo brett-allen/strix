@@ -24,6 +24,9 @@ Statement_Kind :: enum {
 	Insert,
 	Update,
 	Delete,
+	Begin,
+	Commit,
+	Rollback,
 }
 
 Statement_Data :: union {
@@ -36,7 +39,15 @@ Statement_Data :: union {
 	Insert_Stmt,
 	Update_Stmt,
 	Delete_Stmt,
+	Begin_Stmt,
+	Commit_Stmt,
+	Rollback_Stmt,
 }
+
+// Transaction control (optional TRANSACTION keyword is accepted and discarded).
+Begin_Stmt :: struct {}
+Commit_Stmt :: struct {}
+Rollback_Stmt :: struct {}
 
 // Table body elements in source order (columns and table constraints interleaved).
 Table_Element_Kind :: enum {

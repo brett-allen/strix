@@ -30,10 +30,10 @@ Already landed (do not re-implement):
 | `src/sql` | Parser v1 DoD | `parse_statement` / `parse_script` → AST; no storage imports |
 | `src/engine` | Storage S0–S4 | `engine_create` / `engine_open`, txns, btree, `table_prime`, `table_insert_row` / `table_get_row` |
 | Catalog payload | **v2 tables** / v1 indexes ([`storage-format.md`](storage-format.md)) | Key `table:<name>` / `index:<name>`; table v2 = roots + `columns[]` + `next_rowid` |
-| Heap row payload | Opaque bytes | Engine does not interpret columns today (row codec = E2) |
+| Heap row payload | **E2** | `version \| col_count \| null_bitmap \| fields` — see [`storage-format.md`](storage-format.md) |
 | CLI | `strix init` / `strix sql` | Default path `database.strix`; bare names get `.strix` via `ensure_strix_path` |
 
-**Missing after E1:** row codec + `INSERT`/`SELECT`/`UPDATE`/`DELETE` execution (E2–E4); indexes from SQL (E5).
+**E1–E6 landed** on `feature/sql-execute` (E5–E6 were stretch).
 
 ---
 
@@ -123,9 +123,9 @@ Extend the table payload (keep `kind`, `root_page`; add schema fields):
 | `kind` | `1` = table (unchanged) |
 | `root_page` | Heap btree root |
 | `columns[]` | Ordered: name, type name string (affinity later), not_null, pk flag |
-| `next_rowid` | High-water for `INTEGER PRIMARY KEY` / implicit rowid |
+| `next_rowid` | High-water for IPK (`INTEGER`/`INT PRIMARY KEY`) / implicit rowid |
 
-Index rows stay v1 shape through E4; index **column list** can wait until E5 if needed. Document the byte layout in [`storage-format.md`](storage-format.md) when E1 lands.
+Index rows: v1 (legacy, no columns) through E4; **v2 column list** landed in E5 — see [`storage-format.md`](storage-format.md).
 
 **Proposed decision (alternative, not default):** a separate schema btree or side blob — only if v2 payload proves awkward during E1.
 
@@ -141,7 +141,8 @@ version u8 | col_count u16 | [null_bitmap] | concatenated field encodings
 
 - Values: NULL / integer / float / text / blob (align with SQL literal kinds / runtime `Value`).
 - Btree **key** = **big-endian u64 rowid** (already used by `table_insert_row`).
-- `INTEGER PRIMARY KEY` column aliases rowid when present; otherwise allocate `next_rowid++` and persist the new high-water in the catalog row.
+- **IPK (rowid alias):** exactly **one** `PRIMARY KEY` column whose type name is `INTEGER` or `INT` (case-insensitive `equal_fold`; no `INTEGER(n)`, `BIGINT`, etc.). That column aliases the btree rowid; omit/`NULL` auto-allocates via `next_rowid++` (persisted in the catalog).
+- **Unsupported until UNIQUE enforcement:** composite / multi-column `PRIMARY KEY`, and single-column PK whose type is not `INTEGER`/`INT` → reject at `CREATE TABLE` (and guard on `INSERT`) with `Unsupported_Ast`. No silent decorative PK.
 
 ---
 
@@ -164,17 +165,17 @@ Exec_Session {
 | Mode | Behavior |
 |------|----------|
 | Auto (default) | Each statement: `txn_begin` → execute → `txn_commit` (rollback on error) |
-| Explicit | `BEGIN` / `COMMIT` / `ROLLBACK` in phase **E6** (stretch) |
+| Explicit | `BEGIN` / `COMMIT` / `ROLLBACK` (**E6**) |
 
-DDL and DML both require a write txn under auto mode. Nested `BEGIN` while already in a txn → clear error.
+DDL and DML both require a write txn under auto mode. Nested `BEGIN` while already in a txn → clear `In_Txn` error. Statements inside an explicit txn join the open engine txn (no per-statement commit) until `COMMIT` / `ROLLBACK`. Write failure inside an explicit txn aborts the whole txn (`txn_aborted`); `exec_script` then **stops even with `continue_on_error`**.
 
-**Note:** lexer knows `BEGIN` / `COMMIT` / `ROLLBACK` / `TRANSACTION` keywords today, but the parser does **not** emit txn statements yet. E6 either adds parse support or accepts exec-only recognition of those keywords before/alongside `parse_*`.
+**E6:** parser emits `Begin` / `Commit` / `Rollback` statement kinds (`TRANSACTION` optional); executor owns explicit-txn state on `Exec_Session`.
 
 ### Statement pipeline
 
 1. **Parse** — `sql.parse_statement` / `parse_script`
-2. **Bind** — resolve table/column names, types, column indexes; reject unsupported AST shapes with `Exec_Error` + span when available
-3. **Plan** — trivial only: “seq scan”, “point insert”, “create table storage”
+2. **Bind** — resolve table/column names (unquoted idents via case-insensitive `equal_fold`), types, column indexes; reject case-only duplicate columns at CREATE; reject unsupported AST shapes with `Exec_Error` + span when available
+3. **Plan** — trivial only: “seq scan”, “point insert”, “create table storage”; optional **text/blob** index point lookup
 4. **Execute** — call engine/catalog/btree; produce `Exec_Result` (rows affected / result set)
 
 Unsupported but parsed SQL → bind-time or exec-time **clear error** (not silent ignore).
@@ -235,53 +236,61 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 
 ### Phase E2 — `INSERT` + row codec
 
-- [ ] Row encode/decode for heap payloads; document in [`storage-format.md`](storage-format.md)
-- [ ] `INSERT INTO t [(cols)] VALUES (...), (...)`
-- [ ] Auto rowid / PK rowid rules; persist `next_rowid`
-- [ ] Column default: only literal / `NULL` defaults if already on AST; else error
-- [ ] Reject `INSERT … SELECT` / `DEFAULT VALUES` / conflict clauses with clear errors unless already trivial
-- [ ] Tests: insert → reopen → `table_get_row` (and SQL `SELECT` once E3 lands)
+- [x] Row encode/decode for heap payloads; document in [`storage-format.md`](storage-format.md)
+- [x] `INSERT INTO t [(cols)] VALUES (...), (...)`
+- [x] Auto rowid / PK rowid rules; persist `next_rowid` (`catalog_update_next_rowid`)
+- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` only; reject composite and non-integer PK at CREATE/INSERT
+- [x] Column default: only literal / `NULL` defaults if already on AST; else error
+- [x] Reject `INSERT … SELECT` / `DEFAULT VALUES` / conflict clauses with clear errors unless already trivial
+- [x] Tests: insert → reopen → `table_get_row` + decode (SQL `SELECT` once E3 lands); multi-row INSERT rollback on mid-statement failure
+- [x] Coverage inventory: [`exec-e2-coverage.md`](exec-e2-coverage.md)
 
 **Exit:** user can `init`, `CREATE TABLE`, `INSERT` via CLI; rows survive reopen.
 
 ### Phase E3 — `SELECT` (single table)
 
-- [ ] `SELECT` projection (`*`, columns, simple exprs over row)
-- [ ] `FROM` single table; optional alias
-- [ ] `WHERE` on bound columns (expression eval over row values — see [Expression evaluation](#expression-evaluation-binderexecutor))
-- [ ] `ORDER BY` / `LIMIT` / `OFFSET` in executor (in-memory sort OK for v1)
-- [ ] Reject joins / `GROUP BY` / subqueries / `DISTINCT` (unless trivial) clearly
-- [ ] CLI prints result sets
-- [ ] Tests: filter/sort/limit; golden text output optional
+- [x] `SELECT` projection (`*`, columns, simple exprs over row)
+- [x] `FROM` single table; optional alias
+- [x] `WHERE` on bound columns (expression eval over row values — see [Expression evaluation](#expression-evaluation-binderexecutor))
+- [x] `ORDER BY` / `LIMIT` / `OFFSET` in executor (in-memory sort OK for v1)
+- [x] Reject joins / `GROUP BY` / subqueries / `DISTINCT` (unless trivial) clearly
+- [x] CLI prints result sets
+- [x] Tests: filter/sort/limit; create/insert/select round-trip; negatives with codes
+- [x] Coverage inventory: [`exec-e3-coverage.md`](exec-e3-coverage.md)
 
 **Exit:** read path for bootstrap-style scripts (create/insert/select).
 
 ### Phase E4 — `UPDATE` / `DELETE`
 
-- [ ] `DELETE FROM t [WHERE …]`
-- [ ] `UPDATE t SET … [WHERE …]`
-- [ ] Row rewrite / delete-by-rowid
-- [ ] If indexes exist before E5: **forbid** `UPDATE`/`DELETE` with a clear error — do not leave indexes stale
-- [ ] Tests: mutate + select; reopen
+- [x] `DELETE FROM t [WHERE …]`
+- [x] `UPDATE t SET … [WHERE …]`
+- [x] Row rewrite / delete-by-rowid (`table_delete_row` / `table_rewrite_row`)
+- [x] If indexes exist before E5: **forbid** `UPDATE`/`DELETE` with a clear error — do not leave indexes stale *(E5: maintain when column metadata present; still forbid legacy no-column indexes)*
+- [x] Tests: mutate + select; reopen; WHERE filter; negatives with codes
+- [x] Coverage inventory: [`exec-e4-coverage.md`](exec-e4-coverage.md)
 
 **Exit:** basic CRUD via SQL. **← minimum execute v1 DoD**
 
 ### Phase E5 — Stretch: `CREATE INDEX` / `DROP INDEX` + maintenance
 
-- [ ] `CREATE INDEX` → `catalog_register_index` + backfill from table scan
-- [ ] `DROP INDEX`
-- [ ] Maintain indexes on `INSERT` / `UPDATE` / `DELETE`
-- [ ] Optional: use index for simple `WHERE col = const` (point lookup); seq scan remains correct
-- [ ] Tests: index create, insert maintains, lookup path
+- [x] `CREATE INDEX` → `catalog_register_index` + backfill from table scan
+- [x] `DROP INDEX`
+- [x] Maintain indexes on `INSERT` / `UPDATE` / `DELETE`
+- [x] Optional: use index for simple **text/blob** `WHERE col = const` point lookup (numeric eq skipped — index keys are tag-exact; seq scan remains correct); Engine/Io/encode failures on the index path fail hard (no silent seq-scan fallback)
+- [x] Tests: index create, insert maintains, lookup path; reopen durable
+- [x] Coverage inventory: [`exec-e5-coverage.md`](exec-e5-coverage.md)
+- [x] Index catalog v2 column list documented in [`storage-format.md`](storage-format.md)
+- [x] `DROP TABLE` still rejects while indexes remain (no cascade)
 
 **Exit:** indexed tables usable from SQL.
 
 ### Phase E6 — Stretch: script UX + polish
 
-- [ ] Multi-statement scripts with stop-on-error; optional continue-on-error flag
-- [ ] `BEGIN` / `COMMIT` / `ROLLBACK` (parse and/or exec-only keywords)
-- [ ] Better error formatting (`file:line:col: message`)
-- [ ] Run parser fixtures `bootstrap_v1.sql` / `crud.sql` **adapted** to the supported execute subset against a real `.strix` (full fixture includes `CREATE INDEX` — needs E5 or trim)
+- [x] Multi-statement scripts with stop-on-error; optional continue-on-error flag (`Exec_Options` / CLI `--continue-on-error`)
+- [x] `BEGIN` / `COMMIT` / `ROLLBACK` (parser emits stmt kinds; exec explicit txn mode)
+- [x] Better error formatting (`file:line:col: message` when path/span known)
+- [x] Run parser fixtures `bootstrap_v1.sql` / `crud.sql` against a real `.strix` (full E5 index support; no trim needed)
+- [x] Coverage inventory: [`exec-e6-coverage.md`](exec-e6-coverage.md)
 
 **Exit:** “Executed vs parsed-only” section in [`sql-dialect.md`](sql-dialect.md) kept current (prefer that over a new `sql-execute-support.md` unless the table outgrows the dialect doc).
 
@@ -311,7 +320,10 @@ Exec_Error :: struct {
 
 - Map engine errors to exec errors; free messages like `sql.free_error`.
 - Prefer stable `Exec_Error_Code` values for negatives tests (e.g. `Unsupported_Ast`, `Unknown_Table`, `Unknown_Column`, `Constraint`, `Engine`).
-- Introduce codes in E1 as CREATE/DROP needs them; avoid casual churn after E2 negatives lock in.
+- E1 codes: `Parse`, `Unsupported_Ast`, `Unknown_Table`, `Table_Exists`, `Has_Indexes`, `Invalid_Schema`, `Engine`, `Io`, `Closed`.
+- **E2 added:** `Unknown_Column`, `Constraint` (NOT NULL / duplicate rowid / bad IPK).
+- **E5 added:** `Index_Exists`, `Unknown_Index`.
+- **E6 added:** `In_Txn`, `No_Txn`.
 
 ---
 
@@ -326,7 +338,7 @@ Exec_Error :: struct {
 
 Wire `src/test/exec` into `./build.sh test` as part of E1.
 
-**Hard rule (until coverage tooling exists):** each execute phase must ship an inventory of that phase’s new package surface (public procs + engine helpers the phase introduced/changed for exec) with test mapping, and achieve **≥80% symbol coverage** by the inventory method — see [`exec-e1-coverage.md`](exec-e1-coverage.md) for E1. Tests must assert error **codes** and/or **durable outcomes**, not vacuous `has_error` / compile-only checks.
+**Hard rule (until coverage tooling exists):** each execute phase must ship an inventory of that phase’s new package surface (public procs + engine helpers the phase introduced/changed for exec) with test mapping, and achieve **≥80% symbol coverage** by the inventory method — see [`exec-e1-coverage.md`](exec-e1-coverage.md) (E1), [`exec-e2-coverage.md`](exec-e2-coverage.md) (E2), [`exec-e3-coverage.md`](exec-e3-coverage.md) (E3), [`exec-e4-coverage.md`](exec-e4-coverage.md) (E4), [`exec-e5-coverage.md`](exec-e5-coverage.md) (E5), and [`exec-e6-coverage.md`](exec-e6-coverage.md) (E6). Tests must assert error **codes** and/or **durable outcomes**, not vacuous `has_error` / compile-only checks.
 
 ---
 
@@ -339,19 +351,24 @@ Wire `src/test/exec` into `./build.sh test` as part of E1.
 | `docs/sql-dialect.md` | **Executed** vs **Parsed only** — update as phases land |
 | `docs/storage-engine.md` | S5 points here (done) |
 | `docs/exec-e1-coverage.md` | E1 symbol inventory + ≥80% coverage proof |
+| `docs/exec-e2-coverage.md` | E2 symbol inventory + ≥80% coverage proof |
+| `docs/exec-e3-coverage.md` | E3 symbol inventory + ≥80% coverage proof |
+| `docs/exec-e4-coverage.md` | E4 symbol inventory + ≥80% coverage proof |
+| `docs/exec-e5-coverage.md` | E5 symbol inventory + ≥80% coverage proof |
+| `docs/exec-e6-coverage.md` | E6 symbol inventory + ≥80% coverage proof |
 
 ---
 
 ## Definition of done (execute v1)
 
-- [ ] Phases **E1–E4** complete; tests green under `./build.sh test`
-- [ ] CLI: `init` + `sql` can run create/insert/select/update/delete on a `.strix` file
-- [ ] `src/sql` still has no `engine` / `exec` imports
-- [ ] Unsupported SQL fails with clear errors (no silent no-ops)
-- [ ] Catalog v2 + heap row formats documented in `storage-format.md`
-- [ ] Dialect doc states what execute supports (update the stub table as each phase lands; fuller matrix by E6)
+- [x] Phases **E1–E4** complete; tests green under `./build.sh test`
+- [x] CLI: `init` + `sql` can run create/insert/select/update/delete on a `.strix` file
+- [x] `src/sql` still has no `engine` / `exec` imports
+- [x] Unsupported SQL fails with clear errors (no silent no-ops)
+- [x] Catalog v2 + heap row formats documented in `storage-format.md`
+- [x] Dialect doc states what execute supports (update the stub table as each phase lands; fuller matrix by E6)
 
-**Stretch (not required for DoD):** E5 (indexes), E6 (txn keywords, fixture polish, richer dialect matrix).
+**Stretch (not required for DoD):** E5 (indexes — landed), E6 (txn keywords, fixture polish, richer dialect matrix — landed).
 
 ---
 
@@ -361,23 +378,13 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. **Package name:** `exec` vs `runtime` vs `query` — **default `exec`.**
 2. **Catalog v2 vs separate schema btree** — **default: version bump on `table:<name>` payload.**
-3. **Implicit commit per statement vs requiring `BEGIN`** — **default: auto-commit per statement.**
+3. **Implicit commit per statement vs requiring `BEGIN`** — **default: auto-commit per statement** (E6 adds optional explicit `BEGIN`…`COMMIT`/`ROLLBACK`).
 4. **SELECT output format** — aligned columns vs CSV — **default: aligned text for CLI.**
 5. **Persist original `CREATE TABLE` SQL text in catalog?** — nice for `sqlite_master` parity; **optional in E1**, not DoD.
-6. **`DROP TABLE` with indexes:** cascade-drop indexes vs reject until indexes dropped — **Decided in E1: reject with clear error until E5 defines cascade.**
+6. **`DROP TABLE` with indexes:** cascade-drop indexes vs reject until indexes dropped — **E1/E5: keep reject until indexes dropped** (no cascade).
 
 ---
 
 ## Immediate next steps
 
-1. Land this plan; override open-question defaults only if you disagree.
-2. Implement **E1** (session + catalog v2 + `CREATE`/`DROP TABLE` + CLI `sql`).
-3. **E2** `INSERT`, then **E3** `SELECT` for a demo path:
-
-```bash
-./strix init demo
-./strix sql demo -c "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);"
-./strix sql demo -c "INSERT INTO t (id, name) VALUES (1, 'a');"
-./strix sql demo -c "SELECT id, name FROM t;"
-# opens demo.strix (ensure_strix_path)
-```
+1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.

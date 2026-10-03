@@ -46,13 +46,14 @@ print_usage :: proc() {
 		"  sql  [path] -c 'SQL'     Run SQL string against a database\n" +
 		"  sql  [path] file.sql     Run SQL script file\n" +
 		"  sql  [path]              Run SQL from stdin\n" +
+		"      --continue-on-error  Keep running after statement errors\n" +
 		"  help                     Show this help\n",
 		DEFAULT_DB_PATH,
 	)
 }
 
 // run_sql opens path and executes sql_text. Returns process exit code.
-run_sql :: proc(path: string, sql_text: string) -> int {
+run_sql :: proc(path: string, sql_text: string, opts := exec.Exec_Options{}) -> int {
 	resolved := ensure_strix_path(path)
 	defer delete(resolved)
 
@@ -64,9 +65,10 @@ run_sql :: proc(path: string, sql_text: string) -> int {
 	}
 	defer exec.session_close(&session)
 
-	result, eerr := exec.exec_script(&session, sql_text)
+	result, eerr := exec.exec_script(&session, sql_text, opts)
 	if exec.has_error(eerr) {
-		formatted := exec.format_error(eerr)
+		loc := opts.source_path
+		formatted := exec.format_error(eerr, loc)
 		defer delete(formatted)
 		fmt.eprintf("strix sql: %s\n", formatted)
 		exec.free_error(eerr)
@@ -81,10 +83,61 @@ run_sql :: proc(path: string, sql_text: string) -> int {
 	case .Rows_Affected:
 		fmt.printf("%d rows\n", result.rows_affected)
 	case .Result_Set:
-		// E3: print columns/rows
-		fmt.println("ok")
+		print_result_set(result)
 	}
 	return 0
+}
+
+// format_result_set builds an aligned text table (header + rows). Caller deletes the string.
+format_result_set :: proc(result: exec.Exec_Result, allocator := context.allocator) -> string {
+	ncols := len(result.column_names)
+	if ncols == 0 {
+		return ""
+	}
+	widths := make([]int, ncols, allocator)
+	defer delete(widths, allocator)
+	for name, i in result.column_names {
+		widths[i] = len(name)
+	}
+	for row in result.rows {
+		for i in 0 ..< min(ncols, len(row)) {
+			if len(row[i]) > widths[i] {
+				widths[i] = len(row[i])
+			}
+		}
+	}
+	b: strings.Builder
+	strings.builder_init(&b, allocator)
+	for i in 0 ..< ncols {
+		if i > 0 {
+			strings.write_string(&b, "  ")
+		}
+		fmt.sbprintf(&b, "%-*s", widths[i], result.column_names[i])
+	}
+	strings.write_byte(&b, '\n')
+	for row in result.rows {
+		for i in 0 ..< ncols {
+			if i > 0 {
+				strings.write_string(&b, "  ")
+			}
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
+			}
+			fmt.sbprintf(&b, "%-*s", widths[i], cell)
+		}
+		strings.write_byte(&b, '\n')
+	}
+	return strings.to_string(b)
+}
+
+// print_result_set writes an aligned text table (header + rows) to stdout.
+print_result_set :: proc(result: exec.Exec_Result) {
+	text := format_result_set(result)
+	defer delete(text)
+	if text != "" {
+		fmt.print(text)
+	}
 }
 
 read_file_or_stdin :: proc(path: string) -> (string, bool) {
@@ -110,11 +163,12 @@ Sql_Input_Kind :: enum {
 
 // Sql_Command_Args is the pure parse result of `strix sql …` argv (no I/O).
 Sql_Command_Args :: struct {
-	db_path:     string, // raw path token, or DEFAULT_DB_PATH
-	input:       Sql_Input_Kind,
-	sql_or_file: string, // -c text or .sql path; "" for stdin
-	ok:          bool,
-	err_msg:     string, // static message when !ok
+	db_path:           string, // raw path token, or DEFAULT_DB_PATH
+	input:             Sql_Input_Kind,
+	sql_or_file:       string, // -c text or .sql path; "" for stdin
+	continue_on_error: bool,
+	ok:                bool,
+	err_msg:           string, // static message when !ok
 }
 
 // parse_sql_command_args resolves path / -c / file.sql / stdin intent without reading files.
@@ -136,6 +190,11 @@ parse_sql_command_args :: proc(args: []string) -> Sql_Command_Args {
 			out.sql_or_file = args[i + 1]
 			saw_sql = true
 			i += 2
+			continue
+		}
+		if arg == "--continue-on-error" {
+			out.continue_on_error = true
+			i += 1
 			continue
 		}
 		if strings.has_suffix(arg, ".sql") {
@@ -173,6 +232,10 @@ run_sql_command :: proc(args: []string) -> int {
 		delete(sql_text)
 	}
 
+	opts := exec.Exec_Options{
+		continue_on_error = parsed.continue_on_error,
+	}
+
 	switch parsed.input {
 	case .Command:
 		sql_text = parsed.sql_or_file
@@ -184,6 +247,7 @@ run_sql_command :: proc(args: []string) -> int {
 		}
 		sql_text = data
 		sql_owned = true
+		opts.source_path = parsed.sql_or_file
 	case .Stdin:
 		data, ok := read_file_or_stdin("")
 		if !ok {
@@ -202,7 +266,7 @@ run_sql_command :: proc(args: []string) -> int {
 		return 1
 	}
 
-	return run_sql(parsed.db_path, sql_text)
+	return run_sql(parsed.db_path, sql_text, opts)
 }
 
 // run dispatches CLI commands from argv (without the program name).

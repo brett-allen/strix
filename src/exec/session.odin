@@ -3,9 +3,11 @@ package exec
 import engine "../engine"
 
 Exec_Session :: struct {
-	eng:         ^engine.Engine,
-	owns_engine: bool,
-	closed:      bool,
+	eng:          ^engine.Engine,
+	owns_engine:  bool,
+	closed:       bool,
+	explicit_txn: bool, // true after BEGIN until COMMIT/ROLLBACK
+	txn_aborted:  bool, // set when a write fails inside an explicit txn (whole txn rolled back)
 }
 
 // session_open opens an existing .strix database at path.
@@ -33,6 +35,11 @@ session_close :: proc(s: ^Exec_Session) -> Exec_Error {
 		return ok_error()
 	}
 	s.closed = true
+	if s.eng != nil && s.eng.in_txn {
+		_ = engine.txn_rollback(s.eng)
+	}
+	s.explicit_txn = false
+	s.txn_aborted = false
 	if s.owns_engine && s.eng != nil {
 		eerr := engine.engine_close(s.eng)
 		free(s.eng)

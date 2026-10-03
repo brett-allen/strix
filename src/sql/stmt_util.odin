@@ -31,6 +31,8 @@ free_statement :: proc(stmt: Statement, allocator := context.allocator) {
 		free_update_stmt(stmt.data.(Update_Stmt), allocator)
 	case .Delete:
 		free_delete_stmt(stmt.data.(Delete_Stmt), allocator)
+	case .Begin, .Commit, .Rollback:
+		// no owned fields
 	}
 }
 
