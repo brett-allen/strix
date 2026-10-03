@@ -15,6 +15,7 @@ Engine_Error :: enum {
 	Already_Free,
 	Exists,
 	Not_Found,
+	Has_Indexes,
 	Catalog_Missing,
 	Too_Large,
 	Corrupt,
@@ -45,6 +46,7 @@ error_string :: proc(err: Engine_Error) -> string {
 	case .Already_Free:      return "page is already on the freelist"
 	case .Exists:            return "key already exists"
 	case .Not_Found:         return "key not found"
+	case .Has_Indexes:       return "table still has indexes"
 	case .Catalog_Missing:   return "table_prime catalog is not initialized"
 	case .Too_Large:         return "key or payload too large for page"
 	case .Corrupt:           return "corrupt btree page"

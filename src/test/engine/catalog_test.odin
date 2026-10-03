@@ -76,6 +76,50 @@ test_register_table_insert_reopen :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_table_delete_and_rewrite_row :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-catalog-rewrite-%d.strix", os.get_pid())
+	defer os.remove(path)
+
+	e, err := engine.engine_create(path)
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+
+	testing.expect(t, engine.ok(engine.txn_begin(&e)))
+	_, rerr := engine.catalog_register_table(&e, "t")
+	testing.expect(t, engine.ok(rerr))
+	tbl, oerr := engine.catalog_open_table(&e, "t")
+	testing.expect(t, engine.ok(oerr))
+
+	testing.expect(t, engine.ok(engine.table_insert_row(&tbl, 1, transmute([]u8)string("aa"))))
+	testing.expect(t, engine.ok(engine.table_rewrite_row(&tbl, 1, transmute([]u8)string("bbbb"))))
+	got, gerr := engine.table_get_row(&tbl, 1)
+	testing.expect(t, engine.ok(gerr))
+	testing.expect_value(t, string(got), "bbbb")
+	delete(got)
+
+	// same-length in-place path
+	testing.expect(t, engine.ok(engine.table_rewrite_row(&tbl, 1, transmute([]u8)string("cccc"))))
+	got2, gerr2 := engine.table_get_row(&tbl, 1)
+	testing.expect(t, engine.ok(gerr2))
+	testing.expect_value(t, string(got2), "cccc")
+	delete(got2)
+
+	testing.expect(t, engine.ok(engine.table_delete_row(&tbl, 1)))
+	_, missing := engine.table_get_row(&tbl, 1)
+	testing.expect_value(t, missing, engine.Engine_Error.Not_Found)
+
+	key: [8]u8
+	testing.expect(t, engine.ok(engine.rowid_key(42, key[:])))
+	rid, kerr := engine.rowid_from_key(key[:])
+	testing.expect(t, engine.ok(kerr))
+	testing.expect_value(t, rid, u64(42))
+	_, bad := engine.rowid_from_key(key[:4])
+	testing.expect_value(t, bad, engine.Engine_Error.Invalid_Argument)
+
+	testing.expect(t, engine.ok(engine.txn_commit(&e)))
+}
+
+@(test)
 test_register_index_open_and_lookup :: proc(t: ^testing.T) {
 	path := fmt.tprintf("/tmp/strix-catalog-index-%d.strix", os.get_pid())
 	defer os.remove(path)

@@ -20,14 +20,67 @@ parse_statement_node :: proc(p: ^Parser) -> (Statement, Parse_Error) {
 		return parse_update(p, start)
 	case .Kw_Delete:
 		return parse_delete(p, start)
+	case .Kw_Begin:
+		return parse_begin(p, start)
+	case .Kw_Commit:
+		return parse_commit(p, start)
+	case .Kw_Rollback:
+		return parse_rollback(p, start)
 	}
 	tok := peek(p)
 	return Statement{}, make_error(
 		tok.span,
-		"expected statement (CREATE, DROP, ALTER, SELECT, INSERT, UPDATE, or DELETE), got %s",
+		"expected statement (CREATE, DROP, ALTER, SELECT, INSERT, UPDATE, DELETE, BEGIN, COMMIT, or ROLLBACK), got %s",
 		token_kind_string(tok.kind),
 		allocator = p.allocator,
 	)
+}
+
+parse_optional_transaction :: proc(p: ^Parser) {
+	if peek(p).kind == .Kw_Transaction {
+		next(p)
+	}
+}
+
+txn_stmt_span :: proc(p: ^Parser, start: Span) -> Span {
+	end := peek(p).span.offset
+	if p.pos > 0 {
+		prev := p.tokens[p.pos - 1]
+		end = prev.span.offset + prev.span.length
+	}
+	stmt_span := start
+	stmt_span.length = end - start.offset
+	return stmt_span
+}
+
+parse_begin :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Error) {
+	next(p) // BEGIN
+	parse_optional_transaction(p)
+	return Statement{
+		kind = .Begin,
+		span = txn_stmt_span(p, start),
+		data = Begin_Stmt{},
+	}, ok_error()
+}
+
+parse_commit :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Error) {
+	next(p) // COMMIT
+	parse_optional_transaction(p)
+	return Statement{
+		kind = .Commit,
+		span = txn_stmt_span(p, start),
+		data = Commit_Stmt{},
+	}, ok_error()
+}
+
+parse_rollback :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Error) {
+	next(p) // ROLLBACK
+	parse_optional_transaction(p)
+	return Statement{
+		kind = .Rollback,
+		span = txn_stmt_span(p, start),
+		data = Rollback_Stmt{},
+	}, ok_error()
 }
 
 parse_create_statement :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Error) {

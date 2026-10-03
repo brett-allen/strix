@@ -1,7 +1,9 @@
 package main
 
-import "core:fmt"
+import "core:os"
+import cli "./cli"
 
 main :: proc() {
-	fmt.println(greeting())
+	code := cli.run(os.args[1:])
+	os.exit(code)
 }

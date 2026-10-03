@@ -29,7 +29,7 @@ Byte layout: [`storage-format.md`](storage-format.md) (v0.1 freezes page 0).
 
 | Topic | Default unless you override |
 |-------|-----------------------------|
-| SQL inside engine for storage v1? | **No** — storage API first; SQL execute = later phase (S6) |
+| SQL inside engine for storage v1? | **No** — storage API first; SQL execute = [`sql-execute.md`](sql-execute.md) (S5) |
 | Sync on commit | **fsync** the DB file after flushing dirty pages (correctness > speed) |
 | Attached DBs / multi-file | **Out of scope** (one `.strix`/DB file only for now) |
 
@@ -278,10 +278,9 @@ Freeze details in `docs/storage-format.md` during S0.
 
 ### Phase S5 — SQL DDL/DML slice (stretch)
 
-- [ ] Optional: `CREATE TABLE` AST → `table_prime` + storage
-- [ ] Thin `INSERT`/`SELECT` execution
+Superseded by **[`docs/sql-execute.md`](sql-execute.md)** (bind + execute on `feature/sql-execute`).
 
-**Exit:** bootstrap SQL against a real file (optional for “storage v1 done”).
+- [x] See execute plan phases E1–E4 (CREATE/DROP → INSERT → SELECT → UPDATE/DELETE + CLI `sql`) — done in [`sql-execute.md`](sql-execute.md)
 
 ---
 
@@ -314,7 +313,7 @@ Extend `./build.sh test` with `src/test/dbfile`, `src/test/paging`, `src/test/en
 - WAL or rollback journal + true crash-atomic multi-page commit
 - Multi-reader concurrency while writer exists
 - Vacuum / packing; attached databases
-- SQL binder/executor (unless pulled into S5 early)
+- SQL binder/executor — see [`sql-execute.md`](sql-execute.md)
 
 ---
 

@@ -9,6 +9,7 @@ SQLite-shaped dialect baseline. Intentional decisions and deviations live here.
 | DDL | `CREATE`/`DROP TABLE`, `CREATE`/`DROP INDEX`, `ALTER TABLE ADD COLUMN` |
 | DML read | `SELECT` with joins, `WHERE`, `GROUP BY`/`HAVING`, `ORDER BY`, `LIMIT`/`OFFSET` |
 | DML write | `INSERT` (`VALUES` / `SELECT`, `OR REPLACE`/`OR IGNORE`), `UPDATE`, `DELETE` |
+| Txn | `BEGIN` / `COMMIT` / `ROLLBACK` (`[TRANSACTION]` optional) |
 | Scripts | Semicolon-separated via `parse_script` |
 
 ## Phase 0 — Tokenization
@@ -23,6 +24,8 @@ SQLite-shaped dialect baseline. Intentional decisions and deviations live here.
 | Bracket | `[col]` | SQLite-compatible |
 
 Keywords are case-insensitive; quoted forms are always `Ident`. Unicode unquoted idents not supported yet.
+
+**Execute bind policy:** unquoted identifiers resolve with case-insensitive `equal_fold` everywhere names are bound (CREATE duplicate/PK matching, INSERT column lists, SELECT/UPDATE SET/WHERE, index column bind). Case-only duplicate column names at `CREATE TABLE` are rejected (`Invalid_Schema`).
 
 ### Literals & comments
 
@@ -130,9 +133,26 @@ Includes `code` (`Parse_Error_Code`), span (offset/length + 1-based line/column)
 - Sibling `.ast` goldens from `print_script` (trailing newlines normalized)
 - Regenerate: `odin run tools/regen_ast_goldens`
 
+## Executed vs parsed only
+
+Parser v1 accepts a wider surface than the executor runs. **Execute support** lives in [`sql-execute.md`](sql-execute.md) / `src/exec` (phases **E1–E4** minimum; **E5** indexes + **E6** script/txn polish landed).
+
+| Area | Parsed (today) | Executed |
+|------|----------------|----------|
+| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2)** — `NOT NULL`; literal/`NULL` `DEFAULT`; sole `INTEGER`/`INT PRIMARY KEY` (column or table-level); `IF NOT EXISTS` / `IF EXISTS`; rejects composite PK, non-integer PK, UNIQUE/CHECK/FK until later |
+| `INSERT` … `VALUES` | yes | **yes (E2)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5) |
+| Single-table `SELECT` | yes | **yes (E3)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list); ORDER BY / LIMIT / OFFSET (in-memory; incompatible ORDER BY kinds → error); rejects DISTINCT / JOIN / GROUP BY / CAST / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only (E5; numeric eq stays on seq scan) |
+| `UPDATE` / `DELETE` | yes | **yes (E4/E5)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env`; row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL on SET → `Constraint` |
+| `CREATE`/`DROP INDEX` | yes | **yes (E5)** — register + backfill; `IF NOT EXISTS` / `IF EXISTS`; catalog index v2 column list; `DROP TABLE` still rejects while indexes exist (no cascade) |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | yes (E6) | **yes (E6)** — explicit txn mode; nested `BEGIN` → `In_Txn`; statements inside txn do not auto-commit until `COMMIT`; `ROLLBACK` undoes; `COMMIT`/`ROLLBACK` without `BEGIN` → `No_Txn`; **write failure inside explicit txn aborts the whole txn** (no savepoints; clears `explicit_txn`, sets `txn_aborted`) |
+| Scripts | yes | **yes (E6)** — stop-on-error default; optional `continue_on_error` / CLI `--continue-on-error`; **after an explicit-txn abort, the script always stops** (even with `continue_on_error`) so later statements cannot auto-commit outside the aborted txn; errors format as `file:line:col: message` when path+span known |
+| Joins, `GROUP BY`, `ALTER`, … | yes (subset) | reject at bind/exec until later plans |
+
+Update this table as execute phases land.
+
 ## Known gaps
 
-- Binder/catalog/executor not in parser
+- No index cascade on `DROP TABLE` (drop indexes first)
 - No CTEs, set ops, windows, UPSERT, triggers/views/PRAGMA
 - No FROM subqueries / correlated subqueries
 - `token_kind_string(.NotEq)` prints `!=` even for `<>`

@@ -14,7 +14,7 @@ Usage: $(basename "$0") <command> [odin-args...]
 Commands:
   build   Compile the executable (default)
   run     Build and run
-  test    Run package tests under src/test/, src/test/sql/, src/test/dbfile/, src/test/paging/, and src/test/engine/
+  test    Run package tests under src/test/ and layer packages (sql, dbfile, paging, engine, exec, cli)
   clean   Remove build artifacts
 
 Environment:
@@ -39,6 +39,8 @@ case "$cmd" in
 		odin test "$SRC/test/dbfile" "$@"
 		odin test "$SRC/test/paging" "$@"
 		odin test "$SRC/test/engine" "$@"
+		odin test "$SRC/test/exec" "$@"
+		odin test "$SRC/test/cli" "$@"
 		;;
 	clean)
 		rm -f "$OUT" "$OUT.exe" "$OUT.dll" "$OUT.lib"

@@ -5,6 +5,9 @@
 /strix.lib
 /strix.dSYM/
 
+# Local database files
+*.strix
+
 # Generic local binaries
 *.o
 *.obj
