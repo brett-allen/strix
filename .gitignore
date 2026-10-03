@@ -1,0 +1,18 @@
+# Odin build output
+/strix
+/strix.exe
+/strix.dll
+/strix.lib
+/strix.dSYM/
+
+# Generic local binaries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
