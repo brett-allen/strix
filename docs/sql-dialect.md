@@ -130,9 +130,24 @@ Includes `code` (`Parse_Error_Code`), span (offset/length + 1-based line/column)
 - Sibling `.ast` goldens from `print_script` (trailing newlines normalized)
 - Regenerate: `odin run tools/regen_ast_goldens`
 
+## Executed vs parsed only
+
+Parser v1 accepts a wider surface than the executor runs. **Execute support** lives in [`sql-execute.md`](sql-execute.md) / `src/exec` (phases **E1–E4** minimum).
+
+| Area | Parsed (today) | Executed |
+|------|----------------|----------|
+| `CREATE`/`DROP TABLE` | yes | **yes (E1)** — column `PRIMARY KEY` / `NOT NULL`; table-level `PRIMARY KEY`; `IF NOT EXISTS` / `IF EXISTS`; rejects other column/table constraints for now |
+| `INSERT` … `VALUES` | yes | not yet (E2) |
+| Single-table `SELECT` | yes | not yet (E3) |
+| `UPDATE` / `DELETE` | yes | not yet (E4) |
+| `CREATE`/`DROP INDEX` | yes | not yet (E5 stretch); `DROP TABLE` rejects while indexes exist |
+| Joins, `GROUP BY`, `ALTER`, … | yes (subset) | reject at bind/exec until later plans |
+
+Update this table as execute phases land.
+
 ## Known gaps
 
-- Binder/catalog/executor not in parser
+- DML execution incomplete (E2–E4); see [`sql-execute.md`](sql-execute.md)
 - No CTEs, set ops, windows, UPSERT, triggers/views/PRAGMA
 - No FROM subqueries / correlated subqueries
 - `token_kind_string(.NotEq)` prints `!=` even for `<>`

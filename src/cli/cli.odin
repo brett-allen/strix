@@ -1,8 +1,10 @@
 package cli
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import engine "../engine"
+import exec "../exec"
 
 DEFAULT_DB_PATH :: "database.strix"
 
@@ -40,10 +42,167 @@ print_usage :: proc() {
 		"Usage: strix <command> [args]\n" +
 		"\n" +
 		"Commands:\n" +
-		"  init [path]   Create a new .strix database (default: %s)\n" +
-		"  help          Show this help\n",
+		"  init [path]              Create a new .strix database (default: %s)\n" +
+		"  sql  [path] -c 'SQL'     Run SQL string against a database\n" +
+		"  sql  [path] file.sql     Run SQL script file\n" +
+		"  sql  [path]              Run SQL from stdin\n" +
+		"  help                     Show this help\n",
 		DEFAULT_DB_PATH,
 	)
+}
+
+// run_sql opens path and executes sql_text. Returns process exit code.
+run_sql :: proc(path: string, sql_text: string) -> int {
+	resolved := ensure_strix_path(path)
+	defer delete(resolved)
+
+	session, err := exec.session_open(resolved)
+	if exec.has_error(err) {
+		fmt.eprintf("strix sql: open %s: %s\n", resolved, err.message)
+		exec.free_error(err)
+		return 1
+	}
+	defer exec.session_close(&session)
+
+	result, eerr := exec.exec_script(&session, sql_text)
+	if exec.has_error(eerr) {
+		formatted := exec.format_error(eerr)
+		defer delete(formatted)
+		fmt.eprintf("strix sql: %s\n", formatted)
+		exec.free_error(eerr)
+		exec.free_result(result)
+		return 1
+	}
+	defer exec.free_result(result)
+
+	switch result.kind {
+	case .Ok:
+		fmt.println("ok")
+	case .Rows_Affected:
+		fmt.printf("%d rows\n", result.rows_affected)
+	case .Result_Set:
+		// E3: print columns/rows
+		fmt.println("ok")
+	}
+	return 0
+}
+
+read_file_or_stdin :: proc(path: string) -> (string, bool) {
+	data: []byte
+	err: os.Error
+	if path == "" {
+		data, err = os.read_entire_file_from_file(os.stdin, context.allocator)
+	} else {
+		data, err = os.read_entire_file_from_path(path, context.allocator)
+	}
+	if err != os.ERROR_NONE {
+		return "", false
+	}
+	return string(data), true
+}
+
+Sql_Input_Kind :: enum {
+	None,
+	Command, // -c / --command
+	File, // path ending in .sql
+	Stdin,
+}
+
+// Sql_Command_Args is the pure parse result of `strix sql …` argv (no I/O).
+Sql_Command_Args :: struct {
+	db_path:     string, // raw path token, or DEFAULT_DB_PATH
+	input:       Sql_Input_Kind,
+	sql_or_file: string, // -c text or .sql path; "" for stdin
+	ok:          bool,
+	err_msg:     string, // static message when !ok
+}
+
+// parse_sql_command_args resolves path / -c / file.sql / stdin intent without reading files.
+parse_sql_command_args :: proc(args: []string) -> Sql_Command_Args {
+	out := Sql_Command_Args{
+		db_path = DEFAULT_DB_PATH,
+		input   = .Stdin,
+		ok      = true,
+	}
+	saw_sql := false
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+		if arg == "-c" || arg == "--command" {
+			if i + 1 >= len(args) {
+				return Sql_Command_Args{ok = false, err_msg = "-c requires a SQL string"}
+			}
+			out.input = .Command
+			out.sql_or_file = args[i + 1]
+			saw_sql = true
+			i += 2
+			continue
+		}
+		if strings.has_suffix(arg, ".sql") {
+			out.input = .File
+			out.sql_or_file = arg
+			saw_sql = true
+			i += 1
+			continue
+		}
+		out.db_path = arg
+		i += 1
+	}
+	if !saw_sql {
+		out.input = .Stdin
+		out.sql_or_file = ""
+	}
+	return out
+}
+
+// run_sql_command parses `sql` subcommand args.
+// Forms:
+//   sql [path] -c SQL
+//   sql [path] file.sql
+//   sql [path]          (stdin)
+run_sql_command :: proc(args: []string) -> int {
+	parsed := parse_sql_command_args(args)
+	if !parsed.ok {
+		fmt.eprintf("strix sql: %s\n", parsed.err_msg)
+		return 1
+	}
+
+	sql_text: string
+	sql_owned := false
+	defer if sql_owned {
+		delete(sql_text)
+	}
+
+	switch parsed.input {
+	case .Command:
+		sql_text = parsed.sql_or_file
+	case .File:
+		data, ok := read_file_or_stdin(parsed.sql_or_file)
+		if !ok {
+			fmt.eprintf("strix sql: failed to read %s\n", parsed.sql_or_file)
+			return 1
+		}
+		sql_text = data
+		sql_owned = true
+	case .Stdin:
+		data, ok := read_file_or_stdin("")
+		if !ok {
+			fmt.eprintln("strix sql: failed to read stdin")
+			return 1
+		}
+		sql_text = data
+		sql_owned = true
+	case .None:
+		fmt.eprintln("strix sql: no SQL input")
+		return 1
+	}
+
+	if strings.trim_space(sql_text) == "" {
+		fmt.eprintln("strix sql: empty SQL input")
+		return 1
+	}
+
+	return run_sql(parsed.db_path, sql_text)
 }
 
 // run dispatches CLI commands from argv (without the program name).
@@ -66,6 +225,8 @@ run :: proc(args: []string) -> int {
 			path = args[1]
 		}
 		return init_database(path)
+	case "sql":
+		return run_sql_command(args[1:])
 	case "help", "-h", "--help":
 		print_usage()
 		return 0

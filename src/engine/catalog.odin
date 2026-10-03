@@ -4,9 +4,10 @@ import "core:encoding/endian"
 import "core:strings"
 import dbfile "../dbfile"
 
-// Catalog keys and row payloads — see docs/storage-format.md (table_prime v0.4).
+// Catalog keys and row payloads — see docs/storage-format.md (table_prime).
 
-CATALOG_ROW_VERSION :: u8(1)
+CATALOG_ROW_VERSION_V1 :: u8(1)
+CATALOG_ROW_VERSION_V2 :: u8(2)
 CATALOG_KEY_TABLE_PREFIX :: "table:"
 CATALOG_KEY_INDEX_PREFIX :: "index:"
 
@@ -15,10 +16,24 @@ Catalog_Kind :: enum u8 {
 	Index = 2,
 }
 
+Catalog_Column_Flag :: enum u8 {
+	Not_Null    = 0,
+	Primary_Key = 1,
+}
+
+Catalog_Column :: struct {
+	name:      string,
+	type_name: string,
+	flags:     bit_set[Catalog_Column_Flag; u8],
+}
+
 Catalog_Entry :: struct {
+	version:      u8,
 	kind:         Catalog_Kind,
 	root:         dbfile.Page_No,
-	parent_table: string, // set for Index rows
+	parent_table: string, // set for Index rows (owned after decode)
+	next_rowid:   u64, // table v2
+	columns:      []Catalog_Column, // table v2; owned after decode
 }
 
 catalog_table_key :: proc(name: string, allocator := context.allocator) -> []u8 {
@@ -31,6 +46,23 @@ catalog_index_key :: proc(name: string, allocator := context.allocator) -> []u8 
 	return transmute([]u8)s
 }
 
+free_catalog_entry :: proc(entry: Catalog_Entry, allocator := context.allocator) {
+	if entry.parent_table != "" {
+		delete(entry.parent_table, allocator)
+	}
+	for c in entry.columns {
+		if c.name != "" {
+			delete(c.name, allocator)
+		}
+		if c.type_name != "" {
+			delete(c.type_name, allocator)
+		}
+	}
+	if entry.columns != nil {
+		delete(entry.columns, allocator)
+	}
+}
+
 encode_catalog_row :: proc(
 	entry: Catalog_Entry,
 	allocator := context.allocator,
@@ -39,17 +71,55 @@ encode_catalog_row :: proc(
 	if entry.kind == .Table {
 		parent = ""
 	}
-	if entry.kind == .Index && len(parent) == 0 {
-		return nil
-	}
-	need := 6 + (2 + len(parent) if entry.kind == .Index else 0)
-	buf := make([]u8, need, allocator)
-	buf[0] = CATALOG_ROW_VERSION
-	buf[1] = u8(entry.kind)
-	endian.put_u32(buf[2:6], .Little, u32(entry.root))
 	if entry.kind == .Index {
+		if len(parent) == 0 {
+			return nil
+		}
+		need := 8 + len(parent)
+		buf := make([]u8, need, allocator)
+		buf[0] = CATALOG_ROW_VERSION_V1
+		buf[1] = u8(entry.kind)
+		endian.put_u32(buf[2:6], .Little, u32(entry.root))
 		endian.put_u16(buf[6:8], .Little, u16(len(parent)))
 		copy(buf[8:], transmute([]u8)parent)
+		return buf
+	}
+
+	version := entry.version
+	if version == 0 {
+		version = CATALOG_ROW_VERSION_V2
+	}
+	if version == CATALOG_ROW_VERSION_V1 {
+		buf := make([]u8, 6, allocator)
+		buf[0] = CATALOG_ROW_VERSION_V1
+		buf[1] = u8(entry.kind)
+		endian.put_u32(buf[2:6], .Little, u32(entry.root))
+		return buf
+	}
+
+	// Table payload v2: version|kind|root|next_rowid|col_count|[columns…]
+	need := 16
+	for c in entry.columns {
+		need += 2 + len(c.name) + 2 + len(c.type_name) + 1
+	}
+	buf := make([]u8, need, allocator)
+	buf[0] = CATALOG_ROW_VERSION_V2
+	buf[1] = u8(entry.kind)
+	endian.put_u32(buf[2:6], .Little, u32(entry.root))
+	endian.put_u64(buf[6:14], .Little, entry.next_rowid)
+	endian.put_u16(buf[14:16], .Little, u16(len(entry.columns)))
+	off := 16
+	for c in entry.columns {
+		endian.put_u16(buf[off:off + 2], .Little, u16(len(c.name)))
+		off += 2
+		copy(buf[off:], transmute([]u8)c.name)
+		off += len(c.name)
+		endian.put_u16(buf[off:off + 2], .Little, u16(len(c.type_name)))
+		off += 2
+		copy(buf[off:], transmute([]u8)c.type_name)
+		off += len(c.type_name)
+		buf[off] = transmute(u8)c.flags
+		off += 1
 	}
 	return buf
 }
@@ -58,7 +128,8 @@ decode_catalog_row :: proc(payload: []u8, allocator := context.allocator) -> (Ca
 	if len(payload) < 6 {
 		return {}, .Corrupt
 	}
-	if payload[0] != CATALOG_ROW_VERSION {
+	version := payload[0]
+	if version != CATALOG_ROW_VERSION_V1 && version != CATALOG_ROW_VERSION_V2 {
 		return {}, .Corrupt
 	}
 	kind := Catalog_Kind(payload[1])
@@ -69,8 +140,16 @@ decode_catalog_row :: proc(payload: []u8, allocator := context.allocator) -> (Ca
 	if !ok {
 		return {}, .Corrupt
 	}
-	entry := Catalog_Entry{kind = kind, root = dbfile.Page_No(root)}
+	entry := Catalog_Entry{
+		version = version,
+		kind    = kind,
+		root    = dbfile.Page_No(root),
+	}
+
 	if kind == .Index {
+		if version != CATALOG_ROW_VERSION_V1 {
+			return {}, .Corrupt
+		}
 		if len(payload) < 8 {
 			return {}, .Corrupt
 		}
@@ -82,7 +161,69 @@ decode_catalog_row :: proc(payload: []u8, allocator := context.allocator) -> (Ca
 			return {}, .Corrupt
 		}
 		entry.parent_table = strings.clone(string(payload[8:8 + plen]), allocator)
+		return entry, .None
 	}
+
+	// Table
+	if version == CATALOG_ROW_VERSION_V1 {
+		entry.next_rowid = 1
+		return entry, .None
+	}
+
+	if len(payload) < 16 {
+		return {}, .Corrupt
+	}
+	next_rowid, ok3 := endian.get_u64(payload[6:14], .Little)
+	if !ok3 {
+		return {}, .Corrupt
+	}
+	col_count, ok4 := endian.get_u16(payload[14:16], .Little)
+	if !ok4 {
+		return {}, .Corrupt
+	}
+	entry.next_rowid = next_rowid
+	cols := make([]Catalog_Column, col_count, allocator)
+	off := 16
+	for i in 0 ..< int(col_count) {
+		if off + 2 > len(payload) {
+			free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+			return {}, .Corrupt
+		}
+		nlen, ok_n := endian.get_u16(payload[off:off + 2], .Little)
+		if !ok_n {
+			free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+			return {}, .Corrupt
+		}
+		off += 2
+		if off + int(nlen) + 2 > len(payload) {
+			free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+			return {}, .Corrupt
+		}
+		name := strings.clone(string(payload[off:off + int(nlen)]), allocator)
+		off += int(nlen)
+		tlen, ok_t := endian.get_u16(payload[off:off + 2], .Little)
+		if !ok_t {
+			delete(name, allocator)
+			free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+			return {}, .Corrupt
+		}
+		off += 2
+		if off + int(tlen) + 1 > len(payload) {
+			delete(name, allocator)
+			free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+			return {}, .Corrupt
+		}
+		type_name := strings.clone(string(payload[off:off + int(tlen)]), allocator)
+		off += int(tlen)
+		flags := transmute(bit_set[Catalog_Column_Flag; u8])payload[off]
+		off += 1
+		cols[i] = Catalog_Column{name = name, type_name = type_name, flags = flags}
+	}
+	if off != len(payload) {
+		free_catalog_entry(Catalog_Entry{columns = cols})
+		return {}, .Corrupt
+	}
+	entry.columns = cols
 	return entry, .None
 }
 
@@ -122,11 +263,7 @@ catalog_update_root :: proc(e: ^Engine, catalog_key: []u8, new_root: dbfile.Page
 	if derr != .None {
 		return derr
 	}
-	defer {
-		if entry.parent_table != "" {
-			delete(entry.parent_table)
-		}
-	}
+	defer free_catalog_entry(entry)
 	entry.root = new_root
 	updated := encode_catalog_row(entry)
 	if updated == nil {
@@ -154,8 +291,13 @@ engine_ensure_catalog :: proc(e: ^Engine) -> Engine_Error {
 	return txn_commit(e)
 }
 
-// catalog_register_table allocates a user table btree and records it in table_prime.
-catalog_register_table :: proc(e: ^Engine, name: string) -> (root: dbfile.Page_No, err: Engine_Error) {
+// catalog_register_table allocates a user table btree and records a v2 catalog row.
+catalog_register_table :: proc(
+	e: ^Engine,
+	name: string,
+	columns: []Catalog_Column = nil,
+	next_rowid: u64 = 1,
+) -> (root: dbfile.Page_No, err: Engine_Error) {
 	if err = require_txn(e); err != .None {
 		return 0, err
 	}
@@ -182,7 +324,13 @@ catalog_register_table :: proc(e: ^Engine, name: string) -> (root: dbfile.Page_N
 	}
 	_ = user
 
-	payload := encode_catalog_row({kind = .Table, root = root})
+	payload := encode_catalog_row({
+		version    = CATALOG_ROW_VERSION_V2,
+		kind       = .Table,
+		root       = root,
+		next_rowid = next_rowid,
+		columns    = columns,
+	})
 	defer delete(payload)
 	if err = btree_insert(&prime, ckey, payload); err != .None {
 		return 0, err
@@ -231,6 +379,7 @@ catalog_register_index :: proc(e: ^Engine, index_name, table_name: string) -> (r
 	_ = idx
 
 	payload := encode_catalog_row({
+		version      = CATALOG_ROW_VERSION_V1,
 		kind         = .Index,
 		root         = root,
 		parent_table = table_name,
@@ -241,6 +390,126 @@ catalog_register_index :: proc(e: ^Engine, index_name, table_name: string) -> (r
 	}
 	e.schema_cookie += 1
 	return root, .None
+}
+
+// catalog_get_table_entry loads a table catalog row (caller frees with free_catalog_entry).
+catalog_get_table_entry :: proc(
+	e: ^Engine,
+	name: string,
+	allocator := context.allocator,
+) -> (Catalog_Entry, Engine_Error) {
+	if err := require_open(e); err != .None {
+		return {}, err
+	}
+	prime, perr := table_prime_tree(e)
+	if perr != .None {
+		return {}, perr
+	}
+	ckey := catalog_table_key(name)
+	defer delete(ckey)
+	payload, gerr := btree_get(&prime, ckey)
+	if gerr != .None {
+		return {}, gerr
+	}
+	defer delete(payload)
+	entry, derr := decode_catalog_row(payload, allocator)
+	if derr != .None {
+		return {}, derr
+	}
+	if entry.kind != .Table {
+		free_catalog_entry(entry, allocator)
+		return {}, .Not_Found
+	}
+	return entry, .None
+}
+
+// catalog_table_has_indexes reports whether any index rows name this table as parent.
+catalog_table_has_indexes :: proc(e: ^Engine, table_name: string) -> (bool, Engine_Error) {
+	if err := require_open(e); err != .None {
+		return false, err
+	}
+	prime, perr := table_prime_tree(e)
+	if perr != .None {
+		return false, perr
+	}
+	cur := btree_cursor_init(&prime)
+	defer btree_cursor_close(&cur)
+	prefix := transmute([]u8)string(CATALOG_KEY_INDEX_PREFIX)
+	if err := btree_seek_ge(&cur, prefix); err != .None {
+		return false, err
+	}
+	for btree_cursor_valid(&cur) {
+		key := btree_cursor_key(&cur)
+		if !strings.has_prefix(string(key), CATALOG_KEY_INDEX_PREFIX) {
+			break
+		}
+		payload := btree_cursor_payload(&cur)
+		entry, derr := decode_catalog_row(payload)
+		if derr != .None {
+			return false, derr
+		}
+		match := entry.parent_table == table_name
+		free_catalog_entry(entry)
+		if match {
+			return true, .None
+		}
+		if err := btree_next(&cur); err != .None {
+			return false, err
+		}
+	}
+	return false, .None
+}
+
+// catalog_unregister_table removes the table catalog row.
+// Rejects if indexes still reference the table (.Has_Indexes).
+// Best-effort: frees the table root page (does not walk the full btree).
+catalog_unregister_table :: proc(e: ^Engine, name: string) -> Engine_Error {
+	if err := require_txn(e); err != .None {
+		return err
+	}
+	if len(name) == 0 {
+		return .Invalid_Argument
+	}
+	has_idx, herr := catalog_table_has_indexes(e, name)
+	if herr != .None {
+		return herr
+	}
+	if has_idx {
+		return .Has_Indexes
+	}
+
+	prime, perr := table_prime_tree(e)
+	if perr != .None {
+		return perr
+	}
+	ckey := catalog_table_key(name)
+	defer delete(ckey)
+	payload, gerr := btree_get(&prime, ckey)
+	if gerr != .None {
+		return gerr
+	}
+	entry, derr := decode_catalog_row(payload)
+	delete(payload)
+	if derr != .None {
+		return derr
+	}
+	if entry.kind != .Table {
+		free_catalog_entry(entry)
+		return .Not_Found
+	}
+	root := entry.root
+	free_catalog_entry(entry)
+
+	if err := btree_delete(&prime, ckey); err != .None {
+		return err
+	}
+	e.schema_cookie += 1
+
+	// Best-effort page reclaim of the heap root only.
+	if root != 0 {
+		_ = page_free(e, root)
+	}
+	return .None
 }
 
 // catalog_open_table returns a btree handle for a registered user table.
@@ -263,11 +532,7 @@ catalog_open_table :: proc(e: ^Engine, name: string) -> (tree: Btree, err: Engin
 	if derr != .None {
 		return {}, derr
 	}
-	defer {
-		if entry.parent_table != "" {
-			delete(entry.parent_table)
-		}
-	}
+	defer free_catalog_entry(entry)
 	if entry.kind != .Table {
 		return {}, .Not_Found
 	}
@@ -303,11 +568,7 @@ catalog_open_index :: proc(e: ^Engine, index_name: string) -> (tree: Btree, err:
 	if derr != .None {
 		return {}, derr
 	}
-	defer {
-		if entry.parent_table != "" {
-			delete(entry.parent_table)
-		}
-	}
+	defer free_catalog_entry(entry)
 	if entry.kind != .Index {
 		return {}, .Not_Found
 	}

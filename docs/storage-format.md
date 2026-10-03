@@ -1,8 +1,8 @@
 # Strix Storage Format
 
-**Version:** 0.4.2  
-**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4)  
-**Companion:** [`storage-engine.md`](storage-engine.md), [`btrees.md`](btrees.md)
+**Version:** 0.4.3  
+**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1)  
+**Companion:** [`storage-engine.md`](storage-engine.md), [`btrees.md`](btrees.md), [`sql-execute.md`](sql-execute.md)
 
 Strix uses a **native** single-file, page-oriented format. It is **not** SQLite-compatible.
 
@@ -152,21 +152,54 @@ Trees are addressed by **root page_no**. User tables and indexes are registered 
 
 Names are case-sensitive. Keys sort with all `index:` entries before `table:` (`i` < `t`).
 
-### Catalog row payload (v1)
+### Catalog row payload
 
 All multi-byte integers are **little-endian**.
+
+#### Index rows (v1 — unchanged)
 
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|
 | 0 | 1 | `version` | `1` |
-| 1 | 1 | `kind` | `1` = table, `2` = index |
-| 2 | 4 | `root_page` | B+tree root for table or index data |
-| 6 | 2 | `parent_name_len` | **Index only** — byte length of parent table name |
-| 8 | `parent_name_len` | `parent_table` | **Index only** — UTF-8 table name |
+| 1 | 1 | `kind` | `2` = index |
+| 2 | 4 | `root_page` | Index btree root |
+| 6 | 2 | `parent_name_len` | Byte length of parent table name |
+| 8 | `parent_name_len` | `parent_table` | UTF-8 table name |
 
-Table rows are **6 bytes** (no parent fields). Index rows are `8 + parent_name_len`.
+Index rows are `8 + parent_name_len`. Index column lists wait until execute phase E5.
 
-Optional `sql_text` / column meta may be added in a future row version; v1 stores roots only.
+#### Table rows v1 (legacy)
+
+| Offset | Size | Field | Notes |
+|--------|------|-------|-------|
+| 0 | 1 | `version` | `1` |
+| 1 | 1 | `kind` | `1` = table |
+| 2 | 4 | `root_page` | Heap btree root |
+
+Legacy **6-byte** table rows (roots only). Readers still accept v1; new `CREATE TABLE` / `catalog_register_table` writes **v2**.
+
+#### Table rows v2 (current)
+
+| Offset | Size | Field | Notes |
+|--------|------|-------|-------|
+| 0 | 1 | `version` | `2` |
+| 1 | 1 | `kind` | `1` = table |
+| 2 | 4 | `root_page` | Heap btree root |
+| 6 | 8 | `next_rowid` | High-water for implicit / `INTEGER PRIMARY KEY` rowid allocation; starts at `1` |
+| 14 | 2 | `col_count` | Number of columns |
+| 16 | … | `columns[]` | Repeated `col_count` times (see below) |
+
+Each column record:
+
+| Field | Size | Notes |
+|-------|------|-------|
+| `name_len` | u16 | |
+| `name` | `name_len` | UTF-8 column name |
+| `type_name_len` | u16 | `0` if type omitted |
+| `type_name` | `type_name_len` | UTF-8 type name string (affinity later) |
+| `flags` | u8 | bit0 = `NOT NULL`, bit1 = `PRIMARY KEY` |
+
+Empty tables (engine register with no schema) use `col_count = 0` and still store `next_rowid`. Root updates rewrite the same version/size in place.
 
 ### User table data btree
 
@@ -239,3 +272,4 @@ Rollback (no durability, and only when not fenced): `paging.discard_dirty` drops
 | 0.4 | 2026-10-02 | `table_prime` catalog keys and row payload v1 (S4) |
 | 0.4.1 | 2026-10-03 | Root write-through; schema_cookie txn semantics; flush_failed fence |
 | 0.4.2 | 2026-10-03 | Mandatory root ownership (`Caller_Root` / catalog bind / `.Unbound_Root`) |
+| 0.4.3 | 2026-10-03 | Table catalog payload v2 (`columns[]` + `next_rowid`); index rows remain v1 |
