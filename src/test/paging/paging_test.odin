@@ -285,6 +285,11 @@ test_discard_refused_after_partial_flush_failure :: proc(t: ^testing.T) {
 	derr := paging.discard_dirty(&p)
 	testing.expect_value(t, derr, paging.Page_Error.Flush_Failed)
 
+	// pager_close must refuse over a live fence (keep dirty frames for retry flush).
+	testing.expect_value(t, paging.pager_close(&p), paging.Page_Error.Flush_Failed)
+	testing.expect(t, !p.closed)
+	testing.expect(t, p.flush_failed)
+
 	// Retry flush without the hook; fence clears; discard then allowed (no dirty left).
 	p.flush_fail_after_data_writes = 0
 	testing.expect(t, paging.ok(paging.flush(&p, {commit_counter = 1})))

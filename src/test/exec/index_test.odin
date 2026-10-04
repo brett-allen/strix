@@ -1,5 +1,6 @@
 package exec_tests
 
+import "core:bytes"
 import "core:fmt"
 import "core:os"
 import "core:testing"
@@ -501,4 +502,89 @@ test_index_probe_falls_back_only_when_no_usable_index :: proc(t: ^testing.T) {
 	testing.expect_value(t, r2.rows[0][0], "1")
 	exec.free_error(e2)
 	exec.free_result(r2)
+}
+
+@(test)
+test_index_key_float_memcmp_order_mixed_sign :: proc(t: ^testing.T) {
+	// SQLite-style float encode must be memcmp-ordered across negatives and positives.
+	ordered := []f64{-100.0, -2.5, -0.0, 0.0, 0.5, 2.5, 100.0}
+	keys := make([][]u8, len(ordered))
+	defer {
+		for k in keys {
+			delete(k)
+		}
+		delete(keys)
+	}
+	for f, i in ordered {
+		k, kerr := exec.encode_index_key([]exec.Value{exec.value_float(f)})
+		testing.expectf(t, !exec.has_error(kerr), "%s", kerr.message)
+		exec.free_error(kerr)
+		keys[i] = k
+	}
+	for i in 0 ..< len(keys) - 1 {
+		cmp := bytes.compare(keys[i], keys[i + 1])
+		testing.expectf(
+			t,
+			cmp < 0,
+			"expected encode(%.1f) < encode(%.1f) by memcmp, cmp=%d",
+			ordered[i],
+			ordered[i + 1],
+			cmp,
+		)
+	}
+	// Explicit mixed-sign: any negative key must memcmp-less than any positive key.
+	neg, nerr := exec.encode_index_key([]exec.Value{exec.value_float(-1.0)})
+	testing.expect(t, !exec.has_error(nerr))
+	exec.free_error(nerr)
+	defer delete(neg)
+	pos, perr := exec.encode_index_key([]exec.Value{exec.value_float(1.0)})
+	testing.expect(t, !exec.has_error(perr))
+	exec.free_error(perr)
+	defer delete(pos)
+	testing.expect(t, bytes.compare(neg, pos) < 0)
+}
+
+@(test)
+test_index_float_column_sort_order_via_sql :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_script(
+		&s,
+		"CREATE TABLE nums (id INTEGER PRIMARY KEY, v REAL);" +
+		"INSERT INTO nums VALUES (1, 2.5), (2, -1.0), (3, 0.0), (4, -10.0), (5, 100.0);" +
+		"CREATE INDEX nums_by_v ON nums (v);",
+	)
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	// ORDER BY uses in-memory sort; still validates float compare. Index key order
+	// is covered by test_index_key_float_memcmp_order_mixed_sign; here prove SQL
+	// ascending order matches numeric order including negatives.
+	r, eerr := exec.exec_statement(&s, "SELECT id, v FROM nums ORDER BY v ASC;")
+	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+	testing.expect_value(t, len(r.rows), 5)
+	testing.expect_value(t, r.rows[0][0], "4") // -10
+	testing.expect_value(t, r.rows[1][0], "2") // -1
+	testing.expect_value(t, r.rows[2][0], "3") // 0
+	testing.expect_value(t, r.rows[3][0], "1") // 2.5
+	testing.expect_value(t, r.rows[4][0], "5") // 100
+	exec.free_error(eerr)
+	exec.free_result(r)
+
+	// Walk index keys and confirm rowids follow numeric v order.
+	idx, oerr := engine.catalog_open_index(&e, "nums_by_v")
+	testing.expect(t, engine.ok(oerr))
+	want_ids := []u64{4, 2, 3, 1, 5}
+	float_vals := []f64{-10.0, -1.0, 0.0, 2.5, 100.0}
+	for f, i in float_vals {
+		ikey, kerr := exec.encode_index_key([]exec.Value{exec.value_float(f)})
+		testing.expect(t, !exec.has_error(kerr))
+		exec.free_error(kerr)
+		testing.expect(t, engine.ok(engine.index_lookup_rowid(&idx, ikey, want_ids[i])))
+		delete(ikey)
+	}
 }

@@ -35,7 +35,7 @@ error_string :: proc(err: Page_Error) -> string {
 	case .Pinned:            return "page is pinned"
 	case .Not_Pinned:        return "page is not pinned"
 	case .Already_Free:      return "page is already on the freelist"
-	case .Flush_Failed:      return "partial flush failed; discard refused until flush succeeds"
+	case .Flush_Failed:      return "partial flush failed; close/discard refused until flush succeeds"
 	case .Db:                return "database file error"
 	}
 	return "unknown paging error"

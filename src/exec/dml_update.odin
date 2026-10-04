@@ -42,21 +42,18 @@ exec_delete :: proc(s: ^Exec_Session, stmt: sql.Delete_Stmt, span: sql.Span) -> 
 
 	idx_refs, ixerr := table_indexes_maintained(e, stmt.table, span)
 	if has_error(ixerr) {
-		stmt_write_abort(s, e, started)
-		return {}, ixerr
+		return {}, finish_write_error(s, e, started, ixerr, span)
 	}
 	defer engine.free_catalog_index_refs(idx_refs)
 
 	tree, oerr := engine.catalog_open_table(e, stmt.table)
 	if oerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(oerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(oerr, span), span)
 	}
 
 	rowids, cerr := collect_matching_rowids(&tree, entry.columns, stmt.table, "", stmt.where_expr, span)
 	if has_error(cerr) {
-		stmt_write_abort(s, e, started)
-		return {}, cerr
+		return {}, finish_write_error(s, e, started, cerr, span)
 	}
 	defer delete(rowids)
 
@@ -64,26 +61,22 @@ exec_delete :: proc(s: ^Exec_Session, stmt: sql.Delete_Stmt, span: sql.Span) -> 
 		if len(idx_refs) > 0 {
 			old_payload, gerr := engine.table_get_row(&tree, rowid)
 			if gerr != .None {
-				stmt_write_abort(s, e, started)
-				return {}, from_engine_error(gerr, span)
+				return {}, finish_write_error(s, e, started, from_engine_error(gerr, span), span)
 			}
 			old_vals, derr := decode_heap_row(old_payload)
 			delete(old_payload)
 			if has_error(derr) {
-				stmt_write_abort(s, e, started)
-				return {}, derr
+				return {}, finish_write_error(s, e, started, derr, span)
 			}
 			merr := index_delete_for_row(e, idx_refs, entry.columns, old_vals, rowid, span)
 			free_values(old_vals)
 			if has_error(merr) {
-				stmt_write_abort(s, e, started)
-				return {}, merr
+				return {}, finish_write_error(s, e, started, merr, span)
 			}
 		}
 		derr := engine.table_delete_row(&tree, rowid)
 		if derr != .None {
-			stmt_write_abort(s, e, started)
-			return {}, from_engine_error(derr, span)
+			return {}, finish_write_error(s, e, started, from_engine_error(derr, span), span)
 		}
 	}
 
@@ -150,15 +143,13 @@ exec_update :: proc(s: ^Exec_Session, stmt: sql.Update_Stmt, span: sql.Span) -> 
 
 	idx_refs, ixerr := table_indexes_maintained(e, stmt.table, span)
 	if has_error(ixerr) {
-		stmt_write_abort(s, e, started)
-		return {}, ixerr
+		return {}, finish_write_error(s, e, started, ixerr, span)
 	}
 	defer engine.free_catalog_index_refs(idx_refs)
 
 	tree, oerr := engine.catalog_open_table(e, stmt.table)
 	if oerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(oerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(oerr, span), span)
 	}
 
 	pending, perr := collect_update_rewrites(
@@ -170,8 +161,7 @@ exec_update :: proc(s: ^Exec_Session, stmt: sql.Update_Stmt, span: sql.Span) -> 
 		span,
 	)
 	if has_error(perr) {
-		stmt_write_abort(s, e, started)
-		return {}, perr
+		return {}, finish_write_error(s, e, started, perr, span)
 	}
 	defer free_pending_rewrites(pending)
 
@@ -179,33 +169,28 @@ exec_update :: proc(s: ^Exec_Session, stmt: sql.Update_Stmt, span: sql.Span) -> 
 		if len(idx_refs) > 0 {
 			old_vals, derr := decode_heap_row(item.old_payload)
 			if has_error(derr) {
-				stmt_write_abort(s, e, started)
-				return {}, derr
+				return {}, finish_write_error(s, e, started, derr, span)
 			}
 			new_vals, nerr := decode_heap_row(item.payload)
 			if has_error(nerr) {
 				free_values(old_vals)
-				stmt_write_abort(s, e, started)
-				return {}, nerr
+				return {}, finish_write_error(s, e, started, nerr, span)
 			}
 			merr := index_delete_for_row(e, idx_refs, entry.columns, old_vals, item.rowid, span)
 			free_values(old_vals)
 			if has_error(merr) {
 				free_values(new_vals)
-				stmt_write_abort(s, e, started)
-				return {}, merr
+				return {}, finish_write_error(s, e, started, merr, span)
 			}
 			merr2 := index_insert_for_row(e, idx_refs, entry.columns, new_vals, item.rowid, span)
 			free_values(new_vals)
 			if has_error(merr2) {
-				stmt_write_abort(s, e, started)
-				return {}, merr2
+				return {}, finish_write_error(s, e, started, merr2, span)
 			}
 		}
 		rerr := engine.table_rewrite_row(&tree, item.rowid, item.payload)
 		if rerr != .None {
-			stmt_write_abort(s, e, started)
-			return {}, from_engine_error(rerr, span)
+			return {}, finish_write_error(s, e, started, from_engine_error(rerr, span), span)
 		}
 	}
 

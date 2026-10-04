@@ -709,6 +709,62 @@ catalog_get_index_entry :: proc(
 	return entry, .None
 }
 
+// catalog_list_tables returns user table names from table_prime (catalog key order).
+// Caller frees each string and the slice (see free_catalog_table_names).
+catalog_list_tables :: proc(
+	e: ^Engine,
+	allocator := context.allocator,
+) -> ([]string, Engine_Error) {
+	if err := require_open(e); err != .None {
+		return nil, err
+	}
+	prime, perr := table_prime_tree(e)
+	if perr != .None {
+		return nil, perr
+	}
+	out := make([dynamic]string, 0, 8, allocator)
+	cur := btree_cursor_init(&prime)
+	defer btree_cursor_close(&cur)
+	prefix := transmute([]u8)string(CATALOG_KEY_TABLE_PREFIX)
+	if err := btree_seek_ge(&cur, prefix); err != .None {
+		delete(out)
+		return nil, err
+	}
+	for btree_cursor_valid(&cur) {
+		key := btree_cursor_key(&cur)
+		if !strings.has_prefix(string(key), CATALOG_KEY_TABLE_PREFIX) {
+			break
+		}
+		payload := btree_cursor_payload(&cur)
+		entry, derr := decode_catalog_row(payload, allocator)
+		if derr != .None {
+			free_catalog_table_names(out[:], allocator)
+			return nil, derr
+		}
+		if entry.kind == .Table {
+			name := strings.clone(string(key)[len(CATALOG_KEY_TABLE_PREFIX):], allocator)
+			append(&out, name)
+		}
+		free_catalog_entry(entry, allocator)
+		if err := btree_next(&cur); err != .None {
+			free_catalog_table_names(out[:], allocator)
+			return nil, err
+		}
+	}
+	return out[:], .None
+}
+
+free_catalog_table_names :: proc(names: []string, allocator := context.allocator) {
+	for n in names {
+		if n != "" {
+			delete(n, allocator)
+		}
+	}
+	if names != nil {
+		delete(names, allocator)
+	}
+}
+
 // Catalog_Index_Ref is a named index entry for a parent table (caller frees with free_catalog_index_ref).
 Catalog_Index_Ref :: struct {
 	name:  string, // owned
@@ -777,7 +833,7 @@ catalog_indexes_on_table :: proc(
 	return out[:], .None
 }
 
-// catalog_unregister_index removes an index catalog row and best-effort frees its root page.
+// catalog_unregister_index removes an index catalog row and frees its full btree.
 catalog_unregister_index :: proc(e: ^Engine, name: string) -> Engine_Error {
 	if err := require_txn(e); err != .None {
 		return err
@@ -812,7 +868,9 @@ catalog_unregister_index :: proc(e: ^Engine, name: string) -> Engine_Error {
 	}
 	e.schema_cookie += 1
 	if root != 0 {
-		_ = page_free(e, root)
+		if ferr := btree_free_tree(e, root); ferr != .None {
+			return ferr
+		}
 	}
 	return .None
 }
@@ -856,7 +914,7 @@ catalog_table_has_indexes :: proc(e: ^Engine, table_name: string) -> (bool, Engi
 
 // catalog_unregister_table removes the table catalog row.
 // Rejects if indexes still reference the table (.Has_Indexes).
-// Best-effort: frees the table root page (does not walk the full btree).
+// Reclaims the full table btree (all pages) onto the freelist.
 catalog_unregister_table :: proc(e: ^Engine, name: string) -> Engine_Error {
 	if err := require_txn(e); err != .None {
 		return err
@@ -899,9 +957,10 @@ catalog_unregister_table :: proc(e: ^Engine, name: string) -> Engine_Error {
 	}
 	e.schema_cookie += 1
 
-	// Best-effort page reclaim of the heap root only.
 	if root != 0 {
-		_ = page_free(e, root)
+		if ferr := btree_free_tree(e, root); ferr != .None {
+			return ferr
+		}
 	}
 	return .None
 }

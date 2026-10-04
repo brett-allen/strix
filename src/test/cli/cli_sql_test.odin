@@ -256,3 +256,39 @@ test_read_file_or_stdin_file :: proc(t: ^testing.T) {
 	_, bad := cli.read_file_or_stdin(fmt.tprintf("/tmp/strix-e1-no-such-%d.sql", os.get_pid()))
 	testing.expect(t, !bad)
 }
+
+@(test)
+test_run_sql_fence_forfeits_recovery_on_exit :: proc(t: ^testing.T) {
+	// Production path: real run_sql under flush-fail hook. Exit 1; session is
+	// abandoned with the call (honest batch forfeit — no post-exit COMMIT).
+	// Allocator may WARN about the refused close; that is the forfeit contract.
+	path := fmt.tprintf("/tmp/strix-sql-fence-forfeit-%d.strix", os.get_pid())
+	defer os.remove(path)
+	testing.expect_value(t, cli.init_database(path), 0)
+	testing.expect_value(
+		t,
+		cli.run_sql(path, "CREATE TABLE t (id INTEGER PRIMARY KEY, n TEXT);"),
+		0,
+	)
+
+	r, w, perr := os.pipe()
+	testing.expect(t, perr == nil)
+	old_stderr := os.stderr
+	os.stderr = w
+	code := cli.run_sql(
+		path,
+		"INSERT INTO t (id, n) VALUES (1, 'a');",
+		exec.Exec_Options{flush_fail_after_data_writes = 1},
+	)
+	os.close(w)
+	os.stderr = old_stderr
+	data, rerr := os.read_entire_file_from_file(r, context.allocator)
+	os.close(r)
+	testing.expect(t, rerr == nil)
+	err_out := string(data)
+	defer delete(err_out)
+
+	testing.expect_value(t, code, 1)
+	testing.expect(t, strings.contains(err_out, "forfeit"))
+	testing.expect(t, !strings.contains(err_out, "retry COMMIT"))
+}

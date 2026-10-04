@@ -68,6 +68,11 @@ pager_close :: proc(p: ^Pager) -> Page_Error {
 	if p == nil || p.closed {
 		return .None
 	}
+	// Never tear down cache/file over a live flush fence — dirty frames are the
+	// only recovery state for a retry flush. Callers must flush successfully first.
+	if p.flush_failed {
+		return .Flush_Failed
+	}
 	for i in 0 ..< len(p.frames) {
 		if p.frames[i].data != nil {
 			delete(p.frames[i].data)
@@ -84,6 +89,11 @@ pager_close :: proc(p: ^Pager) -> Page_Error {
 	}
 	p.closed = true
 	return err
+}
+
+// pager_flush_failed reports whether a partial-flush fence is active.
+pager_flush_failed :: proc(p: ^Pager) -> bool {
+	return p != nil && !p.closed && p.flush_failed
 }
 
 // get_readonly pins a data page for reading (loads from disk on miss).

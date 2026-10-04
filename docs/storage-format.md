@@ -275,7 +275,7 @@ Registration and opens go through `engine` catalog APIs (`catalog_register_*`, `
 |----------|---------|
 | `0` NULL | (none) |
 | `1` Integer | u64 BE of `i64` bits with high bit flipped (signed memcmp order) |
-| `2` Float | u64 BE of IEEE-754 bits |
+| `2` Float | u64 BE of IEEE-754 bits after SQLite-style order transform (positive: flip sign bit; negative: flip all bits) so `memcmp` matches numeric order |
 | `3` Text | u32 BE length + UTF-8 bytes + `0x00` |
 | `4` Blob | u32 BE length + bytes + `0x00` |
 
@@ -314,9 +314,13 @@ On open, `freelist_head` and `table_prime_root` must be `0` or strictly less tha
 
 Crash during a multi-page flush may leave a torn file in v1 (no WAL yet).
 
-If flush fails after writing one or more data pages, the pager sets a **`flush_failed` fence**: `discard_dirty` / `txn_rollback` return `.Flush_Failed` until a subsequent flush succeeds (v1 recovery: retry flush; no WAL).
+If flush fails after writing one or more data pages, the pager sets a **`flush_failed` fence**: `discard_dirty` / `txn_rollback` / `pager_close` return `.Flush_Failed` until a subsequent flush succeeds (v1 recovery: retry flush / `COMMIT` / `txn_commit` **on the still-open session**; no WAL). Auto-commit flush failure promotes the session to `explicit_txn` so SQL can retry `COMMIT` (see [`sql-execute.md`](sql-execute.md)).
+
+`engine_close` / `session_close` / `shell_state_destroy` must **refuse to close** while the fence is live — they return `.Flush_Failed` and leave the pager, dirty frames, and file handle intact so recovery `COMMIT` can retry. They must never `pager_close` over a live fence (that would destroy the only recovery state). There is no default “surface then close” path.
 
 Rollback (no durability, and only when not fenced): `paging.discard_dirty` drops dirty cache frames and restores `page_count` / `freelist_head` to the last successful flush (or open). The engine also restores `schema_cookie` and `table_prime_root` from the txn-begin snapshot.
+
+**DROP TABLE / DROP INDEX:** unregister removes the catalog row and walks the object btree to return **all** pages (not only the root) to the freelist.
 
 ---
 

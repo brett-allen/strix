@@ -30,26 +30,47 @@ session_adopt :: proc(e: ^engine.Engine) -> Exec_Session {
 }
 
 // session_close rolls back any open txn and closes the engine when owned.
+// While a flush fence is live, close is REFUSED: session stays open/usable so
+// the caller can retry COMMIT. Never frees the engine or marks closed over a fence.
 session_close :: proc(s: ^Exec_Session) -> Exec_Error {
 	if s == nil || s.closed {
 		return ok_error()
 	}
-	s.closed = true
-	if s.eng != nil && s.eng.in_txn {
-		_ = engine.txn_rollback(s.eng)
+	if s.eng != nil && engine.engine_flush_fence(s.eng) {
+		return from_engine_error(.Flush_Failed)
 	}
-	s.explicit_txn = false
-	s.txn_aborted = false
 	if s.owns_engine && s.eng != nil {
 		eerr := engine.engine_close(s.eng)
-		free(s.eng)
-		s.eng = nil
-		if eerr != .None {
+		if eerr == .Flush_Failed {
+			// Engine refused close; keep session usable for recovery COMMIT.
 			return from_engine_error(eerr)
 		}
+		close_err := ok_error()
+		if eerr != .None {
+			close_err = from_engine_error(eerr)
+		}
+		free(s.eng)
+		s.eng = nil
+		s.closed = true
+		s.explicit_txn = false
+		s.txn_aborted = false
+		return close_err
+	}
+	if s.eng != nil && s.eng.in_txn {
+		rerr := engine.txn_rollback(s.eng)
+		if rerr == .Flush_Failed {
+			return from_engine_error(rerr)
+		}
+		if rerr != .None && rerr != .No_Txn {
+			return from_engine_error(rerr)
+		}
+		s.eng = nil
 	} else {
 		s.eng = nil
 	}
+	s.closed = true
+	s.explicit_txn = false
+	s.txn_aborted = false
 	return ok_error()
 }
 
@@ -58,4 +79,12 @@ session_engine :: proc(s: ^Exec_Session) -> ^engine.Engine {
 		return nil
 	}
 	return s.eng
+}
+
+// session_flush_fence reports whether recovery COMMIT is required before close/quit.
+session_flush_fence :: proc(s: ^Exec_Session) -> bool {
+	if s == nil || s.closed || s.eng == nil {
+		return false
+	}
+	return engine.engine_flush_fence(s.eng)
 }
