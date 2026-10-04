@@ -179,17 +179,15 @@ exec_create_table :: proc(s: ^Exec_Session, stmt: sql.Create_Table_Stmt, span: s
 	if rerr == .Exists {
 		if stmt.if_not_exists {
 			// Soft success: only unwind an auto-commit txn; keep explicit txn open.
-			if started {
-				_ = engine.txn_rollback(e)
+			if serr := soft_rollback_started(s, e, started, span); has_error(serr) {
+				return {}, serr
 			}
 			return ok_result(), ok_error()
 		}
-		stmt_write_abort(s, e, started)
-		return {}, make_error(.Table_Exists, "table %q already exists", stmt.name, span = span)
+		return {}, finish_write_error(s, e, started, make_error(.Table_Exists, "table %q already exists", stmt.name, span = span), span)
 	}
 	if rerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(rerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(rerr, span), span)
 	}
 
 	if cerr := stmt_write_commit(s, e, started, span); has_error(cerr) {
@@ -212,26 +210,29 @@ exec_drop_table :: proc(s: ^Exec_Session, stmt: sql.Drop_Table_Stmt, span: sql.S
 	uerr := engine.catalog_unregister_table(e, stmt.name)
 	if uerr == .Not_Found {
 		if stmt.if_exists {
-			if started {
-				_ = engine.txn_rollback(e)
+			if serr := soft_rollback_started(s, e, started, span); has_error(serr) {
+				return {}, serr
 			}
 			return ok_result(), ok_error()
 		}
-		stmt_write_abort(s, e, started)
-		return {}, make_error(.Unknown_Table, "no such table: %q", stmt.name, span = span)
+		return {}, finish_write_error(s, e, started, make_error(.Unknown_Table, "no such table: %q", stmt.name, span = span), span)
 	}
 	if uerr == .Has_Indexes {
-		stmt_write_abort(s, e, started)
-		return {}, make_error(
-			.Has_Indexes,
-			"cannot DROP TABLE %q: indexes still exist (drop indexes first)",
-			stmt.name,
-			span = span,
+		return {}, finish_write_error(
+			s,
+			e,
+			started,
+			make_error(
+				.Has_Indexes,
+				"cannot DROP TABLE %q: indexes still exist (drop indexes first)",
+				stmt.name,
+				span = span,
+			),
+			span,
 		)
 	}
 	if uerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(uerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(uerr, span), span)
 	}
 
 	if cerr := stmt_write_commit(s, e, started, span); has_error(cerr) {

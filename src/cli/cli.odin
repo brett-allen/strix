@@ -3,6 +3,7 @@ package cli
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:terminal"
 import engine "../engine"
 import exec "../exec"
 
@@ -47,12 +48,19 @@ print_usage :: proc() {
 		"  sql  [path] file.sql     Run SQL script file\n" +
 		"  sql  [path]              Run SQL from stdin\n" +
 		"      --continue-on-error  Keep running after statement errors\n" +
-		"  help                     Show this help\n",
+		"  shell [path] [--bail]    Interactive SQL shell (default: %s)\n" +
+		"  help                     Show this help\n" +
+		"\n" +
+		"With no command, if stdin is a TTY, enters the shell on %s.\n",
+		DEFAULT_DB_PATH,
+		DEFAULT_DB_PATH,
 		DEFAULT_DB_PATH,
 	)
 }
 
 // run_sql opens path and executes sql_text. Returns process exit code.
+// Close refusal (flush fence) always yields exit 1 — never `_ = session_close`.
+// Batch process exit forfeits in-memory recovery (no post-exit COMMIT coaching).
 run_sql :: proc(path: string, sql_text: string, opts := exec.Exec_Options{}) -> int {
 	resolved := ensure_strix_path(path)
 	defer delete(resolved)
@@ -63,58 +71,141 @@ run_sql :: proc(path: string, sql_text: string, opts := exec.Exec_Options{}) -> 
 		exec.free_error(err)
 		return 1
 	}
-	defer exec.session_close(&session)
 
+	// Test hook: inject pager flush failure before running the script.
+	if opts.flush_fail_after_data_writes > 0 {
+		if eng := exec.session_engine(&session); eng != nil {
+			if pager := engine.engine_pager_unsafe_for_tests(eng); pager != nil {
+				pager.flush_fail_after_data_writes = opts.flush_fail_after_data_writes
+			}
+		}
+	}
+
+	exit_code := 0
 	result, eerr := exec.exec_script(&session, sql_text, opts)
+	fenced := exec.session_flush_fence(&session)
 	if exec.has_error(eerr) {
-		loc := opts.source_path
-		formatted := exec.format_error(eerr, loc)
-		defer delete(formatted)
-		fmt.eprintf("strix sql: %s\n", formatted)
+		// While fenced, skip in-process "retry COMMIT" coaching — process exit
+		// cannot keep a recovery session; close path prints forfeit-only.
+		if !fenced {
+			loc := opts.source_path
+			formatted := exec.format_error(eerr, loc)
+			defer delete(formatted)
+			fmt.eprintf("strix sql: %s\n", formatted)
+		}
 		exec.free_error(eerr)
 		exec.free_result(result)
+		exit_code = 1
+	} else {
+		print_exec_result(result)
+		exec.free_result(result)
+	}
+
+	close_err := exec.session_close(&session)
+	if exec.has_error(close_err) {
+		// Forfeit-only: never echo engine "retry COMMIT (close refused)".
+		fmt.eprintln(
+			"strix sql: flush recovery forfeited — process exit abandons in-memory dirty pages; database may be torn after partial flush",
+		)
+		exec.free_error(close_err)
 		return 1
 	}
-	defer exec.free_result(result)
-
-	switch result.kind {
-	case .Ok:
-		fmt.println("ok")
-	case .Rows_Affected:
-		fmt.printf("%d rows\n", result.rows_affected)
-	case .Result_Set:
-		print_result_set(result)
-	}
-	return 0
+	exec.free_error(close_err)
+	return exit_code
 }
 
-// format_result_set builds an aligned text table (header + rows). Caller deletes the string.
-format_result_set :: proc(result: exec.Exec_Result, allocator := context.allocator) -> string {
+Display_Mode :: enum {
+	Column,
+	List,
+}
+
+// Display_Opts controls SELECT result printing (shell toggles; batch uses defaults).
+Display_Opts :: struct {
+	headers:   bool,
+	mode:      Display_Mode,
+	separator: string, // list-mode column separator; default "|"
+	nullvalue: string, // display for exec NULL sentinel; default "NULL"
+}
+
+DEFAULT_DISPLAY_OPTS :: Display_Opts {
+	headers   = true,
+	mode      = .Column,
+	separator = "|",
+	nullvalue = "NULL",
+}
+
+// Matches exec.format_value_cell for .Null values (CLI cannot distinguish TEXT 'NULL').
+NULL_CELL_SENTINEL :: "NULL"
+
+LIST_SEPARATOR :: "|"
+
+display_cell :: proc(cell: string, nullvalue: string) -> string {
+	if cell == NULL_CELL_SENTINEL {
+		return nullvalue
+	}
+	return cell
+}
+
+// format_result_set builds a text table. Caller deletes the string.
+// Default opts match batch `strix sql` (headers on, column mode).
+format_result_set :: proc(
+	result: exec.Exec_Result,
+	opts := DEFAULT_DISPLAY_OPTS,
+	allocator := context.allocator,
+) -> string {
 	ncols := len(result.column_names)
 	if ncols == 0 {
 		return ""
 	}
+	// Normalize zero-value partial literals (separator/nullvalue omitted).
+	nopts := opts
+	if nopts.separator == "" {
+		nopts.separator = LIST_SEPARATOR
+	}
+	if nopts.nullvalue == "" {
+		nopts.nullvalue = NULL_CELL_SENTINEL
+	}
+	switch nopts.mode {
+	case .List:
+		return format_result_set_list(result, nopts, allocator)
+	case .Column:
+		return format_result_set_column(result, nopts, allocator)
+	}
+	return ""
+}
+
+format_result_set_column :: proc(
+	result: exec.Exec_Result,
+	opts: Display_Opts,
+	allocator := context.allocator,
+) -> string {
+	ncols := len(result.column_names)
 	widths := make([]int, ncols, allocator)
 	defer delete(widths, allocator)
 	for name, i in result.column_names {
-		widths[i] = len(name)
+		if opts.headers {
+			widths[i] = len(name)
+		}
 	}
 	for row in result.rows {
 		for i in 0 ..< min(ncols, len(row)) {
-			if len(row[i]) > widths[i] {
-				widths[i] = len(row[i])
+			cell := display_cell(row[i], opts.nullvalue)
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
 			}
 		}
 	}
 	b: strings.Builder
 	strings.builder_init(&b, allocator)
-	for i in 0 ..< ncols {
-		if i > 0 {
-			strings.write_string(&b, "  ")
+	if opts.headers {
+		for i in 0 ..< ncols {
+			if i > 0 {
+				strings.write_string(&b, "  ")
+			}
+			fmt.sbprintf(&b, "%-*s", widths[i], result.column_names[i])
 		}
-		fmt.sbprintf(&b, "%-*s", widths[i], result.column_names[i])
+		strings.write_byte(&b, '\n')
 	}
-	strings.write_byte(&b, '\n')
 	for row in result.rows {
 		for i in 0 ..< ncols {
 			if i > 0 {
@@ -122,7 +213,7 @@ format_result_set :: proc(result: exec.Exec_Result, allocator := context.allocat
 			}
 			cell := ""
 			if i < len(row) {
-				cell = row[i]
+				cell = display_cell(row[i], opts.nullvalue)
 			}
 			fmt.sbprintf(&b, "%-*s", widths[i], cell)
 		}
@@ -131,9 +222,43 @@ format_result_set :: proc(result: exec.Exec_Result, allocator := context.allocat
 	return strings.to_string(b)
 }
 
-// print_result_set writes an aligned text table (header + rows) to stdout.
-print_result_set :: proc(result: exec.Exec_Result) {
-	text := format_result_set(result)
+format_result_set_list :: proc(
+	result: exec.Exec_Result,
+	opts: Display_Opts,
+	allocator := context.allocator,
+) -> string {
+	ncols := len(result.column_names)
+	sep := opts.separator if opts.separator != "" else LIST_SEPARATOR
+	b: strings.Builder
+	strings.builder_init(&b, allocator)
+	if opts.headers {
+		for i in 0 ..< ncols {
+			if i > 0 {
+				strings.write_string(&b, sep)
+			}
+			strings.write_string(&b, result.column_names[i])
+		}
+		strings.write_byte(&b, '\n')
+	}
+	for row in result.rows {
+		for i in 0 ..< ncols {
+			if i > 0 {
+				strings.write_string(&b, sep)
+			}
+			cell := ""
+			if i < len(row) {
+				cell = display_cell(row[i], opts.nullvalue)
+			}
+			strings.write_string(&b, cell)
+		}
+		strings.write_byte(&b, '\n')
+	}
+	return strings.to_string(b)
+}
+
+// print_result_set writes a result table to stdout (default = batch aligned+headers).
+print_result_set :: proc(result: exec.Exec_Result, opts := DEFAULT_DISPLAY_OPTS) {
+	text := format_result_set(result, opts)
 	defer delete(text)
 	if text != "" {
 		fmt.print(text)
@@ -269,12 +394,20 @@ run_sql_command :: proc(args: []string) -> int {
 	return run_sql(parsed.db_path, sql_text, opts)
 }
 
+// run_bare handles `strix` with no args: TTY stdin → shell; else usage + exit 1.
+run_bare :: proc(stdin_is_tty: bool, path := DEFAULT_DB_PATH) -> int {
+	if stdin_is_tty {
+		return shell_run(path)
+	}
+	print_usage()
+	return 1
+}
+
 // run dispatches CLI commands from argv (without the program name).
 // Returns a process exit code.
 run :: proc(args: []string) -> int {
 	if len(args) == 0 {
-		print_usage()
-		return 1
+		return run_bare(terminal.is_terminal(os.stdin))
 	}
 
 	switch args[0] {
@@ -291,6 +424,8 @@ run :: proc(args: []string) -> int {
 		return init_database(path)
 	case "sql":
 		return run_sql_command(args[1:])
+	case "shell":
+		return run_shell_command(args[1:])
 	case "help", "-h", "--help":
 		print_usage()
 		return 0

@@ -50,7 +50,14 @@ encode_index_key :: proc(vals: []Value, allocator := context.allocator) -> ([]u8
 		case .Float:
 			buf[off] = IDX_TAG_FLOAT
 			off += 1
+			// SQLite-style order-preserving IEEE-754 transform for memcmp:
+			// positive → flip sign bit; negative → flip all bits.
 			bits := transmute(u64)v.f
+			if bits & (u64(1) << 63) != 0 {
+				bits = ~bits
+			} else {
+				bits ~= u64(1) << 63
+			}
 			if !endian.put_u64(buf[off:off + 8], .Big, bits) {
 				delete(buf, allocator)
 				return nil, error_at(.Engine, "index key float encode failed")

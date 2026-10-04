@@ -1,0 +1,174 @@
+package exec
+
+import "core:fmt"
+import "core:slice"
+import "core:strings"
+import engine "../engine"
+
+// list_tables returns user table names in lexical order.
+// Caller frees with free_table_names.
+list_tables :: proc(s: ^Exec_Session, allocator := context.allocator) -> ([]string, Exec_Error) {
+	e := session_engine(s)
+	if e == nil {
+		return nil, error_at(.Closed, "session is closed")
+	}
+	names, err := engine.catalog_list_tables(e, allocator)
+	if err != .None {
+		return nil, from_engine_error(err)
+	}
+	slice.sort(names)
+	return names, ok_error()
+}
+
+free_table_names :: proc(names: []string, allocator := context.allocator) {
+	engine.free_catalog_table_names(names, allocator)
+}
+
+// schema_sql synthesizes CREATE TABLE / CREATE INDEX text from catalog meta.
+// If table_name is empty, all tables (lexical) are included; otherwise one table
+// or Unknown_Table if missing. Caller frees the returned string.
+schema_sql :: proc(
+	s: ^Exec_Session,
+	table_name: string = "",
+	allocator := context.allocator,
+) -> (string, Exec_Error) {
+	e := session_engine(s)
+	if e == nil {
+		return "", error_at(.Closed, "session is closed")
+	}
+
+	if table_name != "" {
+		return schema_sql_one(e, table_name, allocator)
+	}
+
+	names, lerr := list_tables(s, allocator)
+	if has_error(lerr) {
+		return "", lerr
+	}
+	defer free_table_names(names, allocator)
+
+	b: strings.Builder
+	strings.builder_init(&b, allocator)
+	defer strings.builder_destroy(&b)
+
+	for name, i in names {
+		part, perr := schema_sql_one(e, name, allocator)
+		if has_error(perr) {
+			return "", perr
+		}
+		if i > 0 && strings.builder_len(b) > 0 && !strings.has_suffix(strings.to_string(b), "\n") {
+			strings.write_byte(&b, '\n')
+		}
+		strings.write_string(&b, part)
+		if !strings.has_suffix(part, "\n") {
+			strings.write_byte(&b, '\n')
+		}
+		delete(part, allocator)
+	}
+	return strings.clone(strings.to_string(b), allocator), ok_error()
+}
+
+schema_sql_one :: proc(
+	e: ^engine.Engine,
+	table_name: string,
+	allocator := context.allocator,
+) -> (string, Exec_Error) {
+	entry, gerr := engine.catalog_get_table_entry(e, table_name, allocator)
+	if gerr == .Not_Found {
+		return "", make_error(.Unknown_Table, "no such table: %q", table_name)
+	}
+	if gerr != .None {
+		return "", from_engine_error(gerr)
+	}
+	defer engine.free_catalog_entry(entry, allocator)
+
+	b: strings.Builder
+	strings.builder_init(&b, allocator)
+	defer strings.builder_destroy(&b)
+
+	fmt.sbprintf(&b, "CREATE TABLE %s (\n", table_name)
+	for col, i in entry.columns {
+		if i > 0 {
+			strings.write_string(&b, ",\n")
+		}
+		strings.write_string(&b, "  ")
+		write_column_def(&b, col)
+	}
+	strings.write_string(&b, "\n);\n")
+
+	idx_refs, ixerr := engine.catalog_indexes_on_table(e, table_name, allocator)
+	if ixerr != .None {
+		return "", from_engine_error(ixerr)
+	}
+	defer engine.free_catalog_index_refs(idx_refs, allocator)
+
+	// Stable lexical order by index name.
+	if len(idx_refs) > 1 {
+		slice.sort_by(idx_refs, proc(a, b: engine.Catalog_Index_Ref) -> bool {
+			return a.name < b.name
+		})
+	}
+	for ref in idx_refs {
+		if len(ref.entry.columns) == 0 {
+			continue // v1 rows without column meta — skip awkwardly empty INDEX
+		}
+		fmt.sbprintf(&b, "CREATE INDEX %s ON %s (", ref.name, table_name)
+		for col, i in ref.entry.columns {
+			if i > 0 {
+				strings.write_string(&b, ", ")
+			}
+			strings.write_string(&b, col.name)
+			if .Desc in col.flags {
+				strings.write_string(&b, " DESC")
+			}
+		}
+		strings.write_string(&b, ");\n")
+	}
+
+	return strings.clone(strings.to_string(b), allocator), ok_error()
+}
+
+write_column_def :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
+	strings.write_string(b, col.name)
+	if col.type_name != "" {
+		fmt.sbprintf(b, " %s", col.type_name)
+	}
+	if .Not_Null in col.flags {
+		strings.write_string(b, " NOT NULL")
+	}
+	if .Primary_Key in col.flags {
+		strings.write_string(b, " PRIMARY KEY")
+	}
+	if .Has_Default in col.flags {
+		strings.write_string(b, " DEFAULT ")
+		write_default_literal(b, col)
+	}
+}
+
+write_default_literal :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
+	switch col.default_kind {
+	case .None, .Null:
+		strings.write_string(b, "NULL")
+	case .Integer:
+		fmt.sbprintf(b, "%d", col.default_i)
+	case .Float:
+		fmt.sbprintf(b, "%g", col.default_f)
+	case .Text:
+		strings.write_byte(b, '\'')
+		for i in 0 ..< len(col.default_bytes) {
+			c := col.default_bytes[i]
+			if c == '\'' {
+				strings.write_string(b, "''")
+			} else {
+				strings.write_byte(b, c)
+			}
+		}
+		strings.write_byte(b, '\'')
+	case .Blob:
+		strings.write_string(b, "X'")
+		for i in 0 ..< len(col.default_bytes) {
+			fmt.sbprintf(b, "%02X", col.default_bytes[i])
+		}
+		strings.write_byte(b, '\'')
+	}
+}

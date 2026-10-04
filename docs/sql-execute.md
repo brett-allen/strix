@@ -158,7 +158,7 @@ Exec_Session {
 ```
 
 - Open via path (`engine_open` / `engine_create` already exists) or **adopt** an existing engine (tests).
-- Close flushes via normal engine close (rollback any open txn).
+- Close rolls back any open txn then closes the pager. If a **partial flush fence** is live (`.Flush_Failed`), close is **refused**: session/engine stay open with dirty frames intact so the caller can retry `COMMIT`. Close never destroys recovery state and then reports an error.
 
 ### Transactions
 
@@ -169,12 +169,24 @@ Exec_Session {
 
 DDL and DML both require a write txn under auto mode. Nested `BEGIN` while already in a txn → clear `In_Txn` error. Statements inside an explicit txn join the open engine txn (no per-statement commit) until `COMMIT` / `ROLLBACK`. Write failure inside an explicit txn aborts the whole txn (`txn_aborted`); `exec_script` then **stops even with `continue_on_error`**.
 
+**Flush fence (H2):** if `txn_commit` partially writes data pages, the pager refuses `discard_dirty` / `txn_rollback` / close until a flush succeeds. Exec must not ignore that refusal (`_ = txn_rollback`): surface a clear recovery error, keep `engine.in_txn` / `explicit_txn` consistent, and block further non-recovery writes.
+
+**Recovery recipe (in-process / shell):** retry `COMMIT` (recovery flush) **on the still-open session**. `ROLLBACK` stays refused until a flush succeeds. Auto-commit statements that hit the fence **promote** to `explicit_txn` (same recovery path as an explicit `COMMIT` fence) so SQL is not stranded (`COMMIT`/`ROLLBACK` → `No_Txn` while `BEGIN` → `In_Txn`). `session_close` / `engine_close` / shell destroy **refuse** while fenced (session stays usable). Shell refuses `.open` / `.quit` / EOF / `--bail` exit while fenced (stay in REPL until `COMMIT`); read-only `SELECT` is allowed under the fence for inspection.
+
+**Batch `strix sql`:** process exit **cannot** keep a recovery session alive. Close refusal → exit **1** and **forfeits** in-memory dirty pages; the database may be torn after a partial flush. Do **not** tell the user to “retry `COMMIT` on an open session” after the batch process has exited.
+
+**Fence gate (all entry points):** `exec_statement` / `exec_statement_ast` / `exec_script` / shell typed SQL all hard-stop non-recovery writes while fenced. Allowed: recovery `COMMIT`, read-only `SELECT`. Everything else errors (or is skipped under `continue_on_error` — see below).
+
+**`continue_on_error` × flush fence:** after `exec_commit` or an auto-commit write hits `.Flush_Failed` (auto-commit promotes to `explicit_txn`), non-allowed statements are **skipped** until a recovery `COMMIT` in the same script (do not set `txn_aborted` for this path — that would block recovery `COMMIT`). Without `continue_on_error`, the **next** statement must be `COMMIT` (or `SELECT`) or the script stops. If the script ends still fenced after skips → error.
+
+**`txn_aborted` scope:** annotation (“transaction aborted — script stopped”) applies only to aborts in the **current** `exec_script`. Starting a new script after abort has settled (`!explicit_txn`) clears the sticky flag so later scripts / `.read` are not poisoned.
+
 **E6:** parser emits `Begin` / `Commit` / `Rollback` statement kinds (`TRANSACTION` optional); executor owns explicit-txn state on `Exec_Session`.
 
 ### Statement pipeline
 
 1. **Parse** — `sql.parse_statement` / `parse_script`
-2. **Bind** — resolve table/column names (unquoted idents via case-insensitive `equal_fold`), types, column indexes; reject case-only duplicate columns at CREATE; reject unsupported AST shapes with `Exec_Error` + span when available
+2. **Bind** — resolve **column** names via case-insensitive `equal_fold`; **table/index** names are case-sensitive catalog keys; reject case-only duplicate columns at CREATE; reject unsupported AST shapes with `Exec_Error` + span when available
 3. **Plan** — trivial only: “seq scan”, “point insert”, “create table storage”; optional **text/blob** index point lookup
 4. **Execute** — call engine/catalog/btree; produce `Exec_Result` (rows affected / result set)
 
@@ -191,6 +203,7 @@ strix init [path]              # existing
 strix sql [path] -c 'SQL'      # run one string
 strix sql [path] < file.sql    # run script from stdin
 strix sql [path] file.sql      # run script file
+strix shell [path]             # interactive REPL (SQL + .commands)
 ```
 
 - Default path = `database.strix` (same as `init`).
@@ -200,6 +213,8 @@ strix sql [path] file.sql      # run script file
   - `SELECT`: aligned text table (column names + rows) for v1 (open question #4)
 
 `strix sql` ships in **E1** for DDL (`CREATE`/`DROP TABLE`). Later phases extend what the same command can run.
+
+Interactive shell (`strix shell`) is a separate surface on top of the same `src/exec` session API: multi-line SQL until `;`, plus line-based `.commands` (`.tables`, `.schema`, `.read`, `.open`, display toggles, etc.). See [`cli-shell.md`](cli-shell.md) for the shell plan, DoD (C1–C4), and coverage inventories.
 
 ---
 
@@ -224,7 +239,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] Catalog payload **v2** (columns + `next_rowid`); update [`storage-format.md`](storage-format.md)
 - [x] Engine helpers: register table **with schema**; unregister/drop catalog row (new API if needed)
 - [x] Bind + exec `CREATE TABLE [IF NOT EXISTS]` (auto-commit write txn)
-- [x] Bind + exec `DROP TABLE [IF EXISTS]` (unregister; page reclaim best-effort; index policy per open Q #6)
+- [x] Bind + exec `DROP TABLE [IF EXISTS]` (unregister; **full btree page reclaim** onto freelist; index policy per open Q #6)
 - [x] Unsupported stmt kinds / table options → clear error (not a “reject everything” stub as the deliverable)
 - [x] `strix sql` runs `CREATE`/`DROP` against a `.strix` file (`init` then `sql -c '…'`)
 - [x] Tests: create → reopen → catalog shows columns; `IF NOT EXISTS`; drop removes catalog entry
@@ -302,6 +317,7 @@ For `WHERE` / `SET` / projections (mainly E3–E4):
 
 - Eval AST `Expr` against a **row environment** (column name/index → `Value`).
 - Support parser Phase 1 exprs that are meaningful on scalars: literals, column refs, comparisons, `AND`/`OR`/`NOT`, arithmetic, `IS NULL`, `IN` list (see [`sql-parser.md`](sql-parser.md) Phase 1).
+- **Integer–Integer** comparisons use exact `i64` ordering (not `f64`); mixed integer/float still coerces via `f64`.
 - Fail clearly on unbound names, type conflicts, or unsupported nodes (`CAST` optional early; `BETWEEN` optional).
 
 Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union.

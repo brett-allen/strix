@@ -130,26 +130,22 @@ exec_create_index :: proc(s: ^Exec_Session, stmt: sql.Create_Index_Stmt, span: s
 	_, rerr := engine.catalog_register_index(e, stmt.name, stmt.table_name, idx_cols)
 	if rerr == .Exists {
 		if stmt.if_not_exists {
-			if started {
-				_ = engine.txn_rollback(e)
+			if serr := soft_rollback_started(s, e, started, span); has_error(serr) {
+				return {}, serr
 			}
 			return ok_result(), ok_error()
 		}
-		stmt_write_abort(s, e, started)
-		return {}, make_error(.Index_Exists, "index %q already exists", stmt.name, span = span)
+		return {}, finish_write_error(s, e, started, make_error(.Index_Exists, "index %q already exists", stmt.name, span = span), span)
 	}
 	if rerr == .Not_Found {
-		stmt_write_abort(s, e, started)
-		return {}, make_error(.Unknown_Table, "no such table: %q", stmt.table_name, span = span)
+		return {}, finish_write_error(s, e, started, make_error(.Unknown_Table, "no such table: %q", stmt.table_name, span = span), span)
 	}
 	if rerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(rerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(rerr, span), span)
 	}
 
 	if ferr := backfill_index(e, stmt.name, stmt.table_name, entry.columns, idx_cols, span); has_error(ferr) {
-		stmt_write_abort(s, e, started)
-		return {}, ferr
+		return {}, finish_write_error(s, e, started, ferr, span)
 	}
 
 	if cerr := stmt_write_commit(s, e, started, span); has_error(cerr) {
@@ -175,17 +171,15 @@ exec_drop_index :: proc(s: ^Exec_Session, stmt: sql.Drop_Index_Stmt, span: sql.S
 	uerr := engine.catalog_unregister_index(e, stmt.name)
 	if uerr == .Not_Found {
 		if stmt.if_exists {
-			if started {
-				_ = engine.txn_rollback(e)
+			if serr := soft_rollback_started(s, e, started, span); has_error(serr) {
+				return {}, serr
 			}
 			return ok_result(), ok_error()
 		}
-		stmt_write_abort(s, e, started)
-		return {}, make_error(.Unknown_Index, "no such index: %q", stmt.name, span = span)
+		return {}, finish_write_error(s, e, started, make_error(.Unknown_Index, "no such index: %q", stmt.name, span = span), span)
 	}
 	if uerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(uerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(uerr, span), span)
 	}
 
 	if cerr := stmt_write_commit(s, e, started, span); has_error(cerr) {

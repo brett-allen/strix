@@ -83,13 +83,36 @@ engine_close :: proc(e: ^Engine) -> Engine_Error {
 		return .None
 	}
 	// Rollback any open txn so dirty pages are not silently flushed.
+	// If a partial flush fence refuses discard, REFUSE to close — keep the pager
+	// and file open so the caller can retry COMMIT (recovery flush). Destroying
+	// cache frames here would erase the only recovery state.
 	if e.in_txn {
-		_ = txn_rollback(e)
+		rollback_err := txn_rollback(e)
+		if rollback_err == .Flush_Failed {
+			return .Flush_Failed
+		}
+		if rollback_err != .None && rollback_err != .No_Txn {
+			return rollback_err
+		}
 	}
-	err := from_page_error(paging.pager_close(&e.pager))
+	if paging.pager_flush_failed(&e.pager) {
+		return .Flush_Failed
+	}
+	close_err := from_page_error(paging.pager_close(&e.pager))
+	if close_err == .Flush_Failed {
+		return .Flush_Failed
+	}
 	e.closed = true
 	e.in_txn = false
-	return err
+	return close_err
+}
+
+// engine_flush_fence reports whether recovery flush (COMMIT) is required before close.
+engine_flush_fence :: proc(e: ^Engine) -> bool {
+	if e == nil || e.closed {
+		return false
+	}
+	return paging.pager_flush_failed(&e.pager)
 }
 
 txn_begin :: proc(e: ^Engine) -> Engine_Error {

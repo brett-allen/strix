@@ -50,7 +50,7 @@ error_string :: proc(err: Engine_Error) -> string {
 	case .Catalog_Missing:   return "table_prime catalog is not initialized"
 	case .Too_Large:         return "key or payload too large for page"
 	case .Corrupt:           return "corrupt btree page"
-	case .Flush_Failed:      return "partial flush failed; recovery flush required"
+	case .Flush_Failed:      return "partial flush failed; recovery flush required — retry COMMIT (close refused)"
 	case .Unbound_Root:      return "btree root split without root ownership bind"
 	case .Paging:            return "paging error"
 	case .Db:                return "database error"

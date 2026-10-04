@@ -318,15 +318,13 @@ exec_insert :: proc(s: ^Exec_Session, stmt: sql.Insert_Stmt, span: sql.Span) -> 
 
 	idx_refs, ixerr := table_indexes_maintained(e, stmt.table, span)
 	if has_error(ixerr) {
-		stmt_write_abort(s, e, started)
-		return {}, ixerr
+		return {}, finish_write_error(s, e, started, ixerr, span)
 	}
 	defer engine.free_catalog_index_refs(idx_refs)
 
 	tree, oerr := engine.catalog_open_table(e, stmt.table)
 	if oerr != .None {
-		stmt_write_abort(s, e, started)
-		return {}, from_engine_error(oerr, span)
+		return {}, finish_write_error(s, e, started, from_engine_error(oerr, span), span)
 	}
 
 	next_rowid := entry.next_rowid
@@ -339,47 +337,47 @@ exec_insert :: proc(s: ^Exec_Session, stmt: sql.Insert_Stmt, span: sql.Span) -> 
 	for row_exprs in stmt.rows {
 		vals, berr := build_insert_row_values(stmt, row_exprs, entry.columns, col_map)
 		if has_error(berr) {
-			stmt_write_abort(s, e, started)
-			return {}, berr
+			return {}, finish_write_error(s, e, started, berr, span)
 		}
 
 		rowid, rerr := allocate_rowid(vals, entry.columns, &next_rowid)
 		if has_error(rerr) {
 			free_values(vals)
-			stmt_write_abort(s, e, started)
-			return {}, rerr
+			return {}, finish_write_error(s, e, started, rerr, span)
 		}
 
 		payload, enc_err := encode_heap_row(vals)
 		if has_error(enc_err) {
 			free_values(vals)
-			stmt_write_abort(s, e, started)
-			return {}, enc_err
+			return {}, finish_write_error(s, e, started, enc_err, span)
 		}
 
 		ierr := engine.table_insert_row(&tree, rowid, payload)
 		delete(payload)
 		if ierr == .Exists {
 			free_values(vals)
-			stmt_write_abort(s, e, started)
-			return {}, make_error(
-				.Constraint,
-				"UNIQUE / PRIMARY KEY constraint failed: rowid %v",
-				rowid,
-				span = span,
+			return {}, finish_write_error(
+				s,
+				e,
+				started,
+				make_error(
+					.Constraint,
+					"UNIQUE / PRIMARY KEY constraint failed: rowid %v",
+					rowid,
+					span = span,
+				),
+				span,
 			)
 		}
 		if ierr != .None {
 			free_values(vals)
-			stmt_write_abort(s, e, started)
-			return {}, from_engine_error(ierr, span)
+			return {}, finish_write_error(s, e, started, from_engine_error(ierr, span), span)
 		}
 
 		if len(idx_refs) > 0 {
 			if merr := index_insert_for_row(e, idx_refs, entry.columns, vals, rowid, span); has_error(merr) {
 				free_values(vals)
-				stmt_write_abort(s, e, started)
-				return {}, merr
+				return {}, finish_write_error(s, e, started, merr, span)
 			}
 		}
 		free_values(vals)
@@ -388,8 +386,7 @@ exec_insert :: proc(s: ^Exec_Session, stmt: sql.Insert_Stmt, span: sql.Span) -> 
 
 	if next_rowid != initial_next {
 		if uerr := engine.catalog_update_next_rowid(e, stmt.table, next_rowid); uerr != .None {
-			stmt_write_abort(s, e, started)
-			return {}, from_engine_error(uerr, span)
+			return {}, finish_write_error(s, e, started, from_engine_error(uerr, span), span)
 		}
 	}
 

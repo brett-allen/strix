@@ -71,6 +71,9 @@
 | `ROLLBACK` undoes | yes |
 | Failed write inside explicit txn → whole-txn abort | yes (`test_failed_multirow_insert_inside_begin_aborts_txn`) |
 | continue_on_error × explicit-txn abort → script stops | yes (`test_continue_on_error_stops_after_explicit_txn_abort`) |
+| flush fence × `exec_statement` hard-stop + SELECT/COMMIT | yes (`test_exec_statement_fence_hard_stops_writes_allows_commit_and_select`) |
+| continue_on_error × fence skips until recovery COMMIT | yes (`test_exec_continue_on_error_skips_until_recovery_commit`) |
+| batch `run_sql` fence → exit 1 + forfeit (no post-exit COMMIT lie) | yes (`test_run_sql_fence_forfeits_recovery_on_exit`) |
 | Fixture reopen asserts row outcomes | yes (`test_fixture_bootstrap_v1_and_crud_against_strix`) |
 | `COMMIT`/`ROLLBACK` without `BEGIN` → `No_Txn` | yes |
 | Stop-on-error (default) | yes |

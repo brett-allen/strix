@@ -321,6 +321,8 @@ eval_compare :: proc(op: sql.Binary_Op, left, right: Value, span: sql.Span) -> (
 }
 
 // compare_values returns -1 / 0 / 1. NULL handling is caller's responsibility.
+// Integer–Integer compares as i64 exactly (not via f64). Mixed integer/float
+// coerces through f64 only when a float operand is involved.
 compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Error) {
 	if left.kind == .Null && right.kind == .Null {
 		return 0, ok_error()
@@ -330,6 +332,12 @@ compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Er
 	}
 	if right.kind == .Null {
 		return 1, ok_error()
+	}
+	// Exact i64 path — avoids mantissa rounding around 2^53.
+	if left.kind == .Integer && right.kind == .Integer {
+		if left.i < right.i do return -1, ok_error()
+		if left.i > right.i do return 1, ok_error()
+		return 0, ok_error()
 	}
 	if is_numeric_kind(left.kind) && is_numeric_kind(right.kind) {
 		lf := value_as_f64(left)

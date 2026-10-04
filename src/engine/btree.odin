@@ -573,6 +573,55 @@ btree_split_interior :: proc(
 	return .None
 }
 
+// btree_free_tree walks every page of the btree rooted at `root` and returns
+// them to the freelist (interior children first, then the node). Requires txn.
+btree_free_tree :: proc(e: ^Engine, root: dbfile.Page_No) -> Engine_Error {
+	if root == 0 {
+		return .None
+	}
+	if err := require_txn(e); err != .None {
+		return err
+	}
+	return btree_free_node(e, root)
+}
+
+btree_free_node :: proc(e: ^Engine, page_no: dbfile.Page_No) -> Engine_Error {
+	data, perr := pin_ro(e, page_no)
+	if perr != .None {
+		return perr
+	}
+	kind := page_type(data)
+	if kind == BTREE_PAGE_INTERIOR {
+		n := int(page_n_cells(data))
+		children := make([dynamic]dbfile.Page_No, 0, n + 1)
+		defer delete(children)
+		for i in 0 ..< n {
+			ch, _, cerr := read_interior_cell(data, i)
+			if cerr != .None {
+				unpin_page(e, page_no)
+				return cerr
+			}
+			append(&children, ch)
+		}
+		rightmost := dbfile.Page_No(page_special(data))
+		if rightmost != 0 {
+			append(&children, rightmost)
+		}
+		unpin_page(e, page_no)
+		for ch in children {
+			if err := btree_free_node(e, ch); err != .None {
+				return err
+			}
+		}
+	} else if kind == BTREE_PAGE_LEAF {
+		unpin_page(e, page_no)
+	} else {
+		unpin_page(e, page_no)
+		return .Corrupt
+	}
+	return page_free(e, page_no)
+}
+
 // --- test / introspection helpers (read-only) ---
 
 btree_page_kind :: proc(e: ^Engine, page_no: dbfile.Page_No) -> (kind: u8, err: Engine_Error) {
