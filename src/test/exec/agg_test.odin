@@ -236,10 +236,10 @@ test_agg_reject_unsupported_forms :: proc(t: ^testing.T) {
 	exec.free_error(e6)
 	exec.free_result(r6)
 
-	// GROUP BY still rejected (S5)
-	r7, e7 := exec.exec_statement(&s, "SELECT name, COUNT(*) FROM scores GROUP BY name;")
-	testing.expect(t, exec.has_error(e7))
-	testing.expect_value(t, e7.code, exec.Exec_Error_Code.Unsupported_Ast)
+	// GROUP BY is executed (S5) — smoke that S4 reject path no longer blocks it
+	r7, e7 := exec.exec_statement(&s, "SELECT name, COUNT(*) FROM scores GROUP BY name ORDER BY name;")
+	testing.expectf(t, !exec.has_error(e7), "%s", e7.message)
+	testing.expect_value(t, len(r7.rows), 4) // alice, bob, cara, NULL
 	exec.free_error(e7)
 	exec.free_result(r7)
 }

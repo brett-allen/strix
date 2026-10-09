@@ -50,7 +50,7 @@ Uncovered (1): SUM accumulator promoting from int to float after seeing a float 
 | Mix agg + column / `*` | yes | `test_agg_reject_mixed_columns` | `Unsupported_Ast` |
 | Nested agg / `SUM(*)` / `COUNT()` / `abs` | yes | `test_agg_reject_unsupported_forms` | `Unsupported_Ast` |
 | Non-numeric SUM/MIN | yes | same | `Unsupported_Ast` |
-| GROUP BY still rejected | yes | same | S5 foreshadow |
+| GROUP BY executed (S5) | yes | same (updated) | no longer rejected |
 | `projection_name` for Call | yes | `COUNT(*)` column name | printed call text |
 | `eval_cast_with_aggs` | yes | `test_agg_cast_count` | CAST over COUNT(*) |
 
@@ -82,7 +82,7 @@ Uncovered (1): SUM accumulator promoting from int to float after seeing a float 
 | Non-numeric SUM/MIN → `Unsupported_Ast` | yes |
 | Aggregates in WHERE → `Unsupported_Ast` | yes |
 | ORDER BY bare column with agg SELECT → `Unsupported_Ast` | yes |
-| GROUP BY still → `Unsupported_Ast` (S5) | yes |
+| GROUP BY → executed (S5; see s5-coverage) | yes |
 | LIMIT/OFFSET on aggregate result row | yes |
 | Unknown column in agg arg → `Unknown_Column` | yes |
 | `CAST(COUNT(*) AS TEXT)` | yes |
@@ -94,7 +94,7 @@ Uncovered (1): SUM accumulator promoting from int to float after seeing a float 
 
 | Code | When |
 |------|------|
-| `Unsupported_Ast` | Mix agg + bare columns; nested aggs; `SUM(*)`/`AVG(*)`/`MIN(*)`/`MAX(*)`; bad `COUNT` arity; non-numeric SUM/AVG/MIN/MAX; non-agg function calls; ORDER BY bare/agg with whole-query agg; aggregates in WHERE; GROUP BY/HAVING (unchanged) |
+| `Unsupported_Ast` | Mix agg + bare columns (without GROUP BY); nested aggs; `SUM(*)`/`AVG(*)`/`MIN(*)`/`MAX(*)`; bad `COUNT` arity; non-numeric SUM/AVG/MIN/MAX; non-agg function calls; ORDER BY bare/agg with whole-query agg; aggregates in WHERE |
 | `Unknown_Column` | Unbound name in aggregate argument (unchanged code; dry-run path) |
 
 ---

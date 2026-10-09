@@ -4,9 +4,11 @@ import "core:strings"
 import engine "../engine"
 import sql "../sql"
 
-// Whole-query aggregates (S4 / sql-compliance). No GROUP BY — one result row.
+// Whole-query aggregates (S4) and GROUP BY / HAVING (S5 / sql-compliance).
 // Null-skipping for COUNT(expr)/SUM/AVG/MIN/MAX; COUNT(*) counts all filtered rows.
-// AVG always yields Float (integers promote). Empty input: COUNT→0; SUM/AVG/MIN/MAX→NULL.
+// AVG always yields Float (integers promote).
+// Whole-query empty input: one row (COUNT→0; SUM/AVG/MIN/MAX→NULL).
+// GROUP BY empty input: zero result rows (no groups).
 
 Agg_Fn :: enum {
 	Count_Star,
@@ -313,11 +315,15 @@ collect_agg_calls :: proc(
 }
 
 // prepare_aggregate_select returns whether this SELECT is whole-query aggregate mode
-// and the accumulator slots. Caller owns slots (free_agg_slots).
+// (no GROUP BY) and the accumulator slots. Caller owns slots (free_agg_slots).
 prepare_aggregate_select :: proc(
 	stmt: sql.Select_Stmt,
 	allocator := context.allocator,
 ) -> (is_agg: bool, slots: []Agg_Slot, err: Exec_Error) {
+	if len(stmt.group_by) > 0 {
+		return false, nil, ok_error() // grouped path owns this
+	}
+
 	any_agg := false
 	any_bare := false
 
@@ -344,24 +350,13 @@ prepare_aggregate_select :: proc(
 	if any_bare {
 		return false, nil, make_error(
 			.Unsupported_Ast,
-			"SELECT mixes aggregates with non-aggregate columns; GROUP BY is required (not supported yet)",
+			"SELECT mixes aggregates with non-aggregate columns; GROUP BY is required",
 			span = stmt.projection[0].span if len(stmt.projection) > 0 else {},
 		)
 	}
 
-	// Aggregates in WHERE are illegal.
-	if stmt.where_expr != nil {
-		wf, werr := analyze_expr_aggs(stmt.where_expr, false)
-		if has_error(werr) {
-			return false, nil, werr
-		}
-		if wf.has_agg {
-			return false, nil, make_error(
-				.Unsupported_Ast,
-				"aggregate functions are not allowed in WHERE",
-				span = stmt.where_expr.span,
-			)
-		}
+	if err := reject_aggs_in_where(stmt); has_error(err) {
+		return false, nil, err
 	}
 
 	// ORDER BY with bare columns is illegal without GROUP BY; aggregates in ORDER BY deferred.
@@ -401,6 +396,391 @@ prepare_aggregate_select :: proc(
 		return false, nil, make_error(.Engine, "aggregate SELECT produced no aggregate slots")
 	}
 	return true, dyn[:], ok_error()
+}
+
+reject_aggs_in_where :: proc(stmt: sql.Select_Stmt) -> Exec_Error {
+	if stmt.where_expr == nil {
+		return ok_error()
+	}
+	wf, werr := analyze_expr_aggs(stmt.where_expr, false)
+	if has_error(werr) {
+		return werr
+	}
+	if wf.has_agg {
+		return make_error(
+			.Unsupported_Ast,
+			"aggregate functions are not allowed in WHERE",
+			span = stmt.where_expr.span,
+		)
+	}
+	return ok_error()
+}
+
+// resolve_group_by_columns requires each GROUP BY item to be a column ref (S5 start).
+// Returns owned slice of catalog column indices. Caller deletes.
+resolve_group_by_columns :: proc(
+	stmt: sql.Select_Stmt,
+	columns: []engine.Catalog_Column,
+	table_name, alias: string,
+	allocator := context.allocator,
+) -> ([]int, Exec_Error) {
+	if len(stmt.group_by) == 0 {
+		return nil, make_error(.Engine, "resolve_group_by_columns called without GROUP BY")
+	}
+	out := make([]int, len(stmt.group_by), allocator)
+	for expr, i in stmt.group_by {
+		if expr == nil || expr.kind != .Column_Ref {
+			delete(out, allocator)
+			return nil, make_error(
+				.Unsupported_Ast,
+				"GROUP BY only supports column references (expressions not supported yet)",
+				span = expr.span if expr != nil else {},
+			)
+		}
+		idx, ok, rerr := resolve_proj_column(
+			expr.data.(sql.Column_Ref_Data),
+			columns,
+			table_name,
+			alias,
+			expr.span,
+		)
+		if has_error(rerr) {
+			delete(out, allocator)
+			return nil, rerr
+		}
+		if !ok {
+			delete(out, allocator)
+			return nil, make_error(.Unknown_Column, "GROUP BY column could not be resolved", span = expr.span)
+		}
+		out[i] = idx
+	}
+	return out, ok_error()
+}
+
+column_idx_in_group :: proc(col_idx: int, group_idxs: []int) -> bool {
+	for g in group_idxs {
+		if g == col_idx {
+			return true
+		}
+	}
+	return false
+}
+
+// validate_expr_group_cols ensures every bare Column_Ref outside aggregate args
+// resolves to a GROUP BY column (strict select list / HAVING / ORDER BY).
+validate_expr_group_cols :: proc(
+	expr: ^sql.Expr,
+	group_idxs: []int,
+	columns: []engine.Catalog_Column,
+	table_name, alias: string,
+	in_agg_arg: bool = false,
+) -> Exec_Error {
+	if expr == nil {
+		return ok_error()
+	}
+	switch expr.kind {
+	case .Literal, .Placeholder, .Star:
+		return ok_error()
+	case .Column_Ref:
+		if in_agg_arg {
+			return ok_error()
+		}
+		idx, ok, rerr := resolve_proj_column(
+			expr.data.(sql.Column_Ref_Data),
+			columns,
+			table_name,
+			alias,
+			expr.span,
+		)
+		if has_error(rerr) {
+			return rerr
+		}
+		if !ok || !column_idx_in_group(idx, group_idxs) {
+			return make_error(
+				.Unsupported_Ast,
+				"column must appear in GROUP BY or be used in an aggregate function",
+				span = expr.span,
+			)
+		}
+		return ok_error()
+	case .Unary:
+		return validate_expr_group_cols(
+			expr.data.(sql.Unary_Data).expr,
+			group_idxs,
+			columns,
+			table_name,
+			alias,
+			in_agg_arg,
+		)
+	case .Binary:
+		d := expr.data.(sql.Binary_Data)
+		if err := validate_expr_group_cols(d.left, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+			return err
+		}
+		return validate_expr_group_cols(d.right, group_idxs, columns, table_name, alias, in_agg_arg)
+	case .Is_Null:
+		return validate_expr_group_cols(
+			expr.data.(sql.Is_Null_Data).expr,
+			group_idxs,
+			columns,
+			table_name,
+			alias,
+			in_agg_arg,
+		)
+	case .In_List:
+		d := expr.data.(sql.In_List_Data)
+		if err := validate_expr_group_cols(d.expr, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+			return err
+		}
+		for v in d.values {
+			if err := validate_expr_group_cols(v, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+				return err
+			}
+		}
+		return ok_error()
+	case .Between:
+		d := expr.data.(sql.Between_Data)
+		if err := validate_expr_group_cols(d.expr, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+			return err
+		}
+		if err := validate_expr_group_cols(d.low, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+			return err
+		}
+		return validate_expr_group_cols(d.high, group_idxs, columns, table_name, alias, in_agg_arg)
+	case .Cast:
+		return validate_expr_group_cols(
+			expr.data.(sql.Cast_Data).expr,
+			group_idxs,
+			columns,
+			table_name,
+			alias,
+			in_agg_arg,
+		)
+	case .Call:
+		d := expr.data.(sql.Call_Data)
+		if is_aggregate_name(d.name) {
+			if in_agg_arg {
+				return make_error(
+					.Unsupported_Ast,
+					"nested aggregate functions are not supported",
+					span = expr.span,
+				)
+			}
+			_, rerr := resolve_agg_fn(expr)
+			if has_error(rerr) {
+				return rerr
+			}
+			for arg in d.args {
+				if err := validate_expr_group_cols(arg, group_idxs, columns, table_name, alias, true); has_error(err) {
+					return err
+				}
+			}
+			return ok_error()
+		}
+		for arg in d.args {
+			if err := validate_expr_group_cols(arg, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+				return err
+			}
+		}
+		return ok_error()
+	}
+	return make_error(.Unsupported_Ast, "unsupported expression", span = expr.span)
+}
+
+// prepare_grouped_select validates GROUP BY / HAVING / strict select list and
+// collects aggregate slots (from projection, HAVING, ORDER BY). Caller owns
+// group_idxs (delete) and slots (free_agg_slots).
+prepare_grouped_select :: proc(
+	stmt: sql.Select_Stmt,
+	columns: []engine.Catalog_Column,
+	table_name, alias: string,
+	allocator := context.allocator,
+) -> (group_idxs: []int, slots: []Agg_Slot, err: Exec_Error) {
+	gidxs, gerr := resolve_group_by_columns(stmt, columns, table_name, alias, allocator)
+	if has_error(gerr) {
+		return nil, nil, gerr
+	}
+
+	if werr := reject_aggs_in_where(stmt); has_error(werr) {
+		delete(gidxs, allocator)
+		return nil, nil, werr
+	}
+
+	for item in stmt.projection {
+		switch item.kind {
+		case .Star, .Table_Star:
+			delete(gidxs, allocator)
+			return nil, nil, make_error(
+				.Unsupported_Ast,
+				"SELECT * is not allowed with GROUP BY (strict: list grouped columns and aggregates)",
+				span = item.span,
+			)
+		case .Expr:
+			if item.expr == nil {
+				continue
+			}
+			if verr := validate_expr_group_cols(
+				item.expr,
+				gidxs,
+				columns,
+				table_name,
+				alias,
+			); has_error(verr) {
+				delete(gidxs, allocator)
+				return nil, nil, verr
+			}
+		}
+	}
+
+	if stmt.having != nil {
+		if verr := validate_expr_group_cols(
+			stmt.having,
+			gidxs,
+			columns,
+			table_name,
+			alias,
+		); has_error(verr) {
+			delete(gidxs, allocator)
+			return nil, nil, verr
+		}
+	}
+
+	for item in stmt.order_by {
+		if item.expr == nil {
+			continue
+		}
+		if verr := validate_expr_group_cols(
+			item.expr,
+			gidxs,
+			columns,
+			table_name,
+			alias,
+		); has_error(verr) {
+			delete(gidxs, allocator)
+			return nil, nil, verr
+		}
+	}
+
+	dyn := make([dynamic]Agg_Slot, 0, 4, allocator)
+	for item in stmt.projection {
+		if item.kind == .Expr && item.expr != nil {
+			if cerr := collect_agg_calls(item.expr, &dyn); has_error(cerr) {
+				free_agg_slots(dyn[:], allocator)
+				delete(dyn)
+				delete(gidxs, allocator)
+				return nil, nil, cerr
+			}
+		}
+	}
+	if stmt.having != nil {
+		if cerr := collect_agg_calls(stmt.having, &dyn); has_error(cerr) {
+			free_agg_slots(dyn[:], allocator)
+			delete(dyn)
+			delete(gidxs, allocator)
+			return nil, nil, cerr
+		}
+	}
+	for item in stmt.order_by {
+		if item.expr != nil {
+			if cerr := collect_agg_calls(item.expr, &dyn); has_error(cerr) {
+				free_agg_slots(dyn[:], allocator)
+				delete(dyn)
+				delete(gidxs, allocator)
+				return nil, nil, cerr
+			}
+		}
+	}
+	return gidxs, dyn[:], ok_error()
+}
+
+clone_agg_slot_templates :: proc(
+	templates: []Agg_Slot,
+	allocator := context.allocator,
+) -> []Agg_Slot {
+	if len(templates) == 0 {
+		return nil
+	}
+	out := make([]Agg_Slot, len(templates), allocator)
+	for t, i in templates {
+		out[i] = Agg_Slot{
+			fn   = t.fn,
+			call = t.call,
+			arg  = t.arg,
+		}
+	}
+	return out
+}
+
+group_keys_equal :: proc(a, b: []Value) -> (bool, Exec_Error) {
+	if len(a) != len(b) {
+		return false, ok_error()
+	}
+	for i in 0 ..< len(a) {
+		cmp, err := compare_values(a[i], b[i])
+		if has_error(err) {
+			return false, err
+		}
+		if cmp != 0 {
+			return false, ok_error()
+		}
+	}
+	return true, ok_error()
+}
+
+extract_group_key :: proc(
+	row: []Value,
+	group_idxs: []int,
+	allocator := context.allocator,
+) -> ([]Value, Exec_Error) {
+	key := make([]Value, len(group_idxs), allocator)
+	for gi, i in group_idxs {
+		if gi < 0 || gi >= len(row) {
+			free_values(key, allocator)
+			return nil, make_error(.Engine, "GROUP BY column index out of range")
+		}
+		key[i] = clone_value(row[gi], allocator)
+	}
+	return key, ok_error()
+}
+
+make_group_rep_row :: proc(
+	columns_len: int,
+	group_idxs: []int,
+	key: []Value,
+	allocator := context.allocator,
+) -> []Value {
+	row := make([]Value, columns_len, allocator)
+	for i in 0 ..< columns_len {
+		row[i] = value_null()
+	}
+	for gi, i in group_idxs {
+		if gi >= 0 && gi < columns_len && i < len(key) {
+			free_value(row[gi], allocator)
+			row[gi] = clone_value(key[i], allocator)
+		}
+	}
+	return row
+}
+
+eval_expr_bool_with_aggs :: proc(
+	expr: ^sql.Expr,
+	slots: []Agg_Slot,
+	finals: []Value,
+	env: ^Row_Env,
+	allocator := context.allocator,
+) -> (bool, Exec_Error) {
+	v, err := eval_expr_with_aggs(expr, slots, finals, env, allocator)
+	if has_error(err) {
+		return false, err
+	}
+	defer free_value(v, allocator)
+	if value_is_null(v) {
+		return false, ok_error()
+	}
+	if berr := require_bool_operand(v, expr.span if expr != nil else {}); has_error(berr) {
+		return false, berr
+	}
+	return value_is_true(v), ok_error()
 }
 
 accumulate_agg_slot :: proc(
@@ -807,6 +1187,14 @@ validate_agg_projection_exprs :: proc(
 		}
 	}
 	for item in stmt.order_by {
+		of, oerr := analyze_expr_aggs(item.expr, false)
+		if has_error(oerr) {
+			return oerr
+		}
+		if of.has_agg {
+			// Aggregates in ORDER BY (grouped) need finalized slots; skip dry-run.
+			continue
+		}
 		v, err := eval_expr(item.expr, &env)
 		free_value(v)
 		if has_error(err) {
@@ -831,11 +1219,21 @@ validate_agg_projection_exprs :: proc(
 		if flags.has_agg {
 			continue
 		}
+		// Grouped selects may reference group-key columns; null-row dry-run is fine.
 		v, err := eval_expr(item.expr, &env)
 		free_value(v)
 		if has_error(err) {
 			return err
 		}
+	}
+	if stmt.having != nil {
+		// Dry-run HAVING structure with nulls / no finalized aggs via analyze only;
+		// unbound names in non-agg parts already checked by validate_expr_group_cols.
+		hf, herr := analyze_expr_aggs(stmt.having, false)
+		if has_error(herr) {
+			return herr
+		}
+		_ = hf
 	}
 	return ok_error()
 }

@@ -21,7 +21,7 @@ test_unsupported_statement_kinds :: proc(t: ^testing.T) {
 	cases := []string{
 		"SELECT DISTINCT a FROM t;",
 		"SELECT * FROM t JOIN t AS u ON t.a = u.a;",
-		"SELECT a FROM t GROUP BY a;",
+		"SELECT * FROM t GROUP BY a;", // SELECT * with GROUP BY rejected (strict)
 		"ALTER TABLE t ADD COLUMN b INT;",
 	}
 	for sql_text in cases {

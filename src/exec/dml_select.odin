@@ -62,13 +62,39 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 	}
 	defer free_bound_projs(projs)
 
-	is_agg, agg_slots, aerr := prepare_aggregate_select(stmt)
-	if has_error(aerr) {
-		return {}, aerr
-	}
-	defer free_agg_slots(agg_slots)
+	is_grouped := len(stmt.group_by) > 0
+	group_idxs: []int = nil
+	agg_slots: []Agg_Slot = nil
+	is_agg := false
 
-	if is_agg {
+	if is_grouped {
+		gidxs, gslots, gerr := prepare_grouped_select(
+			stmt,
+			entry.columns,
+			table_name,
+			stmt.from.alias,
+		)
+		if has_error(gerr) {
+			return {}, gerr
+		}
+		group_idxs = gidxs
+		agg_slots = gslots
+	} else {
+		agg_ok, aslots, aerr := prepare_aggregate_select(stmt)
+		if has_error(aerr) {
+			return {}, aerr
+		}
+		is_agg = agg_ok
+		agg_slots = aslots
+	}
+	defer {
+		free_agg_slots(agg_slots)
+		if group_idxs != nil {
+			delete(group_idxs)
+		}
+	}
+
+	if is_grouped || is_agg {
 		if verr := validate_agg_projection_exprs(
 			stmt,
 			agg_slots,
@@ -217,6 +243,19 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 				return {}, from_engine_error(nerr, span)
 			}
 		}
+	}
+
+	if is_grouped {
+		return exec_select_grouped(
+			stmt,
+			projs,
+			agg_slots,
+			group_idxs,
+			matched[:],
+			&env,
+			limit_n,
+			offset_n,
+		)
 	}
 
 	if is_agg {
@@ -374,10 +413,17 @@ project_agg_cell :: proc(
 ) -> (string, Exec_Error) {
 	switch p.kind {
 	case .Column:
-		return "", make_error(
-			.Unsupported_Ast,
-			"SELECT mixes aggregates with non-aggregate columns; GROUP BY is required (not supported yet)",
-		)
+		// Whole-query agg has no row env; grouped queries supply a representative row.
+		if env == nil || env.values == nil {
+			return "", make_error(
+				.Unsupported_Ast,
+				"SELECT mixes aggregates with non-aggregate columns; GROUP BY is required",
+			)
+		}
+		if p.col_idx < 0 || p.col_idx >= len(env.values) {
+			return "", make_error(.Engine, "projection column index out of range")
+		}
+		return format_value_cell(env.values[p.col_idx], allocator), ok_error()
 	case .Expr:
 		v, err := eval_expr_with_aggs(p.expr, slots, finals, env, allocator)
 		if has_error(err) {
@@ -387,6 +433,260 @@ project_agg_cell :: proc(
 		return format_value_cell(v, allocator), ok_error()
 	}
 	return "", make_error(.Engine, "invalid projection")
+}
+
+Group_Bucket :: struct {
+	key:   []Value, // owned group-key clones
+	slots: []Agg_Slot, // owned per-group accumulators
+}
+
+free_group_bucket :: proc(g: Group_Bucket, allocator := context.allocator) {
+	free_values(g.key, allocator)
+	free_agg_slots(g.slots, allocator)
+}
+
+free_group_buckets :: proc(groups: []Group_Bucket, allocator := context.allocator) {
+	for g in groups {
+		free_group_bucket(g, allocator)
+	}
+}
+
+Grouped_Out_Row :: struct {
+	cells:     []string, // owned
+	sort_keys: []Value, // owned; empty if no ORDER BY
+}
+
+free_grouped_out_row :: proc(r: Grouped_Out_Row, allocator := context.allocator) {
+	for c in r.cells {
+		delete(c, allocator)
+	}
+	if r.cells != nil {
+		delete(r.cells, allocator)
+	}
+	free_values(r.sort_keys, allocator)
+}
+
+// exec_select_grouped partitions filtered rows by GROUP BY keys, accumulates
+// per-group aggregates, applies HAVING, then ORDER BY / LIMIT / OFFSET.
+// Empty filtered set → zero result rows (unlike whole-query aggregates).
+exec_select_grouped :: proc(
+	stmt: sql.Select_Stmt,
+	projs: []Bound_Proj,
+	slot_templates: []Agg_Slot,
+	group_idxs: []int,
+	matched: [][]Value,
+	env: ^Row_Env,
+	limit_n: int,
+	offset_n: int,
+	allocator := context.allocator,
+) -> (Exec_Result, Exec_Error) {
+	groups := make([dynamic]Group_Bucket, 0, 8, allocator)
+	defer {
+		free_group_buckets(groups[:], allocator)
+		delete(groups)
+	}
+
+	for row in matched {
+		key, kerr := extract_group_key(row, group_idxs, allocator)
+		if has_error(kerr) {
+			return {}, kerr
+		}
+
+		found := -1
+		for g, gi in groups {
+			eq, eerr := group_keys_equal(g.key, key)
+			if has_error(eerr) {
+				free_values(key, allocator)
+				return {}, eerr
+			}
+			if eq {
+				found = gi
+				break
+			}
+		}
+
+		if found < 0 {
+			slots := clone_agg_slot_templates(slot_templates, allocator)
+			append(&groups, Group_Bucket{key = key, slots = slots})
+			found = len(groups) - 1
+		} else {
+			free_values(key, allocator)
+		}
+
+		env.values = row
+		for i in 0 ..< len(groups[found].slots) {
+			if aerr := accumulate_agg_slot(&groups[found].slots[i], env, allocator); has_error(aerr) {
+				return {}, aerr
+			}
+		}
+	}
+
+	out_rows := make([dynamic]Grouped_Out_Row, 0, len(groups), allocator)
+	defer {
+		for r in out_rows {
+			free_grouped_out_row(r, allocator)
+		}
+		delete(out_rows)
+	}
+
+	ncols := len(env.columns)
+	for g in groups {
+		finals := make([]Value, len(g.slots), allocator)
+		for i in 0 ..< len(g.slots) {
+			v, ferr := finalize_agg_slot(g.slots[i], allocator)
+			if has_error(ferr) {
+				for j in 0 ..< i {
+					free_value(finals[j], allocator)
+				}
+				delete(finals, allocator)
+				return {}, ferr
+			}
+			finals[i] = v
+		}
+
+		rep := make_group_rep_row(ncols, group_idxs, g.key, allocator)
+		env.values = rep
+
+		keep := true
+		if stmt.having != nil {
+			ok, herr := eval_expr_bool_with_aggs(stmt.having, g.slots, finals, env, allocator)
+			if has_error(herr) {
+				for v in finals {
+					free_value(v, allocator)
+				}
+				delete(finals, allocator)
+				free_values(rep, allocator)
+				return {}, herr
+			}
+			keep = ok
+		}
+
+		if !keep {
+			for v in finals {
+				free_value(v, allocator)
+			}
+			delete(finals, allocator)
+			free_values(rep, allocator)
+			continue
+		}
+
+		cells := make([]string, len(projs), allocator)
+		for p, ci in projs {
+			cell, cerr := project_agg_cell(p, g.slots, finals, env, allocator)
+			if has_error(cerr) {
+				for j in 0 ..< ci {
+					delete(cells[j], allocator)
+				}
+				delete(cells, allocator)
+				for v in finals {
+					free_value(v, allocator)
+				}
+				delete(finals, allocator)
+				free_values(rep, allocator)
+				return {}, cerr
+			}
+			cells[ci] = cell
+		}
+
+		sort_keys: []Value = nil
+		if len(stmt.order_by) > 0 {
+			sort_keys = make([]Value, len(stmt.order_by), allocator)
+			for item, ki in stmt.order_by {
+				v, oerr := eval_expr_with_aggs(item.expr, g.slots, finals, env, allocator)
+				if has_error(oerr) {
+					for j in 0 ..< ki {
+						free_value(sort_keys[j], allocator)
+					}
+					delete(sort_keys, allocator)
+					for c in cells {
+						delete(c, allocator)
+					}
+					delete(cells, allocator)
+					for fv in finals {
+						free_value(fv, allocator)
+					}
+					delete(finals, allocator)
+					free_values(rep, allocator)
+					return {}, oerr
+				}
+				sort_keys[ki] = v
+			}
+		}
+
+		append(&out_rows, Grouped_Out_Row{cells = cells, sort_keys = sort_keys})
+
+		for v in finals {
+			free_value(v, allocator)
+		}
+		delete(finals, allocator)
+		free_values(rep, allocator)
+	}
+
+	if len(stmt.order_by) > 0 && len(out_rows) > 1 {
+		if serr := sort_grouped_out_rows(out_rows[:], stmt.order_by); has_error(serr) {
+			return {}, serr
+		}
+	}
+
+	start := offset_n
+	if start > len(out_rows) {
+		start = len(out_rows)
+	}
+	end := len(out_rows)
+	if limit_n >= 0 {
+		end = min(start + limit_n, len(out_rows))
+	}
+	window := out_rows[start:end]
+
+	col_names := make([]string, len(projs), allocator)
+	for p, i in projs {
+		col_names[i] = strings.clone(p.name, allocator)
+	}
+
+	rows := make([][]string, len(window), allocator)
+	for i in 0 ..< len(window) {
+		rows[i] = window[i].cells
+		window[i].cells = nil // transfer ownership
+	}
+
+	return result_set_result(col_names, rows), ok_error()
+}
+
+sort_grouped_out_rows :: proc(
+	rows: []Grouped_Out_Row,
+	order: []sql.Order_By_Item,
+) -> Exec_Error {
+	if len(rows) <= 1 || len(order) == 0 {
+		return ok_error()
+	}
+	idxs := make([]int, len(rows))
+	defer delete(idxs)
+	for i in 0 ..< len(rows) {
+		idxs[i] = i
+	}
+	for i in 1 ..< len(idxs) {
+		j := i
+		for j > 0 {
+			cmp, cerr := compare_order_keys(rows[idxs[j - 1]].sort_keys, rows[idxs[j]].sort_keys, order)
+			if has_error(cerr) {
+				return cerr
+			}
+			if cmp <= 0 {
+				break
+			}
+			idxs[j - 1], idxs[j] = idxs[j], idxs[j - 1]
+			j -= 1
+		}
+	}
+	tmp := make([]Grouped_Out_Row, len(rows))
+	defer delete(tmp)
+	for i in 0 ..< len(rows) {
+		tmp[i] = rows[idxs[i]]
+	}
+	for i in 0 ..< len(rows) {
+		rows[i] = tmp[i]
+	}
+	return ok_error()
 }
 
 // validate_select_exprs dry-runs WHERE / ORDER BY / non-column projections on a null row
@@ -441,12 +741,8 @@ validate_select_supported :: proc(stmt: sql.Select_Stmt, span: sql.Span) -> Exec
 	if len(stmt.joins) > 0 {
 		return make_error(.Unsupported_Ast, "JOINs are not supported yet", span = span)
 	}
-	if len(stmt.group_by) > 0 {
-		return make_error(.Unsupported_Ast, "GROUP BY is not supported yet", span = span)
-	}
-	if stmt.having != nil {
-		return make_error(.Unsupported_Ast, "HAVING is not supported yet", span = span)
-	}
+	// GROUP BY / HAVING executed (S5). Parser already rejects HAVING without GROUP BY.
+	_ = span
 	return ok_error()
 }
 

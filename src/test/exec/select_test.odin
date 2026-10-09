@@ -276,7 +276,8 @@ test_select_negatives_codes :: proc(t: ^testing.T) {
 	exec.free_error(e5)
 	exec.free_result(r5)
 
-	r6, e6 := exec.exec_statement(&s, "SELECT name FROM people GROUP BY name;")
+	// GROUP BY is executed (S5); keep a still-unsupported form in this reject suite.
+	r6, e6 := exec.exec_statement(&s, "SELECT DISTINCT name FROM people;")
 	testing.expect(t, exec.has_error(e6))
 	testing.expect_value(t, e6.code, exec.Exec_Error_Code.Unsupported_Ast)
 	exec.free_error(e6)

@@ -42,7 +42,7 @@
 | Symbol | Tested? | Test name(s) | Branches covered |
 |--------|---------|--------------|------------------|
 | `exec_select` | yes | all select_* tests | scan; filter; project; sort; limit/offset; empty |
-| `validate_select_supported` | yes | DISTINCT/JOIN/GROUP BY negatives | Unsupported_Ast each |
+| `validate_select_supported` | yes | DISTINCT/JOIN negatives; GROUP BY executed (S5) | Unsupported_Ast for DISTINCT/JOIN |
 | `validate_select_exprs` | yes | Unknown_Column WHERE; BETWEEN | dry-run unbound/unsupported |
 | `bind_select_projection` | yes | `*`; columns; `p.*`; expr alias | Star; Table_Star; Column; Expr |
 | `table_star_matches` | yes | `SELECT p.*` | alias match |
@@ -75,7 +75,7 @@
 | WHERE: Text/Blob as boolean → `Unsupported_Ast` (S1; E3 once treated non-NULL Text as TRUE) | yes — see S1 inventory |
 | ORDER BY / LIMIT / OFFSET | yes |
 | ORDER BY incompatible kinds → error | yes |
-| Reject DISTINCT / JOIN / GROUP BY → `Unsupported_Ast` | yes |
+| Reject DISTINCT / JOIN → `Unsupported_Ast`; GROUP BY → S5 | yes |
 | Reject BETWEEN / Call / Placeholder → `Unsupported_Ast` | yes |
 | CAST → executed (S2; was `Unsupported_Ast` in E3) | yes — see [`sql-compliance-s2-coverage.md`](sql-compliance-s2-coverage.md) |
 | Unknown table / column codes | yes |
@@ -94,7 +94,7 @@
 |------|------|
 | `Unknown_Table` | FROM missing table; bad `t.*` qualifier |
 | `Unknown_Column` | projection / WHERE / ORDER BY unbound name or bad qualifier |
-| `Unsupported_Ast` | DISTINCT, JOIN, GROUP BY/HAVING, BETWEEN, non-agg calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare; **(S2)** invalid/`CAST` target errors (CAST itself is executed); **(S4)** whole-query `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` are executed — see [`sql-compliance-s4-coverage.md`](sql-compliance-s4-coverage.md) |
+| `Unsupported_Ast` | DISTINCT, JOIN, BETWEEN, non-agg calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare; **(S2)** invalid/`CAST` target errors (CAST itself is executed); **(S4)** whole-query `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` are executed — see [`sql-compliance-s4-coverage.md`](sql-compliance-s4-coverage.md); **(S5)** `GROUP BY`/`HAVING` executed — see [`sql-compliance-s5-coverage.md`](sql-compliance-s5-coverage.md) |
 | `Closed` | SELECT on closed session |
 | `Engine` | decode / cursor failures during scan |
 
