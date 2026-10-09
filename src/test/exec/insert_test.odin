@@ -115,6 +115,85 @@ test_insert_not_null_violation :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_insert_rejects_incompatible_literal_kinds :: proc(t: ^testing.T) {
+	// S1: no affinity / soft coerce — declared INT/TEXT/REAL/BLOB require matching kinds.
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_statement(
+		&s,
+		"CREATE TABLE t (n INT, s TEXT, f REAL, b BLOB, u);",
+	)
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	{
+		r, eerr := exec.exec_statement(&s, "INSERT INTO t (n) VALUES ('10');")
+		testing.expect(t, exec.has_error(eerr))
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+	{
+		r, eerr := exec.exec_statement(&s, "INSERT INTO t (n) VALUES (X'0A');")
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+	{
+		r, eerr := exec.exec_statement(&s, "INSERT INTO t (n) VALUES (10.0);")
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+	{
+		r, eerr := exec.exec_statement(&s, "INSERT INTO t (s) VALUES (10);")
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+	{
+		r, eerr := exec.exec_statement(&s, "INSERT INTO t (f) VALUES (1);")
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+	{
+		r, eerr := exec.exec_statement(&s, "INSERT INTO t (b) VALUES ('x');")
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+
+	// Matching kinds + untyped column still succeed; no silent Text→Integer.
+	rok, eok := exec.exec_statement(
+		&s,
+		"INSERT INTO t (n, s, f, b, u) VALUES (10, 'ok', 1.5, X'AB', 'any');",
+	)
+	testing.expectf(t, !exec.has_error(eok), "%s", eok.message)
+	testing.expect_value(t, rok.rows_affected, 1)
+	exec.free_error(eok)
+	exec.free_result(rok)
+
+	rok2, eok2 := exec.exec_statement(&s, "INSERT INTO t (u) VALUES (99);")
+	testing.expectf(t, !exec.has_error(eok2), "%s", eok2.message)
+	testing.expect_value(t, rok2.rows_affected, 1)
+	exec.free_error(eok2)
+	exec.free_result(rok2)
+
+	// Compare stays typed: text was never stored in n, so n = 10 is exact Integer match.
+	rs, es := exec.exec_statement(&s, "SELECT n FROM t WHERE n = 10;")
+	testing.expectf(t, !exec.has_error(es), "%s", es.message)
+	testing.expect_value(t, len(rs.rows), 1)
+	testing.expect_value(t, rs.rows[0][0], "10")
+	exec.free_error(es)
+	exec.free_result(rs)
+}
+
+@(test)
 test_insert_rowid_allocation_persists_next_rowid :: proc(t: ^testing.T) {
 	path := fmt.tprintf("/tmp/strix-e2-rowid-%d.strix", os.get_pid())
 	defer os.remove(path)

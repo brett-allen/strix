@@ -4,7 +4,7 @@ import "core:strings"
 import engine "../engine"
 import sql "../sql"
 
-// IPK type affinity: exact equal_fold match on INTEGER or INT only (no INTEGER(n), BIGINT, etc.).
+// IPK type name: exact equal_fold match on INTEGER or INT only (no INTEGER(n), BIGINT, etc.).
 is_ipk_type_name :: proc(type_name: string) -> bool {
 	return strings.equal_fold(type_name, "INTEGER") || strings.equal_fold(type_name, "INT")
 }
@@ -19,13 +19,83 @@ count_primary_key_columns :: proc(columns: []engine.Catalog_Column) -> int {
 	return n
 }
 
-// is_integer_primary_key reports whether a column is marked PK with IPK type affinity.
+// is_integer_primary_key reports whether a column is marked PK with an IPK type name.
 // Callers that need rowid-alias behavior must use find_ipk_column (sole PK required).
 is_integer_primary_key :: proc(col: engine.Catalog_Column) -> bool {
 	if .Primary_Key not_in col.flags {
 		return false
 	}
 	return is_ipk_type_name(col.type_name)
+}
+
+// type_name_base strips parameters / trailing words for declared-type matching.
+// "VARCHAR(10)" → "VARCHAR"; "DOUBLE PRECISION" → "DOUBLE"; "CHARACTER VARYING" → "CHARACTER".
+type_name_base :: proc(type_name: string) -> string {
+	base := strings.trim_space(type_name)
+	if paren := strings.index_byte(base, '('); paren >= 0 {
+		base = strings.trim_space(base[:paren])
+	}
+	if sp := strings.index_byte(base, ' '); sp >= 0 {
+		first := base[:sp]
+		if strings.equal_fold(first, "DOUBLE") ||
+		   strings.equal_fold(first, "CHARACTER") ||
+		   strings.equal_fold(first, "CHAR") {
+			return first
+		}
+	}
+	return base
+}
+
+// declared_storage_kind maps a recognized column type name to the Value_Kind that
+// may be stored. enforced=false means empty/unknown type → no kind check (no affinity).
+declared_storage_kind :: proc(type_name: string) -> (kind: Value_Kind, enforced: bool) {
+	if type_name == "" {
+		return {}, false
+	}
+	base := type_name_base(type_name)
+	if strings.equal_fold(base, "INTEGER") || strings.equal_fold(base, "INT") {
+		return .Integer, true
+	}
+	if strings.equal_fold(base, "REAL") ||
+	   strings.equal_fold(base, "FLOAT") ||
+	   strings.equal_fold(base, "DOUBLE") {
+		return .Float, true
+	}
+	if strings.equal_fold(base, "TEXT") ||
+	   strings.equal_fold(base, "VARCHAR") ||
+	   strings.equal_fold(base, "CHAR") ||
+	   strings.equal_fold(base, "CHARACTER") ||
+	   strings.equal_fold(base, "CLOB") ||
+	   strings.equal_fold(base, "NVARCHAR") {
+		return .Text, true
+	}
+	if strings.equal_fold(base, "BLOB") {
+		return .Blob, true
+	}
+	return {}, false
+}
+
+// check_value_matches_column_type rejects bound kinds that disagree with a recognized
+// declared type. NULL is always allowed here (NOT NULL is separate). No soft coerce / affinity.
+check_value_matches_column_type :: proc(col: engine.Catalog_Column, v: Value) -> Exec_Error {
+	if v.kind == .Null {
+		return ok_error()
+	}
+	expected, enforced := declared_storage_kind(col.type_name)
+	if !enforced {
+		return ok_error()
+	}
+	if v.kind == expected {
+		return ok_error()
+	}
+	return make_error(
+		.Constraint,
+		"type mismatch for column %s: declared %s requires %v, got %v",
+		col.name,
+		col.type_name,
+		expected,
+		v.kind,
+	)
 }
 
 // find_ipk_column returns the sole INTEGER/INT PRIMARY KEY column index, or -1.
@@ -205,6 +275,14 @@ build_insert_row_values :: proc(
 			return nil, err
 		}
 		vals[i] = v
+	}
+
+	// Declared-type kind check (no affinity / soft coerce). Untyped / unknown types skipped.
+	for i in 0 ..< ncol {
+		if cerr := check_value_matches_column_type(columns[i], vals[i]); has_error(cerr) {
+			free_values(vals, allocator)
+			return nil, cerr
+		}
 	}
 
 	// NOT NULL on provided NULLs (except sole IPK NULL → autoallocate).

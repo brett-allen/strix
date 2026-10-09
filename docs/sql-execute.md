@@ -7,6 +7,7 @@ Wire the existing SQL parser (`src/sql`) to the storage stack (`src/engine`) so 
 | **Branch** | `feature/sql-execute` |
 | **Depends on** | Parser v1 DoD ([`sql-parser.md`](sql-parser.md)), storage v1 DoD ([`storage-engine.md`](storage-engine.md) S0–S4), CLI `init` ([`src/cli`](../src/cli)) |
 | **Supersedes** | Storage plan phase S5 (“SQL DDL/DML slice”) — execution work lives here |
+| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). This doc remains the execute **wiring** history (E1–E6); compliance owns boolean/`CAST`/UNIQUE/PK/agg/join semantic evolution. |
 
 ---
 
@@ -53,7 +54,7 @@ Already landed (do not re-implement):
 - Prepared statements and parameter binding (`?` / `?N`): **defer**; literals only for v1 DML.
 - Concurrent sessions / MVCC.
 - WAL (still deferred at storage layer).
-- Full SQLite type affinity / collation matrix — pragmatic scalar `Value` tags only.
+- SQLite type affinity / collation matrix — out of scope; declared types + explicit `CAST` (S2); pragmatic scalar `Value` tags only.
 - Network protocol / multi-user server.
 - `ALTER TABLE` execution (parser may accept `ADD COLUMN`; reject at bind until a later plan).
 
@@ -122,7 +123,7 @@ Extend the table payload (keep `kind`, `root_page`; add schema fields):
 | `version` | `2` |
 | `kind` | `1` = table (unchanged) |
 | `root_page` | Heap btree root |
-| `columns[]` | Ordered: name, type name string (affinity later), not_null, pk flag |
+| `columns[]` | Ordered: name, type name string (declared type; no SQLite affinity), not_null, pk flag |
 | `next_rowid` | High-water for IPK (`INTEGER`/`INT PRIMARY KEY`) / implicit rowid |
 
 Index rows: v1 (legacy, no columns) through E4; **v2 column list** landed in E5 — see [`storage-format.md`](storage-format.md).
@@ -362,7 +363,8 @@ Wire `src/test/exec` into `./build.sh test` as part of E1.
 
 | Doc | Purpose |
 |-----|---------|
-| `docs/sql-execute.md` | This plan (living) |
+| `docs/sql-execute.md` | This plan (living) — E1–E6 wiring |
+| `docs/sql-compliance.md` | Post-E6 semantic north star (compliance subset) |
 | `docs/storage-format.md` | Catalog v2 (E1) / row payload bytes (E2) |
 | `docs/sql-dialect.md` | **Executed** vs **Parsed only** — update as phases land |
 | `docs/storage-engine.md` | S5 points here (done) |
@@ -404,3 +406,4 @@ Defaults stand unless overridden before/during the relevant phase:
 ## Immediate next steps
 
 1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.
+2. Semantic north star after E6: [`sql-compliance.md`](sql-compliance.md) (start at S1 hygiene on `feature/sql-compliance`).

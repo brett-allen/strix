@@ -216,7 +216,7 @@ Each column record:
 | `name_len` | u16 | |
 | `name` | `name_len` | UTF-8 column name |
 | `type_name_len` | u16 | `0` if type omitted |
-| `type_name` | `type_name_len` | UTF-8 type name string (affinity later) |
+| `type_name` | `type_name_len` | UTF-8 declared type name (no affinity; INSERT/UPDATE kind-check recognized names) |
 | `flags` | u8 | bit0 = `NOT NULL`, bit1 = `PRIMARY KEY`, bit2 = `Has_Default` |
 | `default` | … | Present only when `Has_Default` is set (see below) |
 

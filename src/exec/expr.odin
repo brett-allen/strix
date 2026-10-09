@@ -49,13 +49,19 @@ eval_expr :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator
 }
 
 // eval_expr_bool evaluates expr and returns whether it is TRUE (WHERE keep-row).
-// NULL / FALSE → false. Errors propagate.
+// NULL / FALSE → false. Text/Blob in boolean context → Unsupported_Ast. Errors propagate.
 eval_expr_bool :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator) -> (bool, Exec_Error) {
 	v, err := eval_expr(expr, env, allocator)
 	if has_error(err) {
 		return false, err
 	}
 	defer free_value(v, allocator)
+	if value_is_null(v) {
+		return false, ok_error()
+	}
+	if berr := require_bool_operand(v, expr.span); has_error(berr) {
+		return false, berr
+	}
 	return value_is_true(v), ok_error()
 }
 
@@ -78,16 +84,15 @@ eval_const_integer :: proc(expr: ^sql.Expr, what: string, allocator := context.a
 	return v.i, ok_error()
 }
 
-// SQLite-shaped boolean context: non-zero numbers and any non-NULL Text/Blob
-// are TRUE; zero is FALSE; NULL is neither (unknown).
+// Strict boolean context (S1 / sql-compliance): Integer/Float 0 = false, ≠0 = true;
+// NULL is unknown (neither). Text/Blob must be rejected via require_bool_operand
+// before calling these — they treat non-numeric as neither true nor false.
 value_is_true :: proc(v: Value) -> bool {
 	#partial switch v.kind {
 	case .Integer:
 		return v.i != 0
 	case .Float:
 		return v.f != 0
-	case .Text, .Blob:
-		return true
 	}
 	return false
 }
@@ -98,14 +103,34 @@ value_is_false :: proc(v: Value) -> bool {
 		return v.i == 0
 	case .Float:
 		return v.f == 0
-	case .Text, .Blob:
-		return false
 	}
 	return false
 }
 
 value_is_null :: proc(v: Value) -> bool {
 	return v.kind == .Null
+}
+
+// require_bool_operand rejects Text/Blob (and other non-numeric non-null kinds)
+// in WHERE / AND / OR / NOT. NULL is allowed (three-valued unknown).
+require_bool_operand :: proc(v: Value, span: sql.Span = {}) -> Exec_Error {
+	#partial switch v.kind {
+	case .Null, .Integer, .Float:
+		return ok_error()
+	case .Text, .Blob:
+		return make_error(
+			.Unsupported_Ast,
+			"boolean context requires a numeric value (got %v); use a comparison",
+			v.kind,
+			span = span,
+		)
+	}
+	return make_error(
+		.Unsupported_Ast,
+		"boolean context requires a numeric value (got %v)",
+		v.kind,
+		span = span,
+	)
 }
 
 eval_column_ref :: proc(
@@ -203,6 +228,9 @@ eval_unary :: proc(
 		if value_is_null(inner) {
 			return value_null(), ok_error()
 		}
+		if berr := require_bool_operand(inner, span); has_error(berr) {
+			return {}, berr
+		}
 		if value_is_true(inner) {
 			return value_integer(0), ok_error()
 		}
@@ -257,6 +285,11 @@ eval_logic :: proc(
 	}
 	defer free_value(left, allocator)
 
+	left_span := b.left.span if b.left != nil else span
+	if berr := require_bool_operand(left, left_span); has_error(berr) {
+		return {}, berr
+	}
+
 	if b.op == .And {
 		if value_is_false(left) {
 			return value_integer(0), ok_error()
@@ -272,6 +305,11 @@ eval_logic :: proc(
 		return {}, rerr
 	}
 	defer free_value(right, allocator)
+
+	right_span := b.right.span if b.right != nil else span
+	if berr := require_bool_operand(right, right_span); has_error(berr) {
+		return {}, berr
+	}
 
 	if b.op == .And {
 		if value_is_false(right) {
@@ -321,8 +359,11 @@ eval_compare :: proc(op: sql.Binary_Op, left, right: Value, span: sql.Span) -> (
 }
 
 // compare_values returns -1 / 0 / 1. NULL handling is caller's responsibility.
-// Integer–Integer compares as i64 exactly (not via f64). Mixed integer/float
-// coerces through f64 only when a float operand is involved.
+// Policy (S1 / sql-compliance north star):
+//   - Integer–Integer: exact i64
+//   - Mixed int/float: allow via f64
+//   - Same-kind Text/Blob: byte/lex compare
+//   - Text/Blob ↔ numeric (or other kind mismatch): Unsupported_Ast (use CAST later)
 compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Error) {
 	if left.kind == .Null && right.kind == .Null {
 		return 0, ok_error()

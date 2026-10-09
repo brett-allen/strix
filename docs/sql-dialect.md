@@ -1,6 +1,10 @@
 # SQL Dialect Notes (Strix)
 
-SQLite-shaped dialect baseline. Intentional decisions and deviations live here.
+**North star:** a **SQL-compliant subset** (standard-SQL / H2-ish clarity) plus **named extensions** — not full SQL:20xx and not “SQLite quirk parity.” Typed columns matter; no type affinity; `CAST` is explicit; boolean context is strict; `PRIMARY KEY` means `UNIQUE` + `NOT NULL` (index-backed). Internal **rowid** remains the storage key.
+
+Execute semantics migrate under [`sql-compliance.md`](sql-compliance.md) (phases S0–S6). Parser surface may still accept forms the executor rejects until those phases land. Intentional deviations (IPK/rowid alias, `IF NOT EXISTS`, bracket/backtick idents, shell `.commands`) are **named extensions**, not the baseline.
+
+Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; remaining demotions/widenings are in the compliance plan’s breaking-changes table.
 
 ## Supported statements (parser v1 / Phase 5)
 
@@ -27,7 +31,27 @@ Keywords are case-insensitive; quoted forms are always `Ident`. Unicode unquoted
 
 **Execute bind policy:**
 - **Columns** (and IPK type names): case-insensitive `equal_fold` at bind (CREATE duplicate/PK matching, INSERT column lists, SELECT/UPDATE SET/WHERE, index column bind). Case-only duplicate column names at `CREATE TABLE` are rejected (`Invalid_Schema`).
-- **Tables / indexes:** catalog keys are **case-sensitive** (exact match on the name as stored). `Users` and `users` are distinct; docs must not claim fold “everywhere.”
+- **Tables / indexes:** catalog keys are **case-sensitive** (exact match on the name as stored). `Users` and `users` are distinct; wrong-case `FROM` / `DROP INDEX` → `Unknown_Table` / `Unknown_Index` (no silent fold). Docs must not claim fold “everywhere.”
+
+### Boolean context & comparisons (execute / S1)
+
+| Rule | Behavior |
+|------|----------|
+| Boolean (`WHERE` / `AND` / `OR` / `NOT`) | Integer/Float: `0` = false, `≠0` = true. NULL = unknown (3VL preserved; short-circuit may skip the other side). Text/Blob (and other non-numeric non-null) → `Unsupported_Ast`. |
+| Integer–Integer compare | Exact `i64` (not via `f64`) |
+| Mixed int/float compare | Allowed via `f64` (north-star default; documented) |
+| Text/Blob ↔ numeric | Error without `CAST` (`Unsupported_Ast`) |
+| Same-kind Text/Blob | Byte/lex compare unchanged |
+
+### INSERT / UPDATE declared-type kinds (execute / S1)
+
+| Rule | Behavior |
+|------|----------|
+| Recognized types | Bound value kind must match: `INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/`CHAR`/`CHARACTER`/`CLOB`/`NVARCHAR` → Text; `BLOB` → Blob. Parameters (e.g. `VARCHAR(10)`) ignored for matching. |
+| Mismatch | `Constraint` (e.g. `INSERT INTO t (n) VALUES ('10')` into `n INT`) — no soft coerce, no affinity |
+| NULL | Allowed unless `NOT NULL` |
+| Empty / unknown type name | Store bound kind as-is (no check until a recognized name) |
+| `UPDATE SET` | Same kind check on assigned values |
 
 ### Literals & comments
 
@@ -142,9 +166,9 @@ Parser v1 accepts a wider surface than the executor runs. **Execute support** li
 | Area | Parsed (today) | Executed |
 |------|----------------|----------|
 | `CREATE`/`DROP TABLE` | yes | **yes (E1/E2)** — `NOT NULL`; literal/`NULL` `DEFAULT`; sole `INTEGER`/`INT PRIMARY KEY` (column or table-level); `IF NOT EXISTS` / `IF EXISTS`; rejects composite PK, non-integer PK, UNIQUE/CHECK/FK until later |
-| `INSERT` … `VALUES` | yes | **yes (E2)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5) |
-| Single-table `SELECT` | yes | **yes (E3)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list); ORDER BY / LIMIT / OFFSET (in-memory; incompatible ORDER BY kinds → error); rejects DISTINCT / JOIN / GROUP BY / CAST / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only (E5; numeric eq stays on seq scan) |
-| `UPDATE` / `DELETE` | yes | **yes (E4/E5)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env`; row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL on SET → `Constraint` |
+| `INSERT` … `VALUES` | yes | **yes (E2 + S1)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; **declared-type kind check (S1):** recognized types (`INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/… → Text; `BLOB` → Blob) reject mismatched literal kinds with `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5) |
+| Single-table `SELECT` | yes | **yes (E3 + S1)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list); **strict boolean context (S1):** Integer/Float `0` = false, `≠0` = true; NULL unknown (3VL for AND/OR); Text/Blob (and other non-numeric non-null) in `WHERE`/`AND`/`OR`/`NOT` → `Unsupported_Ast`; **compare (S1):** Integer–Integer exact `i64`; mixed int/float via `f64`; same-kind Text/Blob byte/lex; Text/Blob↔numeric without `CAST` → `Unsupported_Ast`; ORDER BY / LIMIT / OFFSET (in-memory; incompatible ORDER BY kinds → error); rejects DISTINCT / JOIN / GROUP BY / CAST / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only (E5; numeric eq stays on seq scan) |
+| `UPDATE` / `DELETE` | yes | **yes (E4/E5 + S1)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env` (same S1 boolean/compare rules); `SET` values checked against declared column kinds (same as INSERT); row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL / type mismatch on SET → `Constraint` |
 | `CREATE`/`DROP INDEX` | yes | **yes (E5)** — register + backfill; `IF NOT EXISTS` / `IF EXISTS`; catalog index v2 column list; `DESC` on index columns is **catalog metadata only** (key bytes are always ASC-encoded for v1); `DROP TABLE` still rejects while indexes exist (no cascade) |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | yes (E6) | **yes (E6)** — explicit txn mode; nested `BEGIN` → `In_Txn`; statements inside txn do not auto-commit until `COMMIT`; `ROLLBACK` undoes; `COMMIT`/`ROLLBACK` without `BEGIN` → `No_Txn`; **write failure inside explicit txn aborts the whole txn** (no savepoints; clears `explicit_txn`, sets `txn_aborted`); **flush-fence recovery:** retry `COMMIT` on the still-open session (auto-commit fence promotes to `explicit_txn`; shell close/quit/EOF/`--bail` exit refused until recovered; batch process exit **forfeits** recovery) |
 | Scripts | yes | **yes (E6)** — stop-on-error default; optional `continue_on_error` / CLI `--continue-on-error`; **after an explicit-txn abort, the script always stops** (even with `continue_on_error`) so later statements cannot auto-commit outside the aborted txn; **after a flush fence, only recovery `COMMIT` and `SELECT` may run** (other stmts hard-stop; with `continue_on_error`, intervening non-allowed stmts are skipped until `COMMIT`); errors format as `file:line:col: message` when path+span known |
