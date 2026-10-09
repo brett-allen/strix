@@ -1,5 +1,6 @@
 package sql_tests
 
+import "core:strings"
 import "core:testing"
 import sql "../../sql"
 
@@ -67,6 +68,49 @@ test_expr_placeholders :: proc(t: ^testing.T) {
 	defer sql.free_error(err2)
 	testing.expect(t, !sql.has_error(err2))
 	testing.expect_value(t, expr2.data.(sql.Placeholder_Data).index, 12)
+}
+
+@(test)
+test_placeholder_print_reparse_preserves_indices :: proc(t: ^testing.T) {
+	stmt, err := sql.parse_statement("SELECT ?2, ?0 FROM t")
+	defer sql.free_statement(stmt)
+	defer sql.free_error(err)
+	testing.expectf(t, !sql.has_error(err), "%s", err.message)
+
+	printed := sql.print_statement(stmt)
+	defer delete(printed)
+	testing.expect(t, strings.contains(printed, "?2"))
+	testing.expect(t, strings.contains(printed, "?0"))
+
+	stmt2, err2 := sql.parse_statement(printed)
+	defer sql.free_statement(stmt2)
+	defer sql.free_error(err2)
+	testing.expectf(t, !sql.has_error(err2), "%s", err2.message)
+	sel := stmt2.data.(sql.Select_Stmt)
+	testing.expect_value(t, len(sel.projection), 2)
+	testing.expect_value(t, sel.projection[0].expr.data.(sql.Placeholder_Data).index, 2)
+	testing.expect_value(t, sel.projection[1].expr.data.(sql.Placeholder_Data).index, 0)
+}
+
+@(test)
+test_placeholder_huge_index_rejected :: proc(t: ^testing.T) {
+	// Overflow / past MAX_PLACEHOLDER_INDEX must not wrap.
+	cases := []string{"?65536", "?99999999999999999999", "?18446744073709551615"}
+	for src in cases {
+		expr, err := sql.parse_expr(src)
+		testing.expectf(t, sql.has_error(err), "expected reject for %s", src)
+		testing.expect_value(t, err.code, sql.Parse_Error_Code.Invalid_Number)
+		sql.free_error(err)
+		if expr != nil {
+			free_expr(expr)
+		}
+	}
+
+	ok_expr, ok_err := sql.parse_expr("?65535")
+	defer free_expr(ok_expr)
+	defer sql.free_error(ok_err)
+	testing.expect(t, !sql.has_error(ok_err))
+	testing.expect_value(t, ok_expr.data.(sql.Placeholder_Data).index, 65535)
 }
 
 @(test)

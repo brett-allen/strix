@@ -706,7 +706,15 @@ eval_unary :: proc(
 		case .Null:
 			return value_null(), ok_error()
 		case .Integer:
-			return value_integer(-inner.i), ok_error()
+			neg, overflowed := i64_neg_checked(inner.i)
+			if overflowed {
+				return {}, make_error(
+					.Unsupported_Ast,
+					"integer overflow: unary negation does not fit in i64",
+					span = span,
+				)
+			}
+			return value_integer(neg), ok_error()
 		case .Float:
 			return value_float(-inner.f), ok_error()
 		case .Text, .Blob, .Boolean, .Uuid:
@@ -998,19 +1006,58 @@ eval_arith :: proc(op: sql.Binary_Op, left, right: Value, span: sql.Span) -> (Va
 		ri := right.i
 		#partial switch op {
 		case .Add:
-			return value_integer(li + ri), ok_error()
+			sum, overflowed := i64_add_checked(li, ri)
+			if overflowed {
+				return {}, make_error(
+					.Unsupported_Ast,
+					"integer overflow: + result does not fit in i64",
+					span = span,
+				)
+			}
+			return value_integer(sum), ok_error()
 		case .Sub:
-			return value_integer(li - ri), ok_error()
+			diff, overflowed := i64_sub_checked(li, ri)
+			if overflowed {
+				return {}, make_error(
+					.Unsupported_Ast,
+					"integer overflow: - result does not fit in i64",
+					span = span,
+				)
+			}
+			return value_integer(diff), ok_error()
 		case .Mul:
-			return value_integer(li * ri), ok_error()
+			prod, overflowed := i64_mul_checked(li, ri)
+			if overflowed {
+				return {}, make_error(
+					.Unsupported_Ast,
+					"integer overflow: * result does not fit in i64",
+					span = span,
+				)
+			}
+			return value_integer(prod), ok_error()
 		case .Div:
 			if ri == 0 {
 				return {}, make_error(.Unsupported_Ast, "division by zero", span = span)
+			}
+			// min(i64) / -1 overflows two's-complement i64.
+			if li == min(i64) && ri == -1 {
+				return {}, make_error(
+					.Unsupported_Ast,
+					"integer overflow: / result does not fit in i64",
+					span = span,
+				)
 			}
 			return value_integer(li / ri), ok_error()
 		case .Mod:
 			if ri == 0 {
 				return {}, make_error(.Unsupported_Ast, "division by zero", span = span)
+			}
+			if li == min(i64) && ri == -1 {
+				return {}, make_error(
+					.Unsupported_Ast,
+					"integer overflow: %% result does not fit in i64",
+					span = span,
+				)
 			}
 			return value_integer(li % ri), ok_error()
 		}

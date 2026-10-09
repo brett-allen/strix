@@ -177,8 +177,9 @@ unpin :: proc(p: ^Pager, page_no: dbfile.Page_No) -> Page_Error {
 /*
 	flush persists the dirty set using the v1 write order:
 
+	  0. if any dirty data pages: set page-0 flush-in-progress fence + sync
 	  1. dirty data pages (page_no >= 1) in ascending page_no order
-	  2. page 0 bootstrap (pager supplies page_count + freelist_head)
+	  2. page 0 bootstrap (clears fence; pager supplies page_count + freelist_head)
 	  3. dbfile.sync()
 
 	`bootstrap` supplies caller-owned meta (commit_counter, schema_cookie,
@@ -186,8 +187,9 @@ unpin :: proc(p: ^Pager, page_no: dbfile.Page_No) -> Page_Error {
 	are taken from the pager.
 
 	Returns .Pinned if any cache frame is still pinned.
-	On partial failure after any data page write, sets flush_failed and returns
-	an error; discard_dirty is then refused until a flush succeeds (H2).
+	On partial failure after the fence is set (or any data page write), sets
+	flush_failed and returns an error; discard_dirty is then refused until a
+	flush succeeds (H2). A crash with the fence still set refuses reopen (.Torn_Flush).
 */
 flush :: proc(p: ^Pager, bootstrap: dbfile.Bootstrap) -> Page_Error {
 	if e := require_open(p); e != .None {
@@ -212,13 +214,24 @@ flush :: proc(p: ^Pager, bootstrap: dbfile.Bootstrap) -> Page_Error {
 	}
 	slice.sort(dirty_nos[:])
 
+	// Durable fence before in-place overwrites so a crash mid-flush refuses reopen
+	// rather than serving a torn prior commit (v1: no WAL / rollback journal).
+	marked := false
+	if len(dirty_nos) > 0 {
+		merr := dbfile.mark_flush_in_progress(&p.file)
+		if merr != .None {
+			return from_db_error(merr)
+		}
+		marked = true
+	}
+
 	wrote_data := 0
 	for page_no in dirty_nos {
 		idx := p.page_index[page_no]
 		fr := &p.frames[idx]
 		derr := dbfile.write_page(&p.file, page_no, fr.data)
 		if derr != .None {
-			if wrote_data > 0 {
+			if marked || wrote_data > 0 {
 				p.flush_failed = true
 			}
 			return from_db_error(derr)
@@ -236,10 +249,11 @@ flush :: proc(p: ^Pager, bootstrap: dbfile.Bootstrap) -> Page_Error {
 	boot.page_count = p.page_count
 	boot.freelist_head = p.freelist_head
 	// Keep caller's commit_counter, schema_cookie, table_prime_root.
+	// write_bootstrap zeros page-0 reserved bytes → clears flush-in-progress fence.
 
 	derr := dbfile.write_bootstrap(&p.file, boot)
 	if derr != .None {
-		if wrote_data > 0 {
+		if marked || wrote_data > 0 {
 			p.flush_failed = true
 		}
 		return from_db_error(derr)

@@ -1,8 +1,5 @@
 package sql
 
-import "core:mem"
-import "core:strconv"
-
 free_expr :: proc(expr: ^Expr, allocator := context.allocator) {
 	if expr == nil {
 		return
@@ -55,12 +52,40 @@ free_expr :: proc(expr: ^Expr, allocator := context.allocator) {
 	free(expr, allocator)
 }
 
+// Explicit ?N indices must fit in this inclusive range (fail-closed; no wrap).
+MAX_PLACEHOLDER_INDEX :: 65535
+
+// parse_placeholder_index parses digits after `?` without wrapping on overflow.
+// Bare `?` (len <= 1) is not handled here — callers assign auto indices.
+parse_placeholder_index :: proc(text: string) -> (idx: int, ok: bool) {
+	if len(text) <= 1 {
+		return 0, false
+	}
+	digits := text[1:]
+	if len(digits) == 0 {
+		return 0, false
+	}
+	n: u64 = 0
+	for i in 0 ..< len(digits) {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		d := u64(c - '0')
+		if n > (u64(MAX_PLACEHOLDER_INDEX) - d) / 10 {
+			return 0, false
+		}
+		n = n * 10 + d
+	}
+	return int(n), true
+}
+
 placeholder_index_from_text :: proc(text: string) -> int {
 	if len(text) <= 1 {
 		return 0
 	}
-	n, ok := strconv.parse_int(text[1:])
-	if !ok || n < 0 {
+	n, ok := parse_placeholder_index(text)
+	if !ok {
 		return 0
 	}
 	return n
@@ -68,15 +93,19 @@ placeholder_index_from_text :: proc(text: string) -> int {
 
 // assign_placeholder_index numbers bare `?` left-to-right (0, 1, 2, …).
 // Explicit `?N` uses N and advances the auto counter past N when needed.
-assign_placeholder_index :: proc(p: ^Parser, text: string) -> int {
+// Returns false when `?N` is out of range or overflows.
+assign_placeholder_index :: proc(p: ^Parser, text: string) -> (idx: int, ok: bool) {
 	if len(text) <= 1 {
-		idx := p.next_placeholder
+		idx = p.next_placeholder
 		p.next_placeholder = idx + 1
-		return idx
+		return idx, true
 	}
-	idx := placeholder_index_from_text(text)
-	if idx >= p.next_placeholder {
-		p.next_placeholder = idx + 1
+	n, pok := parse_placeholder_index(text)
+	if !pok {
+		return 0, false
 	}
-	return idx
+	if n >= p.next_placeholder {
+		p.next_placeholder = n + 1
+	}
+	return n, true
 }

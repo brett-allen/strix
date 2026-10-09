@@ -258,6 +258,16 @@ load_bootstrap_meta :: proc(f: ^Db_File) -> Db_Error {
 		return .Short_Read
 	}
 
+	// Refuse reopen of a file whose last flush set the durable fence but did not
+	// clear it (crash mid-flush). Prefer fail-closed over serving torn pages.
+	marker: [4]u8
+	if merr := f.vfs.read_at(&f.vfs, i64(FLUSH_IN_PROGRESS_OFFSET), marker[:]); merr != .None {
+		return merr
+	}
+	if flush_in_progress_set(marker[:]) {
+		return .Torn_Flush
+	}
+
 	f.page_size = boot.page_size
 	f.page_count = boot.page_count
 	return .None

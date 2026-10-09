@@ -101,7 +101,7 @@ Byte layout: [`storage-format.md`](storage-format.md) (v0.1 freezes page 0).
    - `dbfile.sync()` (`fsync`) once (or data then page 0 — document exact order in `storage-format.md`).
 4. **Open** = validate magic/version; optionally verify page checksums; refuse clearly corrupt headers.
 
-**Known limit:** a crash *during* multi-page flush can leave a torn file. Accept for early development; **API boundaries should make adding WAL later a `paging`+`dbfile` change**, not a btree rewrite.
+**Known limit:** a crash *during* multi-page flush can leave a torn file (no WAL / rollback journal). v1 sets a durable page-0 **flush-in-progress** fence before overwriting data pages and **refuses reopen** (`.Torn_Flush`) if that fence is still set — fail-closed rather than serving mixed pages. Prior-commit restore still needs WAL/journal later; **API boundaries should make adding WAL a `paging`+`dbfile` change**, not a btree rewrite.
 
 **Not too simple:** still have real txns, pin cache, freelist, checksums, bootstrap catalog, deterministic flush order.
 

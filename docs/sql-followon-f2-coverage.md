@@ -50,7 +50,7 @@ Uncovered (2): multiple table PRIMARY KEY; duplicate name inside PRIMARY KEY lis
 |---------|---------|--------------|------------------|
 | `.schema` emits `PRIMARY KEY (a, b)` | yes | `test_composite_pk_schema_sql` | table constraint form |
 | Hide composite PK autoindex in schema | yes | same | no `strix_autoindex_` |
-| Multi-col UNIQUE still emits autoindex | yes | `test_multi_column_table_unique` | unchanged |
+| Multi-col UNIQUE in schema as `UNIQUE (…)` | yes | `test_multi_column_table_unique` | table constraint; no `strix_autoindex_*` dump |
 
 ---
 

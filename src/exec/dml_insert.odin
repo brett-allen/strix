@@ -328,6 +328,10 @@ build_insert_row_values :: proc(
 	return vals, ok_error()
 }
 
+// IPK / implicit rowid keys are stored as i64-compatible values; auto-alloc
+// refuses past max(i64) (no silent wrap to negative).
+MAX_IPK_ROWID :: u64(max(i64))
+
 allocate_rowid :: proc(
 	vals: []Value,
 	columns: []engine.Catalog_Column,
@@ -337,6 +341,12 @@ allocate_rowid :: proc(
 	if ipk >= 0 {
 		v := vals[ipk]
 		if v.kind == .Null {
+			if next_rowid^ == 0 || next_rowid^ > MAX_IPK_ROWID {
+				return 0, make_error(
+					.Constraint,
+					"INTEGER PRIMARY KEY auto-allocate exhausted (max i64)",
+				)
+			}
 			rowid = next_rowid^
 			next_rowid^ += 1
 			vals[ipk] = value_integer(i64(rowid))
@@ -353,9 +363,20 @@ allocate_rowid :: proc(
 		}
 		rowid = u64(v.i)
 		if rowid >= next_rowid^ {
-			next_rowid^ = rowid + 1
+			// Cap high-water at max(i64)+1 so the next auto-alloc fails closed.
+			if rowid >= MAX_IPK_ROWID {
+				next_rowid^ = MAX_IPK_ROWID + 1
+			} else {
+				next_rowid^ = rowid + 1
+			}
 		}
 		return rowid, ok_error()
+	}
+	if next_rowid^ == 0 || next_rowid^ > MAX_IPK_ROWID {
+		return 0, make_error(
+			.Constraint,
+			"rowid auto-allocate exhausted (max i64)",
+		)
 	}
 	rowid = next_rowid^
 	next_rowid^ += 1

@@ -52,7 +52,8 @@ Uncovered (1): `index_insert_for_row` btree `.Exists` after probe (rowid-suffix 
 | UUID-as-TEXT PK | yes | `test_uuid_type_as_text_pk` | `UUID PRIMARY KEY` |
 | `.schema` column PK/UNIQUE | yes | `test_schema_sql_shows_text_pk_and_unique` | PRIMARY KEY; column UNIQUE; hide single-col autoindex; emit user `CREATE UNIQUE INDEX` |
 | `.schema` table-level single UNIQUE | yes | `test_schema_sql_shows_table_level_single_unique` | `UNIQUE (a)` → column UNIQUE in schema (no lost constraint) |
-| Multi-col UNIQUE in schema | yes | `test_multi_column_table_unique` | emit `strix_autoindex_*` for multi-col |
+| Multi-col UNIQUE in schema | yes | `test_multi_column_table_unique` | emit table `UNIQUE (a, b)`; no `strix_autoindex_*` |
+| `DROP INDEX` reserved autoindex | yes | `test_drop_index_rejects_system_autoindex` | case-insensitive; uniqueness still enforced |
 | UPDATE PK collision | yes | `test_text_pk_update_unique_and_drop_table` | SET id to existing → `Constraint` |
 | UPDATE TEXT PK to NULL | yes | `test_text_pk_update_null_constraint` | SET id = NULL → `Constraint` |
 
@@ -87,7 +88,7 @@ Note: table-level `PRIMARY KEY (col)` on TEXT is covered in `test_create_accepts
 | Durable reopen of TEXT PK + unique index | yes |
 | DROP TABLE drops system autoindexes | yes |
 | `.schema` shows PK/UNIQUE honestly (column + table-level single) | yes |
-| Reserved `strix_autoindex_` index names rejected | yes |
+| Reserved `strix_autoindex_` index names rejected (CREATE + DROP) | yes |
 | UPDATE TEXT PK to NULL → `Constraint` | yes |
 | E1–E6 + S1–S2 still green | yes — full `./build.sh test` |
 
@@ -98,7 +99,7 @@ Note: table-level `PRIMARY KEY (col)` on TEXT is covered in `test_create_accepts
 | Code | When |
 |------|------|
 | `Constraint` | Duplicate PK/UNIQUE / unique index key; NULL on PK (`NOT NULL`); UNIQUE backfill collision |
-| `Invalid_Schema` | `CREATE INDEX` / `CREATE UNIQUE INDEX` name starts with reserved `strix_autoindex_` (case-insensitive) |
+| `Invalid_Schema` | `CREATE INDEX` / `CREATE UNIQUE INDEX` / `DROP INDEX` name starts with reserved `strix_autoindex_` (case-insensitive) |
 | `Unsupported_Ast` | Composite PRIMARY KEY (unchanged) |
 
 ---

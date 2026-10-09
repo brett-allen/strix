@@ -282,6 +282,64 @@ test_sum_i64_overflow_fail_closed :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_scalar_i64_arith_overflow_fail_closed :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_statement(&s, "CREATE TABLE t (n INTEGER);")
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	// Bind extreme i64 values (SQL literals cannot always spell min(i64)).
+	extremes := []i64{max(i64), min(i64), i64(4611686018427387904)}
+	for v in extremes {
+		ri, ei := exec.exec_statement_params(&s, "INSERT INTO t VALUES (?)", []exec.Value{exec.value_integer(v)})
+		testing.expectf(t, !exec.has_error(ei), "%s", ei.message)
+		exec.free_error(ei)
+		exec.free_result(ri)
+	}
+
+	// `/` always promotes to float in eval_arith; cover + - * and unary -.
+	overflow_cases := []struct {
+		sql: string,
+		arg: i64,
+	}{
+		{"SELECT n + 1 FROM t WHERE n = ?", max(i64)},
+		{"SELECT n - 1 FROM t WHERE n = ?", min(i64)},
+		{"SELECT n * 2 FROM t WHERE n = ?", i64(4611686018427387904)},
+		{"SELECT -n FROM t WHERE n = ?", min(i64)},
+	}
+	for c in overflow_cases {
+		r, eerr := exec.exec_statement_params(&s, c.sql, []exec.Value{exec.value_integer(c.arg)})
+		testing.expectf(t, exec.has_error(eerr), "expected overflow for %s", c.sql)
+		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Unsupported_Ast)
+		exec.free_error(eerr)
+		exec.free_result(r)
+	}
+
+	rins, eins := exec.exec_statement_params(
+		&s,
+		"INSERT INTO t VALUES (?)",
+		[]exec.Value{exec.value_integer(max(i64) - 1)},
+	)
+	testing.expectf(t, !exec.has_error(eins), "%s", eins.message)
+	exec.free_error(eins)
+	exec.free_result(rins)
+	rok, eok := exec.exec_statement_params(
+		&s,
+		"SELECT n + 1 FROM t WHERE n = ?",
+		[]exec.Value{exec.value_integer(max(i64) - 1)},
+	)
+	testing.expectf(t, !exec.has_error(eok), "%s", eok.message)
+	testing.expect_value(t, rok.rows[0][0], "9223372036854775807")
+	exec.free_error(eok)
+	exec.free_result(rok)
+}
+
+@(test)
 test_heap_row_boolean_uuid_codec :: proc(t: ^testing.T) {
 	raw: [16]u8
 	testing.expect(t, exec.parse_uuid_text("01234567-89ab-cdef-0123-456789abcdef", raw[:]))

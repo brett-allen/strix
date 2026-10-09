@@ -142,27 +142,42 @@ schema_sql_one :: proc(
 		}
 		strings.write_string(&b, ")")
 	}
-	strings.write_string(&b, "\n);\n")
 
-	// Stable lexical order by index name.
+	// Multi-column UNIQUE system autoindexes → table-level UNIQUE (c1, c2)
+	// inside CREATE TABLE (replayable; never emit reserved strix_autoindex_* names).
 	if len(idx_refs) > 1 {
 		slice.sort_by(idx_refs, proc(a, b: engine.Catalog_Index_Ref) -> bool {
 			return a.name < b.name
 		})
 	}
 	for ref in idx_refs {
+		if !is_system_autoindex_name(ref.name) || !engine.catalog_index_is_unique(ref.entry) {
+			continue
+		}
+		if len(ref.entry.columns) <= 1 {
+			continue // single-col UNIQUE/PK shown on the column
+		}
+		if composite_pk && index_columns_match_pk_set(ref.entry.columns, entry.columns) {
+			continue // already emitted as PRIMARY KEY (…)
+		}
+		strings.write_string(&b, ",\n  UNIQUE (")
+		for col, i in ref.entry.columns {
+			if i > 0 {
+				strings.write_string(&b, ", ")
+			}
+			strings.write_string(&b, col.name)
+		}
+		strings.write_string(&b, ")")
+	}
+	strings.write_string(&b, "\n);\n")
+
+	// User indexes only (system autoindexes never appear as CREATE INDEX).
+	for ref in idx_refs {
 		if len(ref.entry.columns) == 0 {
 			continue // v1 rows without column meta — skip awkwardly empty INDEX
 		}
-		// System autoindexes implied by PRIMARY KEY / UNIQUE: hide single-col always;
-		// hide multi-col when it is the composite PRIMARY KEY (emitted in CREATE TABLE).
 		if is_system_autoindex_name(ref.name) {
-			if len(ref.entry.columns) == 1 {
-				continue
-			}
-			if composite_pk && index_columns_match_pk_set(ref.entry.columns, entry.columns) {
-				continue
-			}
+			continue
 		}
 		if engine.catalog_index_is_unique(ref.entry) {
 			fmt.sbprintf(&b, "CREATE UNIQUE INDEX %s ON %s (", ref.name, table_name)
