@@ -11,7 +11,8 @@
 --   .read examples/comprehensive.sql
 --
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
--- "Executed vs parsed only"). Includes S2 CAST and S3 UNIQUE / TEXT PK.
+-- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK, and
+-- S4 whole-query aggregates (COUNT/SUM/AVG/MIN/MAX, no GROUP BY).
 -- Intentionally omits JOINs, GROUP BY, DISTINCT, CHECK/FK, ALTER,
 -- INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
 
@@ -185,6 +186,10 @@ SELECT id, name, price, note FROM products WHERE id = 10;
 SELECT id, customer_id, qty, paid, tag FROM orders ORDER BY id;
 SELECT id, email, active FROM customers ORDER BY id;
 SELECT id, text_col FROM scratch ORDER BY id;
+
+-- Whole-query aggregates (S4; no GROUP BY)
+SELECT COUNT(*) AS n_products, SUM(price), AVG(price), MIN(price), MAX(price) FROM products;
+SELECT COUNT(*) FROM orders WHERE paid = 1;
 
 -- ---------------------------------------------------------------------------
 -- Explicit transactions

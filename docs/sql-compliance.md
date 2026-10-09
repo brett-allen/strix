@@ -28,8 +28,8 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `CAST`, `JOIN`, `GROUP BY`/`HAVING`, aggregates-as-calls, UNIQUE/PK constraints — many reject at bind/exec |
-| `src/exec` | E1–E6 + **S3** | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; rejects composite PK |
-| Expression eval | E3 + **S1** + **S2** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2) |
+| `src/exec` | E1–E6 + **S4** | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; rejects composite PK; whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, no `GROUP BY`) |
+| Expression eval | E3 + **S1** + **S2** + **S4** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2); whole-query aggregates (S4) |
 | Catalog / rows | v2 tables, heap codec | `columns[]` + `next_rowid`; btree key = internal rowid |
 | CLI / shell | `strix sql` / `strix shell` | Batch + REPL; `.dot` meta-commands are **not** SQL |
 
@@ -232,11 +232,11 @@ User-visible: predicates stop lying; type mismatches fail clearly.
 
 ### Phase S4 — Aggregates
 
-- [ ] `COUNT(*)` over whole query (no `GROUP BY`) — single-table first
-- [ ] Then richer aggs as capacity allows: `COUNT(expr)`, `SUM` / `AVG` / `MIN` / `MAX` on numerics (document null-skipping per standard)
-- [ ] Reject unsupported call forms clearly
-- [ ] Projection rules: aggregate-only select without `GROUP BY` yields one row
-- [ ] Tests + [`sql-compliance-s4-coverage.md`](sql-compliance-s4-coverage.md) ≥80%
+- [x] `COUNT(*)` over whole query (no `GROUP BY`) — single-table first
+- [x] Then richer aggs as capacity allows: `COUNT(expr)`, `SUM` / `AVG` / `MIN` / `MAX` on numerics (document null-skipping per standard)
+- [x] Reject unsupported call forms clearly
+- [x] Projection rules: aggregate-only select without `GROUP BY` yields one row
+- [x] Tests + [`sql-compliance-s4-coverage.md`](sql-compliance-s4-coverage.md) ≥80%
 
 **Exit:** `SELECT COUNT(*) FROM t` works; demo scripts can summarize tables.
 
@@ -296,8 +296,8 @@ User-visible: predicates stop lying; type mismatches fail clearly.
 Not a single ship gate — **each phase has its own exit**. Program-level success looks like:
 
 - [ ] S0 docs live; dialect/execute framing updated
-- [ ] S1–S3 landed → TEXT/UUID PK + strict eval + `CAST` (minimum product arc)
-- [ ] S4–S6 landed → aggregates, groups, inner joins (query arc)
+- [x] S1–S3 landed → TEXT/UUID PK + strict eval + `CAST` (minimum product arc)
+- [ ] S4–S6 landed → aggregates, groups, inner joins (query arc) — **S4 done**; S5–S6 remain
 - [ ] Dialect matrix honest; extensions named; no affinity claims
 - [ ] Coverage inventories ≥80% per implemented phase
 
@@ -326,4 +326,5 @@ Defaults stand unless overridden before/during the relevant phase:
 3. ~~Implement **S1** (boolean + compare hygiene) with `sql-compliance-s1-coverage.md`.~~
 4. ~~Implement **S2** (`CAST`) with `sql-compliance-s2-coverage.md`.~~
 5. ~~Implement **S3** (UNIQUE + TEXT PK) with `sql-compliance-s3-coverage.md`.~~
-6. Next: **S4** (`COUNT(*)` / aggregates).
+6. ~~Implement **S4** (`COUNT(*)` / aggregates) with `sql-compliance-s4-coverage.md`.~~
+7. Next: **S5** (`GROUP BY` / `HAVING`).

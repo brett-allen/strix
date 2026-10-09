@@ -62,8 +62,26 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 	}
 	defer free_bound_projs(projs)
 
-	if verr := validate_select_exprs(stmt, projs, entry.columns, table_name, stmt.from.alias); has_error(verr) {
-		return {}, verr
+	is_agg, agg_slots, aerr := prepare_aggregate_select(stmt)
+	if has_error(aerr) {
+		return {}, aerr
+	}
+	defer free_agg_slots(agg_slots)
+
+	if is_agg {
+		if verr := validate_agg_projection_exprs(
+			stmt,
+			agg_slots,
+			entry.columns,
+			table_name,
+			stmt.from.alias,
+		); has_error(verr) {
+			return {}, verr
+		}
+	} else {
+		if verr := validate_select_exprs(stmt, projs, entry.columns, table_name, stmt.from.alias); has_error(verr) {
+			return {}, verr
+		}
 	}
 
 	limit_n: int = -1
@@ -201,6 +219,18 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		}
 	}
 
+	if is_agg {
+		return exec_select_aggregate(
+			stmt,
+			projs,
+			agg_slots,
+			matched[:],
+			&env,
+			limit_n,
+			offset_n,
+		)
+	}
+
 	if len(stmt.order_by) > 0 {
 		if sort_err := sort_scanned_rows(matched[:], stmt.order_by, &env); has_error(sort_err) {
 			return {}, sort_err
@@ -253,6 +283,110 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 	}
 
 	return result_set_result(col_names, out_rows), ok_error()
+}
+
+// exec_select_aggregate accumulates over filtered rows and emits one result row
+// (then applies LIMIT/OFFSET). Empty filtered set still yields one row.
+exec_select_aggregate :: proc(
+	stmt: sql.Select_Stmt,
+	projs: []Bound_Proj,
+	slots: []Agg_Slot,
+	matched: [][]Value,
+	env: ^Row_Env,
+	limit_n: int,
+	offset_n: int,
+	allocator := context.allocator,
+) -> (Exec_Result, Exec_Error) {
+	for row in matched {
+		env.values = row
+		for i in 0 ..< len(slots) {
+			if aerr := accumulate_agg_slot(&slots[i], env, allocator); has_error(aerr) {
+				return {}, aerr
+			}
+		}
+	}
+
+	finals := make([]Value, len(slots), allocator)
+	defer {
+		for v in finals {
+			free_value(v, allocator)
+		}
+		delete(finals, allocator)
+	}
+	for i in 0 ..< len(slots) {
+		v, ferr := finalize_agg_slot(slots[i], allocator)
+		if has_error(ferr) {
+			return {}, ferr
+		}
+		finals[i] = v
+	}
+
+	// Project one logical row (no current heap row required for pure aggs/constants).
+	env.values = nil
+	cells := make([]string, len(projs), allocator)
+	for p, ci in projs {
+		cell, cerr := project_agg_cell(p, slots, finals, env, allocator)
+		if has_error(cerr) {
+			for j in 0 ..< ci {
+				delete(cells[j], allocator)
+			}
+			delete(cells, allocator)
+			return {}, cerr
+		}
+		cells[ci] = cell
+	}
+
+	col_names := make([]string, len(projs), allocator)
+	for p, i in projs {
+		col_names[i] = strings.clone(p.name, allocator)
+	}
+
+	// LIMIT/OFFSET apply to the single aggregate result row.
+	include := true
+	if offset_n > 0 {
+		include = false
+	} else if limit_n == 0 {
+		include = false
+	}
+
+	out_rows: [][]string
+	if include {
+		out_rows = make([][]string, 1, allocator)
+		out_rows[0] = cells
+	} else {
+		for c in cells {
+			delete(c, allocator)
+		}
+		delete(cells, allocator)
+		out_rows = make([][]string, 0, allocator)
+	}
+
+	_ = stmt
+	return result_set_result(col_names, out_rows), ok_error()
+}
+
+project_agg_cell :: proc(
+	p: Bound_Proj,
+	slots: []Agg_Slot,
+	finals: []Value,
+	env: ^Row_Env,
+	allocator := context.allocator,
+) -> (string, Exec_Error) {
+	switch p.kind {
+	case .Column:
+		return "", make_error(
+			.Unsupported_Ast,
+			"SELECT mixes aggregates with non-aggregate columns; GROUP BY is required (not supported yet)",
+		)
+	case .Expr:
+		v, err := eval_expr_with_aggs(p.expr, slots, finals, env, allocator)
+		if has_error(err) {
+			return "", err
+		}
+		defer free_value(v, allocator)
+		return format_value_cell(v, allocator), ok_error()
+	}
+	return "", make_error(.Engine, "invalid projection")
 }
 
 // validate_select_exprs dry-runs WHERE / ORDER BY / non-column projections on a null row
@@ -437,6 +571,9 @@ projection_name :: proc(item: sql.Select_Item, allocator := context.allocator) -
 		if len(segs) > 0 {
 			return strings.clone(segs[len(segs) - 1], allocator)
 		}
+	}
+	if item.expr != nil && item.expr.kind == .Call {
+		return sql.print_expr(item.expr, allocator)
 	}
 	return strings.clone("?", allocator)
 }

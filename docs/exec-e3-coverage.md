@@ -94,7 +94,7 @@
 |------|------|
 | `Unknown_Table` | FROM missing table; bad `t.*` qualifier |
 | `Unknown_Column` | projection / WHERE / ORDER BY unbound name or bad qualifier |
-| `Unsupported_Ast` | DISTINCT, JOIN, GROUP BY/HAVING, BETWEEN, calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare; **(S2)** invalid/`CAST` target errors (CAST itself is executed) |
+| `Unsupported_Ast` | DISTINCT, JOIN, GROUP BY/HAVING, BETWEEN, non-agg calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare; **(S2)** invalid/`CAST` target errors (CAST itself is executed); **(S4)** whole-query `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` are executed — see [`sql-compliance-s4-coverage.md`](sql-compliance-s4-coverage.md) |
 | `Closed` | SELECT on closed session |
 | `Engine` | decode / cursor failures during scan |
 
