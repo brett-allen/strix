@@ -446,17 +446,182 @@ test_uuid_type_as_text_pk :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_composite_pk_still_rejected :: proc(t: ^testing.T) {
+test_composite_pk_crud_duplicate_and_null :: proc(t: ^testing.T) {
 	e, err := engine.engine_open_memory()
 	testing.expect(t, engine.ok(err))
 	defer engine.engine_close(&e)
 	s := exec.session_adopt(&e)
 
-	r, eerr := exec.exec_statement(&s, "CREATE TABLE c (a TEXT, b TEXT, PRIMARY KEY (a, b));")
-	testing.expect(t, exec.has_error(eerr))
-	testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Unsupported_Ast)
+	r0, e0 := exec.exec_script(
+		&s,
+		"CREATE TABLE t (a TEXT, b TEXT, n INT, PRIMARY KEY (a, b));" +
+		"INSERT INTO t VALUES ('x', '1', 10), ('x', '2', 20);",
+	)
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	r, eerr := exec.exec_statement(&s, "SELECT a, b, n FROM t WHERE a = 'x' AND b = '2';")
+	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+	testing.expect_value(t, len(r.rows), 1)
+	testing.expect_value(t, r.rows[0][2], "20")
 	exec.free_error(eerr)
 	exec.free_result(r)
+
+	ru, eu := exec.exec_statement(&s, "UPDATE t SET n = 21 WHERE a = 'x' AND b = '2';")
+	testing.expectf(t, !exec.has_error(eu), "%s", eu.message)
+	testing.expect_value(t, ru.rows_affected, 1)
+	exec.free_error(eu)
+	exec.free_result(ru)
+
+	rdup, edup := exec.exec_statement(&s, "INSERT INTO t VALUES ('x', '1', 99);")
+	testing.expect(t, exec.has_error(edup))
+	testing.expect_value(t, edup.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(edup)
+	exec.free_result(rdup)
+
+	// UPDATE that would collide on composite PK.
+	rcoll, ecoll := exec.exec_statement(&s, "UPDATE t SET b = '1' WHERE a = 'x' AND b = '2';")
+	testing.expect(t, exec.has_error(ecoll))
+	testing.expect_value(t, ecoll.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(ecoll)
+	exec.free_result(rcoll)
+
+	rn, en := exec.exec_statement(&s, "INSERT INTO t VALUES (NULL, '1', 1);")
+	testing.expect(t, exec.has_error(en))
+	testing.expect_value(t, en.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(en)
+	exec.free_result(rn)
+
+	rn2, en2 := exec.exec_statement(&s, "INSERT INTO t VALUES ('y', NULL, 1);")
+	testing.expect(t, exec.has_error(en2))
+	testing.expect_value(t, en2.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(en2)
+	exec.free_result(rn2)
+
+	rd, ed := exec.exec_statement(&s, "DELETE FROM t WHERE a = 'x' AND b = '1';")
+	testing.expectf(t, !exec.has_error(ed), "%s", ed.message)
+	testing.expect_value(t, rd.rows_affected, 1)
+	exec.free_error(ed)
+	exec.free_result(rd)
+
+	// After delete, the pair can be re-inserted.
+	rok, eok := exec.exec_statement(&s, "INSERT INTO t VALUES ('x', '1', 11);")
+	testing.expectf(t, !exec.has_error(eok), "%s", eok.message)
+	exec.free_error(eok)
+	exec.free_result(rok)
+
+	rdrop, edrop := exec.exec_statement(&s, "DROP TABLE t;")
+	testing.expectf(t, !exec.has_error(edrop), "%s", edrop.message)
+	exec.free_error(edrop)
+	exec.free_result(rdrop)
+	_, gerr := engine.catalog_get_index_entry(&e, "strix_autoindex_t_1")
+	testing.expect_value(t, gerr, engine.Engine_Error.Not_Found)
+}
+
+@(test)
+test_composite_pk_durable_reopen :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-f2-composite-pk-%d.strix", os.get_pid())
+	defer os.remove(path)
+
+	{
+		e, err := engine.engine_create(path)
+		testing.expect(t, engine.ok(err))
+		s := exec.session_adopt(&e)
+		r, eerr := exec.exec_script(
+			&s,
+			"CREATE TABLE t (a TEXT, b TEXT, n INT, PRIMARY KEY (a, b));" +
+			"INSERT INTO t VALUES ('u', '1', 1), ('u', '2', 2);",
+		)
+		testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+		exec.free_error(eerr)
+		exec.free_result(r)
+		exec.session_close(&s)
+		engine.engine_close(&e)
+	}
+
+	{
+		e, err := engine.engine_open(path)
+		testing.expect(t, engine.ok(err))
+		defer engine.engine_close(&e)
+		s := exec.session_adopt(&e)
+
+		idx, ierr := engine.catalog_get_index_entry(&e, "strix_autoindex_t_1")
+		testing.expect(t, engine.ok(ierr))
+		testing.expect(t, engine.catalog_index_is_unique(idx))
+		testing.expect_value(t, len(idx.columns), 2)
+		engine.free_catalog_entry(idx)
+
+		r, eerr := exec.exec_statement(&s, "SELECT n FROM t WHERE a = 'u' AND b = '2';")
+		testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+		testing.expect_value(t, len(r.rows), 1)
+		testing.expect_value(t, r.rows[0][0], "2")
+		exec.free_error(eerr)
+		exec.free_result(r)
+
+		rdup, edup := exec.exec_statement(&s, "INSERT INTO t VALUES ('u', '1', 99);")
+		testing.expect(t, exec.has_error(edup))
+		testing.expect_value(t, edup.code, exec.Exec_Error_Code.Constraint)
+		exec.free_error(edup)
+		exec.free_result(rdup)
+	}
+}
+
+@(test)
+test_composite_pk_never_aliases_rowid :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	// Two INTEGER PRIMARY KEY columns → composite unique index, not IPK.
+	r0, e0 := exec.exec_script(
+		&s,
+		"CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY, n TEXT);" +
+		"INSERT INTO t VALUES (1, 1, 'a'), (1, 2, 'b');",
+	)
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	idx, ierr := engine.catalog_get_index_entry(&e, "strix_autoindex_t_1")
+	testing.expect(t, engine.ok(ierr))
+	testing.expect(t, engine.catalog_index_is_unique(idx))
+	testing.expect_value(t, len(idx.columns), 2)
+	engine.free_catalog_entry(idx)
+
+	// NULL in a PK column fails (no IPK auto-allocate).
+	rn, en := exec.exec_statement(&s, "INSERT INTO t VALUES (NULL, 3, 'c');")
+	testing.expect(t, exec.has_error(en))
+	testing.expect_value(t, en.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(en)
+	exec.free_result(rn)
+
+	rdup, edup := exec.exec_statement(&s, "INSERT INTO t VALUES (1, 1, 'x');")
+	testing.expect(t, exec.has_error(edup))
+	testing.expect_value(t, edup.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(edup)
+	exec.free_result(rdup)
+}
+
+@(test)
+test_composite_pk_schema_sql :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_statement(&s, "CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a, b));")
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	text, serr := exec.schema_sql(&s, "t")
+	testing.expectf(t, !exec.has_error(serr), "%s", serr.message)
+	defer exec.free_error(serr)
+	defer delete(text)
+	testing.expect(t, strings.contains(text, "PRIMARY KEY (a, b)"))
+	testing.expect(t, !strings.contains(text, "strix_autoindex_"))
 }
 
 @(test)

@@ -4,9 +4,9 @@
 
 Execute semantics migrate under [`sql-compliance.md`](sql-compliance.md) (phases S0–S6). Parser surface may still accept forms the executor rejects until those phases land. Intentional deviations (IPK/rowid alias, `IF NOT EXISTS`, bracket/backtick idents, shell `.commands`) are **named extensions**, not the baseline.
 
-Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6. **F1** widens joins to `LEFT OUTER` and 3+ tables (left-deep nested loop).
+Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6. **F1** widens joins to `LEFT OUTER` and 3+ tables; **F2** executes composite `PRIMARY KEY`.
 
-**Post-F1:** further execute widening (composite PK, BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F2–F4) — not executed until those phases land.
+**Post-F2:** further widening (BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F3–F4).
 
 ## Supported statements (parser v1 / Phase 5)
 
@@ -55,14 +55,16 @@ Keywords are case-insensitive; quoted forms are always `Ident`. Unicode unquoted
 | Empty / unknown type name | Store bound kind as-is (no check until a recognized name) |
 | `UPDATE SET` | Same kind check on assigned values |
 
-### PRIMARY KEY shapes (execute / S3)
+### PRIMARY KEY shapes (execute / S3 + F2)
 
 | Shape | Behavior |
 |-------|----------|
 | **IPK (extension)** | Sole column `INTEGER`/`INT PRIMARY KEY` aliases btree rowid; omit/`NULL` auto-allocates via `next_rowid`. No system unique index on the IPK column. |
 | **Non-IPK PK** | Single-column PK on other types (`TEXT`, `VARCHAR(…)`, `UUID`, `REAL`, …) → implied `NOT NULL` + system unique index `strix_autoindex_<table>_<n>`. NULL / duplicate → `Constraint`. |
-| **Composite PK** | Still rejected (`Unsupported_Ast`). |
-| **Internal rowid** | Always present as the heap btree key; **not** exposed as a SQL column in S3. |
+| **Composite PK (F2)** | Table `PRIMARY KEY (c1, c2, …)` (≥2 cols) → `NOT NULL` on every PK column + composite unique system index `strix_autoindex_<table>_<n>`. Duplicate pair / NULL in any PK col → `Constraint`. **Never** aliases rowid (even if all PK cols are `INTEGER`). |
+| **Internal rowid** | Always present as the heap btree key; **not** exposed as a SQL column. |
+
+Ill-formed mixes (e.g. column-level IPK plus a different table `PRIMARY KEY (…)`, or multiple table `PRIMARY KEY` constraints) → `Invalid_Schema`. Prefer the table-constraint form for composite keys.
 
 `UNIQUE` (column or table) and `CREATE UNIQUE INDEX` use the same unique-index maintenance path. Nullable UNIQUE columns allow multiple NULLs.
 
@@ -242,7 +244,7 @@ Parser v1 accepts a wider surface than the executor runs. **Execute support** li
 
 | Area | Parsed (today) | Executed |
 |------|----------------|----------|
-| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2 + S3)** — `NOT NULL`; literal/`NULL` `DEFAULT`; **two PK shapes (S3):** (A) sole `INTEGER`/`INT PRIMARY KEY` = IPK/rowid alias (named extension); (B) single-column non-IPK PK (`TEXT`/`VARCHAR`/`UUID`/…) = `NOT NULL` + system unique index `strix_autoindex_<table>_<n>`; column/table `UNIQUE` → system unique indexes; `DROP TABLE` auto-drops system autoindexes (user indexes still block); `IF NOT EXISTS` / `IF EXISTS`; rejects **composite** PK; CHECK/FK still unsupported |
+| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2 + S3 + F2)** — `NOT NULL`; literal/`NULL` `DEFAULT`; **PK shapes:** (A) sole `INTEGER`/`INT PRIMARY KEY` = IPK/rowid alias (named extension); (B) single-column non-IPK PK (`TEXT`/`VARCHAR`/`UUID`/…) = `NOT NULL` + system unique index; (C) **composite** `PRIMARY KEY (c1, c2, …)` = `NOT NULL` on all PK cols + composite unique system index (never rowid alias); column/table `UNIQUE` → system unique indexes; `DROP TABLE` auto-drops system autoindexes (user indexes still block); `IF NOT EXISTS` / `IF EXISTS`; rejects conflicting PK mixes; CHECK/FK still unsupported |
 | `INSERT` … `VALUES` | yes | **yes (E2 + S1 + S3)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; non-IPK PK / UNIQUE duplicates → `Constraint`; NULL PK → `Constraint`; UNIQUE allows multiple NULLs; **declared-type kind check (S1):** recognized types (`INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/…/`UUID` → Text; `BLOB` → Blob) reject mismatched literal kinds with `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5/S3) |
 | `SELECT` (single-table + N-table join) | yes | **yes (E3 + S1 + S2 + S4 + S5 + S6 + F1)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list, **`CAST` (S2)**); **strict boolean context (S1):** Integer/Float `0` = false, `≠0` = true; NULL unknown (3VL for AND/OR); Text/Blob (and other non-numeric non-null) in `WHERE`/`AND`/`OR`/`NOT` → `Unsupported_Ast`; **compare (S1):** Integer–Integer exact `i64`; mixed int/float via `f64`; same-kind Text/Blob byte/lex; Text/Blob↔numeric without `CAST` → `Unsupported_Ast`; **`CAST(expr AS type)` (S2)** in projection/WHERE — see [Scalar CAST](#scalar-cast-execute--s2); **whole-query aggregates (S4):** `COUNT(*)` / `COUNT(expr)` / `SUM` / `AVG` / `MIN` / `MAX` (numerics; null-skipping except `COUNT(*)`) without `GROUP BY` → one result row — see [Aggregates](#aggregates-execute--s4); **`GROUP BY` / `HAVING` (S5):** column-ref keys; strict select list; HAVING post-agg; empty groups → 0 rows — see [GROUP BY / HAVING](#group-by--having-execute--s5); **`JOIN` (S6 + F1):** left-deep nested-loop `INNER` / `CROSS` / comma-join / **`LEFT [OUTER] JOIN` … `ON`**; 3+ tables; qualified names / aliases; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY`/`HAVING` over joins supported; rejects `USING`, `RIGHT`/`FULL`/`NATURAL` — see [JOIN](#join-execute--s6--f1); ORDER BY / LIMIT / OFFSET (in-memory; group keys/aggs with GROUP BY; incompatible ORDER BY kinds → error); rejects DISTINCT / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only on **single-table** selects (E5; numeric eq stays on seq scan; joins always seq-scan all sides) |
 | `UPDATE` / `DELETE` | yes | **yes (E4/E5 + S1 + S2)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env` (same S1 boolean/compare rules; **`CAST` in SET/WHERE (S2)**); `SET` values checked against declared column kinds (same as INSERT); row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL / type mismatch on SET → `Constraint` |

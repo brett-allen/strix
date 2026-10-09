@@ -7,7 +7,7 @@ Wire the existing SQL parser (`src/sql`) to the storage stack (`src/engine`) so 
 | **Branch** | `feature/sql-execute` |
 | **Depends on** | Parser v1 DoD ([`sql-parser.md`](sql-parser.md)), storage v1 DoD ([`storage-engine.md`](storage-engine.md) S0–S4), CLI `init` ([`src/cli`](../src/cli)) |
 | **Supersedes** | Storage plan phase S5 (“SQL DDL/DML slice”) — execution work lives here |
-| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening: **F1** LEFT/3+ joins landed; F2–F4 (composite PK, BOOLEAN/UUID, prepared `?`) planned in [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
+| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening: **F1** LEFT/3+ joins + **F2** composite PK landed; F3–F4 (BOOLEAN/UUID, prepared `?`) planned in [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
 
 ---
 
@@ -144,8 +144,8 @@ version u8 | col_count u16 | [null_bitmap] | concatenated field encodings
 - Btree **key** = **big-endian u64 rowid** (already used by `table_insert_row`).
 - **IPK (rowid alias, named extension):** exactly **one** `PRIMARY KEY` column whose type name is `INTEGER` or `INT` (case-insensitive `equal_fold`; no `INTEGER(n)`, `BIGINT`, etc.). That column aliases the btree rowid; omit/`NULL` auto-allocates via `next_rowid++` (persisted in the catalog). No secondary unique index is required for the IPK column itself.
 - **Non-IPK PRIMARY KEY (S3):** single-column PK on any other type (e.g. `TEXT`, `VARCHAR`, `UUID`) implies `NOT NULL` + a system unique secondary index (`strix_autoindex_<table>_<n>`). Duplicate / NULL PK → `Constraint`. Internal rowid is still allocated but **not** exposed as a SQL column.
+- **Composite PRIMARY KEY (F2):** table `PRIMARY KEY (c1, c2, …)` (≥2 columns) implies `NOT NULL` on every PK column + a composite unique system index (same maintenance path as multi-column `UNIQUE`). Duplicate / NULL in any PK column → `Constraint`. Composite **never** aliases rowid.
 - **UNIQUE (S3):** column/table `UNIQUE` and `CREATE UNIQUE INDEX` create/maintain unique secondary indexes; collisions → `Constraint`. Multiple NULLs are allowed on nullable UNIQUE columns.
-- **Still rejected:** composite / multi-column `PRIMARY KEY` → `Unsupported_Ast`.
 
 ---
 
@@ -257,7 +257,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] Row encode/decode for heap payloads; document in [`storage-format.md`](storage-format.md)
 - [x] `INSERT INTO t [(cols)] VALUES (...), (...)`
 - [x] Auto rowid / PK rowid rules; persist `next_rowid` (`catalog_update_next_rowid`)
-- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` = rowid alias (extension); S3 adds non-IPK single-column PK + UNIQUE; still reject composite PK
+- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` = rowid alias (extension); S3 adds non-IPK single-column PK + UNIQUE; F2 adds composite PK (unique system index; never rowid alias)
 - [x] Column default: only literal / `NULL` defaults if already on AST; else error
 - [x] Reject `INSERT … SELECT` / `DEFAULT VALUES` / conflict clauses with clear errors unless already trivial
 - [x] Tests: insert → reopen → `table_get_row` + decode (SQL `SELECT` once E3 lands); multi-row INSERT rollback on mid-statement failure
@@ -414,4 +414,4 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.
 2. ~~Semantic north star after E6: [`sql-compliance.md`](sql-compliance.md) (S0–S6).~~
-3. Post-F1 execute widening: [`sql-followon.md`](sql-followon.md) (F2 composite PK → F3 types → F4 prepared `?`).
+3. Post-F2 execute widening: [`sql-followon.md`](sql-followon.md) (F3 BOOLEAN/UUID → F4 prepared `?`).

@@ -114,19 +114,10 @@ find_ipk_column :: proc(columns: []engine.Catalog_Column) -> int {
 	return -1
 }
 
-// validate_primary_key_shape rejects composite / multi-column PRIMARY KEY.
-// Allowed: zero PK columns, or exactly one PK column (IPK rowid alias or unique-index PK).
+// validate_primary_key_shape accepts zero, single (IPK or unique-index), or composite PK.
+// Composite never aliases rowid (see find_ipk_column). Ill-formed mixes are rejected at CREATE bind.
 validate_primary_key_shape :: proc(columns: []engine.Catalog_Column) -> Exec_Error {
-	pk_count := count_primary_key_columns(columns)
-	if pk_count == 0 {
-		return ok_error()
-	}
-	if pk_count > 1 {
-		return make_error(
-			.Unsupported_Ast,
-			"composite PRIMARY KEY is not supported yet",
-		)
-	}
+	_ = columns
 	return ok_error()
 }
 

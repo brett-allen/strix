@@ -30,7 +30,7 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `LEFT OUTER`, `USING`, multi-`JOIN`, composite `PRIMARY KEY (…)`, `?` / `?N` placeholders, `CAST`, aggs/`GROUP BY` — many reject at bind/exec |
-| `src/exec` | E1–E6 + **S1–S6** + **F1** | Left-deep `INNER`/`CROSS`/`LEFT OUTER`, N tables (`src/exec/join.odin`); single-column PK (IPK or unique index); multi-column **UNIQUE** already enforced; `UUID` type name stores as **Text**; no native `BOOLEAN`; placeholders → `Unsupported_Ast` in eval |
+| `src/exec` | E1–E6 + **S1–S6** + **F1** + **F2** | Left-deep `INNER`/`CROSS`/`LEFT OUTER`, N tables (`src/exec/join.odin`); single-column PK (IPK or unique index) + **composite** `PRIMARY KEY (…)` via system unique index; multi-column **UNIQUE** enforced; `UUID` type name stores as **Text**; no native `BOOLEAN`; placeholders → `Unsupported_Ast` in eval |
 | Expression eval | S1–S6 + F1 | Strict bool; `CAST`; whole-query + grouped aggs; multi-table column bind / ambiguity for **N** `Join_Side`s |
 | Catalog / rows | v2 tables, heap v1 | `Value_Kind`: Null / Integer / Float / Text / Blob; index keys already concatenate **N** tagged fields |
 | CLI / shell | `strix sql` / `strix shell` | Literals only; no prepare/execute API |
@@ -122,7 +122,7 @@ Already landed (do not re-implement):
 | Area | Fact |
 |------|------|
 | Joins | **F1 landed:** `validate_select_joins` accepts N clauses + `.Left` with `ON`; rejects `using_cols`; left-deep `nested_loop_join_step` with NULL-extend for LEFT |
-| Composite PK | Rejected in `bind_create_table_columns` / `validate_primary_key_shape`; **multi-column UNIQUE already works** (`test_multi_column_table_unique`) |
+| Composite PK | **F2 landed:** table `PRIMARY KEY (c1, c2, …)` → NOT NULL + composite unique autoindex; IPK sole-column path unchanged |
 | UUID | Type name → Text in `declared_storage_kind` / `CAST … AS UUID` |
 | BOOLEAN | Not a lexer keyword / not a `Value_Kind`; `CAST … AS BOOLEAN` errors |
 | Placeholders | Lexer/parser store `Placeholder_Data{index}`; `eval_expr` / agg paths reject |
@@ -204,14 +204,14 @@ User-visible: multi-column PK tables with fail-closed uniqueness and NOT NULL.
 
 Acceptance:
 
-- [ ] Accept table `PRIMARY KEY (c1, c2, …)` (≥2 columns); mark columns PK + NOT NULL; create/maintain composite unique system index
-- [ ] Duplicate PK → `Constraint`; NULL in any PK column → `Constraint`
-- [ ] INSERT / UPDATE / DELETE maintain the composite unique index (reuse `encode_index_key` N-col)
-- [ ] IPK single-column path regression unchanged under (A)
-- [ ] Reject ill-formed mixes (e.g. IPK + composite) with clear errors
-- [ ] Update dialect PK shapes + [`storage-format.md`](storage-format.md) only if on-disk meta grows (likely **no** format bump — flags/index list already exist)
-- [ ] Tests: create/insert/select/update/delete; duplicate; NULL PK col; reopen durable; IPK regression
-- [ ] Coverage inventory: [`sql-followon-f2-coverage.md`](sql-followon-f2-coverage.md) ≥80%
+- [x] Accept table `PRIMARY KEY (c1, c2, …)` (≥2 columns); mark columns PK + NOT NULL; create/maintain composite unique system index
+- [x] Duplicate PK → `Constraint`; NULL in any PK column → `Constraint`
+- [x] INSERT / UPDATE / DELETE maintain the composite unique index (reuse `encode_index_key` N-col)
+- [x] IPK single-column path regression unchanged under (A)
+- [x] Reject ill-formed mixes (e.g. IPK + composite) with clear errors
+- [x] Update dialect PK shapes + [`storage-format.md`](storage-format.md) only if on-disk meta grows (likely **no** format bump — flags/index list already exist)
+- [x] Tests: create/insert/select/update/delete; duplicate; NULL PK col; reopen durable; IPK regression
+- [x] Coverage inventory: [`sql-followon-f2-coverage.md`](sql-followon-f2-coverage.md) ≥80%
 
 **Exit:** `CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a, b));` works end-to-end via CLI; duplicates fail closed.
 
@@ -314,7 +314,7 @@ Not a single ship gate — **each phase has its own exit**. Program-level succes
 
 - [x] F0 docs live; compliance/dialect/execute pointers updated
 - [x] F1 landed → LEFT OUTER + 3+ table joins
-- [ ] F2 landed → composite PRIMARY KEY
+- [x] F2 landed → composite PRIMARY KEY
 - [ ] F3 landed → native BOOLEAN + typed UUID (or documented fallback if Q #5/#6 flip)
 - [ ] F4 landed → prepared `?` binding with session API + documented CLI/shell story
 - [ ] Dialect matrix honest; extensions named; no affinity claims
@@ -343,5 +343,6 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. ~~Land this plan + compliance/dialect/execute pointers (**F0**).~~
 2. ~~Implement **F1** (LEFT OUTER + 3+ joins) with `sql-followon-f1-coverage.md`.~~
-3. Confirm open Q defaults with PM (especially **BOOLEAN/UUID storage**, **join cap**, **prepared CLI depth**).
-4. Then **F2** (composite PK) → **F3** (BOOLEAN + UUID) → **F4** (prepared `?`).
+3. ~~Implement **F2** (composite PRIMARY KEY) with `sql-followon-f2-coverage.md`.~~
+4. Confirm open Q defaults with PM (especially **BOOLEAN/UUID storage**, **prepared CLI depth**).
+5. Then **F3** (BOOLEAN + UUID) → **F4** (prepared `?`).

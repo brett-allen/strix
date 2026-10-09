@@ -13,9 +13,9 @@
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
 -- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK,
 -- S4 whole-query aggregates, S5 GROUP BY / HAVING, S6 INNER/CROSS JOIN,
--- and F1 LEFT OUTER + 3-table joins.
+-- F1 LEFT OUTER + 3-table joins, and F2 composite PRIMARY KEY.
 -- Intentionally omits USING / RIGHT / FULL / NATURAL, DISTINCT, CHECK/FK,
--- ALTER, INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
+-- ALTER, INSERT…SELECT, OR REPLACE/IGNORE.
 
 -- ---------------------------------------------------------------------------
 -- Clean slate (idempotent-ish: drop children before parents)
@@ -30,6 +30,7 @@ DROP TABLE IF EXISTS products;
 DROP TABLE IF EXISTS customers;
 DROP TABLE IF EXISTS scratch;
 DROP TABLE IF EXISTS tags;
+DROP TABLE IF EXISTS line_items;
 
 -- ---------------------------------------------------------------------------
 -- Schema: tables
@@ -53,6 +54,14 @@ CREATE TABLE products (
 CREATE TABLE tags (
   id TEXT PRIMARY KEY,
   label TEXT NOT NULL
+);
+
+-- Composite PRIMARY KEY (F2): NOT NULL on all PK cols + composite unique autoindex
+CREATE TABLE line_items (
+  order_id INTEGER NOT NULL,
+  sku TEXT NOT NULL,
+  qty INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (order_id, sku)
 );
 
 CREATE TABLE orders (
@@ -116,6 +125,11 @@ INSERT INTO tags (id, label) VALUES
   ('tag-retail', 'retail'),
   ('tag-vip', 'vip');
 
+INSERT INTO line_items (order_id, sku, qty) VALUES
+  (100, 'W-10', 2),
+  (100, 'G-20', 1),
+  (101, 'W-10', 1);
+
 -- ---------------------------------------------------------------------------
 -- SELECT: projection, alias, WHERE, exprs, IN, IS NULL, ORDER/LIMIT/OFFSET
 -- ---------------------------------------------------------------------------
@@ -164,6 +178,9 @@ SELECT id, tag || '-paid' AS label, qty * 10 AS scaled
  ORDER BY id;
 
 SELECT * FROM scratch ORDER BY id;
+
+-- Composite PRIMARY KEY (F2)
+SELECT order_id, sku, qty FROM line_items ORDER BY order_id, sku;
 
 -- Scalar CAST (S2): projection, WHERE, SET — no affinity; Text↔numeric needs CAST
 SELECT id, CAST(price AS TEXT) AS price_text, CAST(price AS INTEGER) AS price_int
@@ -254,6 +271,7 @@ DROP INDEX IF EXISTS idx_products_name;
 DROP INDEX IF EXISTS idx_customers_email;
 DROP INDEX IF EXISTS idx_tags_label;
 
+DROP TABLE line_items;
 DROP TABLE orders;
 DROP TABLE products;
 DROP TABLE customers;

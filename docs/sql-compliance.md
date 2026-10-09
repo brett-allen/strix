@@ -28,7 +28,7 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `CAST`, `JOIN`, `GROUP BY`/`HAVING`, aggregates-as-calls, UNIQUE/PK constraints — many reject at bind/exec |
-| `src/exec` | E1–E6 + **S6** (+ **F1** in follow-on) | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; rejects composite PK; whole-query aggregates (S4) + `GROUP BY` / `HAVING` (S5) + joins (S6 INNER/CROSS; F1 adds LEFT OUTER + 3+ tables — see [`sql-followon.md`](sql-followon.md)) |
+| `src/exec` | E1–E6 + **S6** (+ **F1**/**F2** in follow-on) | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; **F2** composite `PRIMARY KEY (…)` via composite unique autoindex; whole-query aggregates (S4) + `GROUP BY` / `HAVING` (S5) + joins (S6 INNER/CROSS; F1 LEFT OUTER + 3+ tables — see [`sql-followon.md`](sql-followon.md)) |
 | Expression eval | E3 + **S1** + **S2** + **S4** + **S5** + **S6** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2); whole-query aggregates (S4); grouped aggregates (S5); multi-table column bind / ambiguity (S6) |
 | Catalog / rows | v2 tables, heap codec | `columns[]` + `next_rowid`; btree key = internal rowid |
 | CLI / shell | `strix sql` / `strix shell` | Batch + REPL; `.dot` meta-commands are **not** SQL |
@@ -66,7 +66,7 @@ Already landed (do not re-implement):
 | **No type affinity** | Do not coerce values into a column’s “affinity” on insert the SQLite way. Store what was bound (after explicit rules / `CAST`); reject illegal combinations clearly. |
 | **`CAST` is explicit** | Type conversion happens via `CAST(expr AS type)` (and documented literal bind rules), not ambient affinity. |
 | **Boolean context is strict** | `WHERE` / `AND` / `OR` / `NOT` accept only well-defined truth values (integers `0`/`≠0`, and later a real boolean if introduced). Non-NULL Text/Blob is **not** automatically TRUE. |
-| **`PRIMARY KEY` = `UNIQUE` + `NOT NULL`** | Logical PK is a uniqueness constraint enforced via an index (unique index maintenance). Composite PK remains a later slice unless a phase explicitly takes it. |
+| **`PRIMARY KEY` = `UNIQUE` + `NOT NULL`** | Logical PK is a uniqueness constraint enforced via an index (unique index maintenance). Composite PK is follow-on **F2** (see [`sql-followon.md`](sql-followon.md)). |
 | **rowid stays internal** | Every heap row still has a btree **rowid** key. Logical PK columns may or may not alias it. |
 
 **Clarity bar:** when unsure, prefer H2 / common standard-SQL behavior over SQLite quirk parity, and document the choice in [`sql-dialect.md`](sql-dialect.md).
@@ -329,4 +329,4 @@ Defaults stand unless overridden before/during the relevant phase:
 6. ~~Implement **S4** (`COUNT(*)` / aggregates) with `sql-compliance-s4-coverage.md`.~~
 7. ~~Implement **S5** (`GROUP BY` / `HAVING`) with `sql-compliance-s5-coverage.md`.~~
 8. ~~Implement **S6** (`INNER JOIN`) with `sql-compliance-s6-coverage.md`.~~
-9. ~~Compliance query arc complete through S6.~~ Post-S6 work lives in [`sql-followon.md`](sql-followon.md) — **F0**/**F1** landed; next **F2** (composite PK).
+9. ~~Compliance query arc complete through S6.~~ Post-S6 work lives in [`sql-followon.md`](sql-followon.md) — **F0**/**F1**/**F2** landed; next **F3** (BOOLEAN/UUID).
