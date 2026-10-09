@@ -30,10 +30,10 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `LEFT OUTER`, `USING`, multi-`JOIN`, composite `PRIMARY KEY (…)`, `?` / `?N` placeholders, `CAST`, aggs/`GROUP BY` — many reject at bind/exec |
-| `src/exec` | E1–E6 + **S1–S6** + **F1** + **F2** + **F3** | Left-deep `INNER`/`CROSS`/`LEFT OUTER`, N tables (`src/exec/join.odin`); single-column PK (IPK or unique index) + **composite** `PRIMARY KEY (…)` via system unique index; multi-column **UNIQUE** enforced; native **`BOOLEAN`** + typed **`UUID`** (16-byte); placeholders → `Unsupported_Ast` in eval |
-| Expression eval | S1–S6 + F1 + F3 | Strict bool (incl. Boolean); `CAST` matrix with BOOLEAN/UUID; whole-query + grouped aggs; multi-table column bind / ambiguity for **N** `Join_Side`s |
+| `src/exec` | E1–E6 + **S1–S6** + **F1**–**F4** | Left-deep `INNER`/`CROSS`/`LEFT OUTER`, N tables (`src/exec/join.odin`); single-column PK (IPK or unique index) + **composite** `PRIMARY KEY (…)` via system unique index; multi-column **UNIQUE** enforced; native **`BOOLEAN`** + typed **`UUID`** (16-byte); **session `?` / `?N` bind** (`session_bind*` / `exec_statement_params`) |
+| Expression eval | S1–S6 + F1 + F3 + **F4** | Strict bool (incl. Boolean); `CAST` matrix with BOOLEAN/UUID; whole-query + grouped aggs; multi-table column bind / ambiguity for **N** `Join_Side`s; **Placeholder → session bind table** |
 | Catalog / rows | v2 tables, heap v1 | `Value_Kind`: Null / Integer / Float / Text / Blob / **Boolean** / **Uuid**; index keys concatenate **N** tagged fields (tags 5/6 for Boolean/Uuid) |
-| CLI / shell | `strix sql` / `strix shell` | Literals only; no prepare/execute API |
+| CLI / shell | `strix sql` / `strix shell` | Literals in SQL text; **prepared binds via session API** (no shell `.param` / batch `--bind` yet) |
 
 **Honest surface today:** see [`sql-dialect.md`](sql-dialect.md) JOIN / PK / CAST sections. Follow-on changes **execute** (and docs); update that matrix as each F-phase lands.
 
@@ -125,7 +125,7 @@ Already landed (do not re-implement):
 | Composite PK | **F2 landed:** table `PRIMARY KEY (c1, c2, …)` → NOT NULL + composite unique autoindex; IPK sole-column path unchanged |
 | UUID | **F3:** typed 16-byte `Value_Kind.Uuid`; string bind + canonical I/O; `CAST … AS UUID` |
 | BOOLEAN | **F3:** `Value_Kind.Boolean`; `TRUE`/`FALSE` keywords; `CAST … AS BOOLEAN` |
-| Placeholders | Lexer/parser store `Placeholder_Data{index}`; `eval_expr` / agg paths reject |
+| Placeholders | **F4:** bare `?` auto-numbers per statement; `?N` explicit; eval reads session `Bind_Table` |
 
 ---
 
@@ -268,17 +268,19 @@ User-visible: bind parameters once per execute; scripts/apps stop string-buildin
 
 Acceptance:
 
-- [ ] Eval of `Placeholder` reads from a session/execution bind table; unbound → clear error
-- [ ] `?` works in SELECT/INSERT/UPDATE/DELETE WHERE/SET/VALUES (documented positions)
-- [ ] Positional binding API with stable errors (arity mismatch, unbound, type/`Constraint`)
-- [ ] `?N` supported if already parsed and cheap; else reject `?N` clearly until a stretch
-- [ ] CLI and/or shell story documented and smoke-tested
-- [ ] Update dialect “placeholders” + execute API sketch
-- [ ] Tests + [`sql-followon-f4-coverage.md`](sql-followon-f4-coverage.md) ≥80%
+- [x] Eval of `Placeholder` reads from a session/execution bind table; unbound → clear error
+- [x] `?` works in SELECT/INSERT/UPDATE/DELETE WHERE/SET/VALUES (documented positions)
+- [x] Positional binding API with stable errors (arity mismatch, unbound, type/`Constraint`)
+- [x] `?N` supported if already parsed and cheap; else reject `?N` clearly until a stretch
+- [x] CLI and/or shell story documented and smoke-tested
+- [x] Update dialect “placeholders” + execute API sketch
+- [x] Tests + [`sql-followon-f4-coverage.md`](sql-followon-f4-coverage.md) ≥80%
 
 **Exit:** A prepared/bound `INSERT`/`SELECT` runs via the session API without interpolating literals into SQL text.
 
 **Reject / defer boundary:** no `PREPARE`/`EXECUTE` SQL statements required if the API is session-native (document as extension vs SQL-standard PREPARE); no named `:name` / `$name` params this phase unless free.
+
+**CLI / shell story (Q #7 — API-first):** `strix sql` and `strix shell` still take SQL text with literals only. Apps/tests bind via `session_bind` / `session_bind_all` + `exec_statement`, or one-shot `exec_statement_params(s, sql, params)`. Smoke: `src/test/exec/bind_test.odin`. Shell `.param` / batch `--bind` deferred.
 
 ---
 
@@ -316,9 +318,9 @@ Not a single ship gate — **each phase has its own exit**. Program-level succes
 - [x] F1 landed → LEFT OUTER + 3+ table joins
 - [x] F2 landed → composite PRIMARY KEY
 - [x] F3 landed → native BOOLEAN + typed UUID (or documented fallback if Q #5/#6 flip)
-- [ ] F4 landed → prepared `?` binding with session API + documented CLI/shell story
-- [ ] Dialect matrix honest; extensions named; no affinity claims
-- [ ] Coverage inventories ≥80% per implemented phase
+- [x] F4 landed → prepared `?` binding with session API + documented CLI/shell story
+- [x] Dialect matrix honest; extensions named; no affinity claims
+- [x] Coverage inventories ≥80% per implemented phase
 
 ---
 
@@ -332,10 +334,10 @@ Defaults stand unless overridden before/during the relevant phase:
 4. **`USING` clause in F1?** — **default: defer** (keep reject; use `ON`). Stretch only if LEFT + 3+ exit early.
 5. **BOOLEAN storage:** native `Value_Kind.Boolean` vs INTEGER 0/1 — **default: native Boolean** if heap/index tag bump is tractable; else INTEGER + document.
 6. **UUID storage:** typed 16-byte vs TEXT + validation only — **default: typed** if format/catalog allow without huge churn; validation-on-TEXT is fallback.
-7. **Prepared CLI/shell depth:** full `.param` / bind commands vs API-first + minimal CLI — **default: session API + tests first**; shell bind UX in the same phase if cheap.
-8. **`?N` in F4:** — **default: support if cheap** (parser already stores N); else positional `?` only + clear reject for `?N`.
+7. **Prepared CLI/shell depth:** full `.param` / bind commands vs API-first + minimal CLI — **resolved: API-first** (session bind + tests); shell `.param` / batch `--bind` deferred.
+8. **`?N` in F4:** — **resolved: supported** (explicit index; bare `?` auto-numbers 0-based per statement).
 9. **`SUM(i64)` overflow fail-closed:** — **default: fold into F3 polish or a small gate PR**, not a named F-phase.
-10. **SQL-standard `PREPARE`/`EXECUTE` text:** — **default: no**; session API is enough (named extension / library surface).
+10. **SQL-standard `PREPARE`/`EXECUTE` text:** — **resolved: no**; session API is the named extension / library surface.
 
 ---
 
@@ -345,4 +347,5 @@ Defaults stand unless overridden before/during the relevant phase:
 2. ~~Implement **F1** (LEFT OUTER + 3+ joins) with `sql-followon-f1-coverage.md`.~~
 3. ~~Implement **F2** (composite PRIMARY KEY) with `sql-followon-f2-coverage.md`.~~
 4. ~~Implement **F3** (BOOLEAN + typed UUID) with `sql-followon-f3-coverage.md`.~~
-5. Then **F4** (prepared `?` binding).
+5. ~~Implement **F4** (prepared `?` binding) with `sql-followon-f4-coverage.md`.~~
+6. Follow-on program complete (F0–F4). Later residue: shell `.param`, named params, SQL `PREPARE` text — only if a new plan owns them.

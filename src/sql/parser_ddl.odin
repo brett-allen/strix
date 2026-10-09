@@ -4,6 +4,8 @@ import "core:mem"
 import "core:strings"
 
 parse_statement_node :: proc(p: ^Parser) -> (Statement, Parse_Error) {
+	// Placeholders number per statement (bare `?` restarts at 0 each statement).
+	p.next_placeholder = 0
 	start := peek(p).span
 	#partial switch peek(p).kind {
 	case .Kw_Create:

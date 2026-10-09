@@ -7,7 +7,7 @@ Wire the existing SQL parser (`src/sql`) to the storage stack (`src/engine`) so 
 | **Branch** | `feature/sql-execute` |
 | **Depends on** | Parser v1 DoD ([`sql-parser.md`](sql-parser.md)), storage v1 DoD ([`storage-engine.md`](storage-engine.md) S0–S4), CLI `init` ([`src/cli`](../src/cli)) |
 | **Supersedes** | Storage plan phase S5 (“SQL DDL/DML slice”) — execution work lives here |
-| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening: **F1** LEFT/3+ joins + **F2** composite PK + **F3** BOOLEAN/typed UUID landed; **F4** prepared `?` planned in [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
+| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening (**F0–F4** complete): LEFT/3+ joins, composite PK, BOOLEAN/typed UUID, prepared `?` — [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
 
 ---
 
@@ -51,7 +51,7 @@ Already landed (do not re-implement):
 
 - Query planner / cost-based optimizer (trivial plans only: seq scan, point insert, etc.).
 - Subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore). `GROUP BY`/`HAVING` executed (S5). Joins: `INNER`/`CROSS`/`LEFT OUTER`, N tables left-deep (S6 + F1); `USING` / `RIGHT` / `FULL` / `NATURAL` still rejected — see [`sql-followon.md`](sql-followon.md) F1.
-- Prepared statements and parameter binding (`?` / `?N`): **defer** for execute v1 (literals only); planned in [`sql-followon.md`](sql-followon.md) **F4**.
+- Prepared statements and parameter binding (`?` / `?N`): **landed in F4** as a session bind API (not SQL `PREPARE`/`EXECUTE` text) — see sketch below and [`sql-dialect.md`](sql-dialect.md) § Prepared parameters.
 - Concurrent sessions / MVCC.
 - WAL (still deferred at storage layer).
 - SQLite type affinity / collation matrix — out of scope; declared types + explicit `CAST` (S2); pragmatic scalar `Value` tags only.
@@ -88,14 +88,22 @@ Already landed (do not re-implement):
 ### Sketch API (`src/exec`)
 
 ```odin
-Exec_Session :: struct { /* engine: ^Engine, … */ }
+Exec_Session :: struct { /* eng, txn flags, binds: Bind_Table, … */ }
 
 session_open  :: proc(path: string, …) -> (Exec_Session, Exec_Error)
 session_adopt :: proc(e: ^engine.Engine) -> Exec_Session   // tests
 session_close :: proc(s: ^Exec_Session)
 
 exec_script   :: proc(s: ^Exec_Session, sql_text: string) -> (Exec_Result, Exec_Error)
-exec_statement :: proc(s: ^Exec_Session, sql_text: string) -> (Exec_Result, Exec_Error)  // optional thin wrapper
+exec_statement :: proc(s: ^Exec_Session, sql_text: string) -> (Exec_Result, Exec_Error)
+
+// F4 — positional parameters (named extension; not SQL PREPARE/EXECUTE text)
+session_bind       :: proc(s: ^Exec_Session, index: int, value: Value) -> Exec_Error  // clones value
+session_bind_all   :: proc(s: ^Exec_Session, values: []Value) -> Exec_Error           // clear + bind 0..n-1
+session_clear_binds :: proc(s: ^Exec_Session)
+exec_statement_params :: proc(s: ^Exec_Session, sql_text: string, params: []Value) -> (Exec_Result, Exec_Error)
+//   binds params, checks arity vs max `?`/`?N` in the statement, executes, clears binds.
+//   Caller retains ownership of `params`. Unbound / arity → Invalid_Schema; kind → Constraint.
 
 Exec_Result :: struct {
   // kind: rows_affected | result_set | ok
@@ -104,7 +112,7 @@ Exec_Result :: struct {
 }
 ```
 
-The split **session + script/statement entrypoints + freeable result/error** is the contract. Package/types appear when E1 needs them — not as a prior “scaffold phase.”
+The split **session + script/statement entrypoints + freeable result/error** is the contract. Package/types appear when E1 needs them — not as a prior “scaffold phase.” **F4** adds the bind table on the session; `Placeholder` eval reads the active bind table for the current statement.
 
 ---
 
@@ -414,4 +422,4 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.
 2. ~~Semantic north star after E6: [`sql-compliance.md`](sql-compliance.md) (S0–S6).~~
-3. Post-F3 execute widening: [`sql-followon.md`](sql-followon.md) (F4 prepared `?`).
+3. ~~Post-S6 execute widening F0–F4~~ — complete; see [`sql-followon.md`](sql-followon.md).

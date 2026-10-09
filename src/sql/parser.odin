@@ -13,18 +13,20 @@ String ownership (hard contract):
 */
 
 Parser :: struct {
-	tokens:    []Token,
-	pos:       int,
-	allocator: mem.Allocator,
-	src:       string,
+	tokens:           []Token,
+	pos:              int,
+	allocator:        mem.Allocator,
+	src:              string,
+	next_placeholder: int, // next index for bare `?` (SQLite-style auto-number, 0-based)
 }
 
 make_parser :: proc(tokens: []Token, allocator := context.allocator, src := "") -> Parser {
 	return Parser{
-		tokens    = tokens,
-		pos       = 0,
-		allocator = allocator,
-		src       = src,
+		tokens           = tokens,
+		pos              = 0,
+		allocator        = allocator,
+		src              = src,
+		next_placeholder = 0,
 	}
 }
 

@@ -52,7 +52,7 @@ Already landed (do not re-implement):
 - H2 JDBC / product parity (MVCC modes, modes catalog, full function library, etc.).
 - Query planner / cost-based optimizer beyond trivial plans.
 - Concurrent sessions, WAL, network protocol.
-- Prepared statements / `?` binding (still deferred unless a later plan owns it).
+- Prepared statements / `?` binding — **landed in follow-on F4** (session API; see [`sql-followon.md`](sql-followon.md)).
 - Views, triggers, CTEs, set ops, window functions, `CHECK` / FK enforcement, `ALTER` beyond what execute already rejects.
 - Rewriting the parser into a different grammar family — compliance is primarily **semantic**.
 
@@ -329,4 +329,4 @@ Defaults stand unless overridden before/during the relevant phase:
 6. ~~Implement **S4** (`COUNT(*)` / aggregates) with `sql-compliance-s4-coverage.md`.~~
 7. ~~Implement **S5** (`GROUP BY` / `HAVING`) with `sql-compliance-s5-coverage.md`.~~
 8. ~~Implement **S6** (`INNER JOIN`) with `sql-compliance-s6-coverage.md`.~~
-9. ~~Compliance query arc complete through S6.~~ Post-S6 work lives in [`sql-followon.md`](sql-followon.md) — **F0**–**F3** landed; next **F4** (prepared `?`).
+9. ~~Compliance query arc complete through S6.~~ Post-S6 work lives in [`sql-followon.md`](sql-followon.md) — **F0**–**F4** complete.

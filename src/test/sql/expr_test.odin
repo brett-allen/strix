@@ -70,6 +70,23 @@ test_expr_placeholders :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_expr_placeholder_auto_number :: proc(t: ^testing.T) {
+	// Bare `?` auto-assigns 0, 1, … left-to-right; `?N` is explicit.
+	stmt, err := sql.parse_statement("INSERT INTO t VALUES (?, ?, ?2, ?)")
+	defer sql.free_statement(stmt)
+	defer sql.free_error(err)
+	testing.expect(t, !sql.has_error(err))
+	ins := stmt.data.(sql.Insert_Stmt)
+	testing.expect_value(t, len(ins.rows), 1)
+	row := ins.rows[0]
+	testing.expect_value(t, len(row), 4)
+	testing.expect_value(t, row[0].data.(sql.Placeholder_Data).index, 0)
+	testing.expect_value(t, row[1].data.(sql.Placeholder_Data).index, 1)
+	testing.expect_value(t, row[2].data.(sql.Placeholder_Data).index, 2)
+	testing.expect_value(t, row[3].data.(sql.Placeholder_Data).index, 3)
+}
+
+@(test)
 test_expr_function_call :: proc(t: ^testing.T) {
 	expr, err := sql.parse_expr("count(*)")
 	defer free_expr(expr)

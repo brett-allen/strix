@@ -385,7 +385,7 @@ parse_primary_expr :: proc(p: ^Parser) -> (^Expr, Parse_Error) {
 		node := new(Expr, p.allocator)
 		node.kind = .Placeholder
 		node.span = tok.span
-		node.data = Placeholder_Data{index = placeholder_index_from_text(tok.text)}
+		node.data = Placeholder_Data{index = assign_placeholder_index(p, tok.text)}
 		return node, ok_error()
 	case .Star:
 		next(p)

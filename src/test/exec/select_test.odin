@@ -297,9 +297,10 @@ test_select_negatives_codes :: proc(t: ^testing.T) {
 	exec.free_error(e9)
 	exec.free_result(r9)
 
+	// Unbound `?` → Invalid_Schema (F4); bind via session API to use parameters.
 	r10, e10 := exec.exec_statement(&s, "SELECT name FROM people WHERE id = ?;")
 	testing.expect(t, exec.has_error(e10))
-	testing.expect_value(t, e10.code, exec.Exec_Error_Code.Unsupported_Ast)
+	testing.expect_value(t, e10.code, exec.Exec_Error_Code.Invalid_Schema)
 	exec.free_error(e10)
 	exec.free_result(r10)
 }

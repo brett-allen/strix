@@ -118,6 +118,6 @@ Section sums: Value 9 + Lexer 3 + Bind 8 + Eval 10 + Index 5 + Polish 4 = **39**
 - UUID version/variant validation beyond parse
 - Three-valued BOOLEAN beyond NULL
 - Ambient affinity / SQLite-style coerce
-- F4 prepared `?` binding
+- ~~F4 prepared `?` binding~~ — see [`sql-followon-f4-coverage.md`](sql-followon-f4-coverage.md)
 - Migrating pre-F3 on-disk Text-tagged “UUID” rows automatically (docs-only dialect note; not a coverage cell)
 - Composite PK including UUID (stretch; F2 composite PK already covered without UUID column)

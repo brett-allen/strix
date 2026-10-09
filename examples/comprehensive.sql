@@ -13,8 +13,11 @@
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
 -- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK,
 -- S4 whole-query aggregates, S5 GROUP BY / HAVING, S6 INNER/CROSS JOIN,
--- F1 LEFT OUTER + 3-table joins, F2 composite PRIMARY KEY, and F3
+-- F1 LEFT OUTER + 3-table joins, F2 composite PRIMARY KEY, F3
 -- BOOLEAN + typed UUID.
+-- F4 prepared `?` binding is a session API (exec_statement_params /
+-- session_bind*) — not expressible as literal SQL in this file; smoke is
+-- src/test/exec/bind_test.odin (strix sql / shell take literals only).
 -- Intentionally omits USING / RIGHT / FULL / NATURAL, DISTINCT, CHECK/FK,
 -- ALTER, INSERT…SELECT, OR REPLACE/IGNORE.
 

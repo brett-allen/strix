@@ -49,7 +49,8 @@ eval_expr :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator
 	case .In_List:
 		return eval_in_list(expr.data.(sql.In_List_Data), expr.span, env, allocator)
 	case .Placeholder:
-		return {}, make_error(.Unsupported_Ast, "parameter placeholders are not supported yet", span = expr.span)
+		ph := expr.data.(sql.Placeholder_Data)
+		return lookup_active_bind(ph.index, expr.span, allocator)
 	case .Star:
 		return {}, make_error(.Unsupported_Ast, "bare * is not valid in this expression", span = expr.span)
 	case .Call:

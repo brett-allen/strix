@@ -98,8 +98,8 @@ clone_value :: proc(v: Value, allocator := context.allocator) -> Value {
 	return value_null()
 }
 
-// eval_literal_expr evaluates a literal (or unary +/- numeric literal) to a Value.
-// Non-literal / non-NULL defaults and expressions yield a clear error.
+// eval_literal_expr evaluates a literal, Placeholder (F4), or unary +/- numeric literal to a Value.
+// Other expression shapes yield a clear error. Placeholders read the active session bind table.
 eval_literal_expr :: proc(expr: ^sql.Expr, allocator := context.allocator) -> (Value, Exec_Error) {
 	if expr == nil {
 		return {}, error_at(.Unsupported_Ast, "missing expression")
@@ -107,12 +107,22 @@ eval_literal_expr :: proc(expr: ^sql.Expr, allocator := context.allocator) -> (V
 	switch expr.kind {
 	case .Literal:
 		return value_from_literal(expr.data.(sql.Literal_Data), expr.span, allocator)
+	case .Placeholder:
+		ph := expr.data.(sql.Placeholder_Data)
+		return lookup_active_bind(ph.index, expr.span, allocator)
 	case .Unary:
 		u := expr.data.(sql.Unary_Data)
-		if u.expr == nil || u.expr.kind != .Literal {
+		if u.expr == nil || (u.expr.kind != .Literal && u.expr.kind != .Placeholder) {
 			return {}, make_error(.Unsupported_Ast, "only literal values are supported in INSERT", span = expr.span)
 		}
-		inner, err := value_from_literal(u.expr.data.(sql.Literal_Data), u.expr.span, allocator)
+		inner: Value
+		err: Exec_Error
+		if u.expr.kind == .Placeholder {
+			ph := u.expr.data.(sql.Placeholder_Data)
+			inner, err = lookup_active_bind(ph.index, u.expr.span, allocator)
+		} else {
+			inner, err = value_from_literal(u.expr.data.(sql.Literal_Data), u.expr.span, allocator)
+		}
 		if has_error(err) {
 			return {}, err
 		}
@@ -135,10 +145,10 @@ eval_literal_expr :: proc(expr: ^sql.Expr, allocator := context.allocator) -> (V
 		}
 		free_value(inner, allocator)
 		return {}, make_error(.Unsupported_Ast, "unsupported unary operator in INSERT", span = expr.span)
-	case .Column_Ref, .Placeholder, .Star, .Binary, .Call, .Is_Null, .In_List, .Between, .Cast:
+	case .Column_Ref, .Star, .Binary, .Call, .Is_Null, .In_List, .Between, .Cast:
 		return {}, make_error(
 			.Unsupported_Ast,
-			"only literal / NULL values are supported in INSERT VALUES",
+			"only literal / NULL / parameter values are supported in INSERT VALUES",
 			span = expr.span,
 		)
 	}

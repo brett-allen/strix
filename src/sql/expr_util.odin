@@ -65,3 +65,18 @@ placeholder_index_from_text :: proc(text: string) -> int {
 	}
 	return n
 }
+
+// assign_placeholder_index numbers bare `?` left-to-right (0, 1, 2, …).
+// Explicit `?N` uses N and advances the auto counter past N when needed.
+assign_placeholder_index :: proc(p: ^Parser, text: string) -> int {
+	if len(text) <= 1 {
+		idx := p.next_placeholder
+		p.next_placeholder = idx + 1
+		return idx
+	}
+	idx := placeholder_index_from_text(text)
+	if idx >= p.next_placeholder {
+		p.next_placeholder = idx + 1
+	}
+	return idx
+}

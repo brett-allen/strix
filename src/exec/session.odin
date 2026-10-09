@@ -8,6 +8,7 @@ Exec_Session :: struct {
 	closed:       bool,
 	explicit_txn: bool, // true after BEGIN until COMMIT/ROLLBACK
 	txn_aborted:  bool, // set when a write fails inside an explicit txn (whole txn rolled back)
+	binds:        Bind_Table, // positional `?` / `?N` values (F4); owned clones
 }
 
 // session_open opens an existing .strix database at path.
@@ -32,6 +33,7 @@ session_adopt :: proc(e: ^engine.Engine) -> Exec_Session {
 // session_close rolls back any open txn and closes the engine when owned.
 // While a flush fence is live, close is REFUSED: session stays open/usable so
 // the caller can retry COMMIT. Never frees the engine or marks closed over a fence.
+// Cleared binds are always released when close succeeds (or when already closed).
 session_close :: proc(s: ^Exec_Session) -> Exec_Error {
 	if s == nil || s.closed {
 		return ok_error()
@@ -54,6 +56,7 @@ session_close :: proc(s: ^Exec_Session) -> Exec_Error {
 		s.closed = true
 		s.explicit_txn = false
 		s.txn_aborted = false
+		bind_table_destroy(&s.binds)
 		return close_err
 	}
 	if s.eng != nil && s.eng.in_txn {
@@ -71,6 +74,7 @@ session_close :: proc(s: ^Exec_Session) -> Exec_Error {
 	s.closed = true
 	s.explicit_txn = false
 	s.txn_aborted = false
+	bind_table_destroy(&s.binds)
 	return ok_error()
 }
 
