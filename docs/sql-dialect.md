@@ -6,6 +6,8 @@ Execute semantics migrate under [`sql-compliance.md`](sql-compliance.md) (phases
 
 Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6.
 
+**Post-S6:** further execute widening (LEFT OUTER, 3+ tables, composite PK, BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F0–F4) — not executed until those phases land.
+
 ## Supported statements (parser v1 / Phase 5)
 
 | Kind | Forms |
@@ -117,9 +119,9 @@ Two-table joins via **nested-loop** (correctness over clever plans). `WHERE` app
 |------|-----------|-------|
 | `INNER JOIN` … `ON expr` / `JOIN` … `ON expr` | **yes** | Required `ON`; equi-join and general boolean `ON` |
 | `CROSS JOIN` / comma-join (`FROM a, b`) | **yes** | Cartesian product; filter with `WHERE` |
-| `LEFT [OUTER] JOIN` | **no** | `Unsupported_Ast` (deferred) |
-| `JOIN` … `USING (…)` | **no** | `Unsupported_Ast` (use `ON`) |
-| Three+ tables / multiple `JOIN` clauses | **no** | `Unsupported_Ast` until a follow-on |
+| `LEFT [OUTER] JOIN` | **no** | `Unsupported_Ast` (planned: [`sql-followon.md`](sql-followon.md) **F1**) |
+| `JOIN` … `USING (…)` | **no** | `Unsupported_Ast` (use `ON`; follow-on default defer) |
+| Three+ tables / multiple `JOIN` clauses | **no** | `Unsupported_Ast` (planned: [`sql-followon.md`](sql-followon.md) **F1**) |
 
 **Column binding:** optional table aliases and `t.col` / `alias.col` qualifiers. Unqualified names that appear in more than one input → `Unknown_Column` with message `ambiguous column: …`. Unknown names / qualifiers → `Unknown_Column`. Duplicate exposed aliases → `Invalid_Schema`.
 

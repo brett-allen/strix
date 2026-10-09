@@ -329,4 +329,4 @@ Defaults stand unless overridden before/during the relevant phase:
 6. ~~Implement **S4** (`COUNT(*)` / aggregates) with `sql-compliance-s4-coverage.md`.~~
 7. ~~Implement **S5** (`GROUP BY` / `HAVING`) with `sql-compliance-s5-coverage.md`.~~
 8. ~~Implement **S6** (`INNER JOIN`) with `sql-compliance-s6-coverage.md`.~~
-9. Compliance query arc complete through S6; remaining open questions (LEFT OUTER, 3+ tables, composite PK, …) are follow-on work.
+9. ~~Compliance query arc complete through S6.~~ Post-S6 work (LEFT OUTER, 3+ tables, composite PK, BOOLEAN/UUID, prepared `?`) lives in [`sql-followon.md`](sql-followon.md) — start at **F0** freeze, then **F1**.
