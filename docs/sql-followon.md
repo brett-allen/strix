@@ -30,8 +30,8 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `LEFT OUTER`, `USING`, multi-`JOIN`, composite `PRIMARY KEY (…)`, `?` / `?N` placeholders, `CAST`, aggs/`GROUP BY` — many reject at bind/exec |
-| `src/exec` | E1–E6 + **S1–S6** | Two-table `INNER`/`CROSS` only (`src/exec/join.odin`); single-column PK (IPK or unique index); multi-column **UNIQUE** already enforced; `UUID` type name stores as **Text**; no native `BOOLEAN`; placeholders → `Unsupported_Ast` in eval |
-| Expression eval | S1–S6 | Strict bool; `CAST`; whole-query + grouped aggs; multi-table column bind / ambiguity for **two** sides |
+| `src/exec` | E1–E6 + **S1–S6** + **F1** | Left-deep `INNER`/`CROSS`/`LEFT OUTER`, N tables (`src/exec/join.odin`); single-column PK (IPK or unique index); multi-column **UNIQUE** already enforced; `UUID` type name stores as **Text**; no native `BOOLEAN`; placeholders → `Unsupported_Ast` in eval |
+| Expression eval | S1–S6 + F1 | Strict bool; `CAST`; whole-query + grouped aggs; multi-table column bind / ambiguity for **N** `Join_Side`s |
 | Catalog / rows | v2 tables, heap v1 | `Value_Kind`: Null / Integer / Float / Text / Blob; index keys already concatenate **N** tagged fields |
 | CLI / shell | `strix sql` / `strix shell` | Literals only; no prepare/execute API |
 
@@ -121,7 +121,7 @@ Already landed (do not re-implement):
 
 | Area | Fact |
 |------|------|
-| Joins | `validate_select_joins` rejects `len(joins) > 1`, `.Left`, `using_cols`; `nested_loop_join` is INNER/CROSS only (no NULL-extend) |
+| Joins | **F1 landed:** `validate_select_joins` accepts N clauses + `.Left` with `ON`; rejects `using_cols`; left-deep `nested_loop_join_step` with NULL-extend for LEFT |
 | Composite PK | Rejected in `bind_create_table_columns` / `validate_primary_key_shape`; **multi-column UNIQUE already works** (`test_multi_column_table_unique`) |
 | UUID | Type name → Text in `declared_storage_kind` / `CAST … AS UUID` |
 | BOOLEAN | Not a lexer keyword / not a `Value_Kind`; `CAST … AS BOOLEAN` errors |
@@ -173,14 +173,14 @@ User-visible: outer joins and multi-table FROM lists runnable via CLI/shell.
 
 Acceptance:
 
-- [ ] `LEFT [OUTER] JOIN` … `ON expr` (start: two tables) — NULL-pad right columns on no match; `ON` filters join matches; `WHERE` filters after join
-- [ ] Multiple `JOIN` clauses / 3+ tables: left-deep nested loop; column bind with N `Join_Side`s; ambiguous unqualified → `Unknown_Column` (same policy as S6)
-- [ ] Mix: `LEFT` + `INNER` + `CROSS` / comma-join in one FROM (document evaluation order: left-deep)
-- [ ] Aggs / `GROUP BY` / `HAVING` over widened join streams (regression + new cases)
-- [ ] Reject clearly: `RIGHT` / `FULL` / `NATURAL`; `USING` (until Q #4); unsupported join shapes
-- [ ] Update [`sql-dialect.md`](sql-dialect.md) JOIN section + executed matrix
-- [ ] Tests: equi LEFT preserving unmatched left; ON vs WHERE difference (NULL-extended row filtered by WHERE); 3-table chain; ambiguity; negatives with stable codes
-- [ ] Coverage inventory: [`sql-followon-f1-coverage.md`](sql-followon-f1-coverage.md) ≥80%
+- [x] `LEFT [OUTER] JOIN` … `ON expr` (start: two tables) — NULL-pad right columns on no match; `ON` filters join matches; `WHERE` filters after join
+- [x] Multiple `JOIN` clauses / 3+ tables: left-deep nested loop; column bind with N `Join_Side`s; ambiguous unqualified → `Unknown_Column` (same policy as S6)
+- [x] Mix: `LEFT` + `INNER` + `CROSS` / comma-join in one FROM (document evaluation order: left-deep)
+- [x] Aggs / `GROUP BY` / `HAVING` over widened join streams (regression + new cases)
+- [x] Reject clearly: `RIGHT` / `FULL` / `NATURAL`; `USING` (until Q #4); unsupported join shapes
+- [x] Update [`sql-dialect.md`](sql-dialect.md) JOIN section + executed matrix
+- [x] Tests: equi LEFT preserving unmatched left; ON vs WHERE difference (NULL-extended row filtered by WHERE); 3-table chain; ambiguity; negatives with stable codes
+- [x] Coverage inventory: [`sql-followon-f1-coverage.md`](sql-followon-f1-coverage.md) ≥80%
 
 **Exit:** `SELECT … FROM a LEFT JOIN b ON …` and a 3-table join run end-to-end via CLI; dialect matrix honest.
 
@@ -313,7 +313,7 @@ Acceptance:
 Not a single ship gate — **each phase has its own exit**. Program-level success looks like:
 
 - [x] F0 docs live; compliance/dialect/execute pointers updated
-- [ ] F1 landed → LEFT OUTER + 3+ table joins
+- [x] F1 landed → LEFT OUTER + 3+ table joins
 - [ ] F2 landed → composite PRIMARY KEY
 - [ ] F3 landed → native BOOLEAN + typed UUID (or documented fallback if Q #5/#6 flip)
 - [ ] F4 landed → prepared `?` binding with session API + documented CLI/shell story
@@ -342,6 +342,6 @@ Defaults stand unless overridden before/during the relevant phase:
 ## Immediate next steps
 
 1. ~~Land this plan + compliance/dialect/execute pointers (**F0**).~~
-2. Confirm open Q defaults with PM (especially **BOOLEAN/UUID storage**, **join cap**, **prepared CLI depth**).
-3. Implement **F1** (LEFT OUTER + 3+ joins) with `sql-followon-f1-coverage.md`.
+2. ~~Implement **F1** (LEFT OUTER + 3+ joins) with `sql-followon-f1-coverage.md`.~~
+3. Confirm open Q defaults with PM (especially **BOOLEAN/UUID storage**, **join cap**, **prepared CLI depth**).
 4. Then **F2** (composite PK) → **F3** (BOOLEAN + UUID) → **F4** (prepared `?`).

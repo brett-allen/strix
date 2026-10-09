@@ -1182,7 +1182,6 @@ validate_agg_projection_exprs :: proc(
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
 	sides: []Join_Side = nil,
-	on_expr: ^sql.Expr = nil,
 ) -> Exec_Error {
 	nulls := make([]Value, len(columns))
 	defer delete(nulls)
@@ -1196,8 +1195,11 @@ validate_agg_projection_exprs :: proc(
 		values  = nulls,
 		sides   = sides,
 	}
-	if on_expr != nil {
-		v, err := eval_expr(on_expr, &env)
+	for j in stmt.joins {
+		if j.on == nil {
+			continue
+		}
+		v, err := eval_expr(j.on, &env)
 		free_value(v)
 		if has_error(err) {
 			return err

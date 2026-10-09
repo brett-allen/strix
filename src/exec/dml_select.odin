@@ -27,8 +27,9 @@ free_bound_projs :: proc(projs: []Bound_Proj, allocator := context.allocator) {
 	}
 }
 
-// exec_select runs SELECT: single-table seq scan, or two-table nested-loop JOIN
-// (S6), then in-memory filter/sort/limit (and optional aggregates / GROUP BY).
+// exec_select runs SELECT: single-table seq scan, or left-deep nested-loop JOIN
+// (S6/F1: INNER / CROSS / LEFT OUTER, N tables), then in-memory filter/sort/limit
+// (and optional aggregates / GROUP BY).
 exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> (Exec_Result, Exec_Error) {
 	e := session_engine(s)
 	if e == nil {
@@ -59,40 +60,63 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		return {}, make_error(.Invalid_Schema, "table %q has no columns", table_name, span = span)
 	}
 
-	right_entry: engine.Catalog_Entry
+	join_entries: []engine.Catalog_Entry = nil
 	flat_cols: []engine.Catalog_Column = entry.columns
 	join_sides: []Join_Side = nil
-	right_table := ""
-	right_alias := ""
-	on_expr: ^sql.Expr = nil
 
 	if is_join {
-		j := stmt.joins[0]
-		right_table = j.table.table
-		right_alias = j.table.alias
-		on_expr = j.on
-		rentry, rgerr := engine.catalog_get_table_entry(e, right_table)
-		if rgerr == .Not_Found {
-			return {}, make_error(.Unknown_Table, "no such table: %q", right_table, span = j.span)
+		n_sides := 1 + len(stmt.joins)
+		join_entries = make([]engine.Catalog_Entry, len(stmt.joins))
+		tables := make([]string, n_sides)
+		aliases := make([]string, n_sides)
+		col_lists := make([][]engine.Catalog_Column, n_sides)
+		defer {
+			delete(tables)
+			delete(aliases)
+			delete(col_lists)
 		}
-		if rgerr != .None {
-			return {}, from_engine_error(rgerr, j.span)
+		tables[0] = table_name
+		aliases[0] = stmt.from.alias
+		col_lists[0] = entry.columns
+		for j, ji in stmt.joins {
+			rt := j.table.table
+			rentry, rgerr := engine.catalog_get_table_entry(e, rt)
+			if rgerr == .Not_Found {
+				for k in 0 ..< ji {
+					engine.free_catalog_entry(join_entries[k])
+				}
+				delete(join_entries)
+				join_entries = nil
+				return {}, make_error(.Unknown_Table, "no such table: %q", rt, span = j.span)
+			}
+			if rgerr != .None {
+				for k in 0 ..< ji {
+					engine.free_catalog_entry(join_entries[k])
+				}
+				delete(join_entries)
+				join_entries = nil
+				return {}, from_engine_error(rgerr, j.span)
+			}
+			join_entries[ji] = rentry
+			if len(rentry.columns) == 0 {
+				for k in 0 ..= ji {
+					engine.free_catalog_entry(join_entries[k])
+				}
+				delete(join_entries)
+				join_entries = nil
+				return {}, make_error(.Invalid_Schema, "table %q has no columns", rt, span = j.span)
+			}
+			tables[ji + 1] = rt
+			aliases[ji + 1] = j.table.alias
+			col_lists[ji + 1] = rentry.columns
 		}
-		right_entry = rentry
-		if len(right_entry.columns) == 0 {
-			engine.free_catalog_entry(right_entry)
-			return {}, make_error(.Invalid_Schema, "table %q has no columns", right_table, span = j.span)
-		}
-		fc, sides, ferr := build_flat_join_columns(
-			entry.columns,
-			right_entry.columns,
-			table_name,
-			stmt.from.alias,
-			right_table,
-			right_alias,
-		)
+		fc, sides, ferr := build_flat_join_columns(tables, aliases, col_lists)
 		if has_error(ferr) {
-			engine.free_catalog_entry(right_entry)
+			for k in 0 ..< len(join_entries) {
+				engine.free_catalog_entry(join_entries[k])
+			}
+			delete(join_entries)
+			join_entries = nil
 			return {}, ferr
 		}
 		flat_cols = fc
@@ -100,7 +124,12 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 	}
 	defer {
 		if is_join {
-			engine.free_catalog_entry(right_entry)
+			for k in 0 ..< len(join_entries) {
+				engine.free_catalog_entry(join_entries[k])
+			}
+			if join_entries != nil {
+				delete(join_entries)
+			}
 			if flat_cols != nil {
 				delete(flat_cols)
 			}
@@ -157,7 +186,6 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 			table_name,
 			stmt.from.alias,
 			join_sides,
-			on_expr,
 		); has_error(verr) {
 			return {}, verr
 		}
@@ -169,7 +197,6 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 			table_name,
 			stmt.from.alias,
 			join_sides,
-			on_expr,
 		); has_error(verr) {
 			return {}, verr
 		}
@@ -201,29 +228,78 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 
 	matched := make([dynamic][]Value, 0, 16)
 	if is_join {
-		left_rows, lerr := scan_table_rows(e, table_name, span)
+		n_sides := 1 + len(stmt.joins)
+		side_rows := make([][][]Value, n_sides)
+		defer {
+			for si in 0 ..< n_sides {
+				if side_rows[si] != nil {
+					free_scanned_rows(side_rows[si])
+					delete(side_rows[si])
+				}
+			}
+			delete(side_rows)
+		}
+		left0, lerr := scan_table_rows(e, table_name, span)
 		if has_error(lerr) {
 			delete(matched)
 			return {}, lerr
 		}
-		defer {
-			free_scanned_rows(left_rows)
-			delete(left_rows)
+		side_rows[0] = left0
+		for j, ji in stmt.joins {
+			rrows, rerr := scan_table_rows(e, j.table.table, j.span)
+			if has_error(rerr) {
+				delete(matched)
+				return {}, rerr
+			}
+			side_rows[ji + 1] = rrows
 		}
-		right_rows, rerr := scan_table_rows(e, right_table, span)
-		if has_error(rerr) {
-			delete(matched)
-			return {}, rerr
+
+		// Seed working set with FROM-table rows (transfer ownership out of side_rows[0]).
+		working := make([dynamic][]Value, 0, len(side_rows[0]))
+		for row in side_rows[0] {
+			append(&working, row)
 		}
-		defer {
-			free_scanned_rows(right_rows)
-			delete(right_rows)
+		delete(side_rows[0])
+		side_rows[0] = nil
+
+		for j, ji in stmt.joins {
+			right_i := ji + 1
+			end_col := join_sides[right_i].offset + join_sides[right_i].ncols
+			env.columns = flat_cols[:end_col]
+			env.sides = join_sides[:right_i + 1]
+
+			next := make([dynamic][]Value, 0, 16)
+			jerr := nested_loop_join_step(
+				&next,
+				working[:],
+				side_rows[right_i],
+				j.kind,
+				j.on,
+				&env,
+			)
+			free_scanned_rows(working[:])
+			delete(working)
+			free_scanned_rows(side_rows[right_i])
+			delete(side_rows[right_i])
+			side_rows[right_i] = nil
+			if has_error(jerr) {
+				free_scanned_rows(next[:])
+				delete(next)
+				delete(matched)
+				return {}, jerr
+			}
+			working = next
 		}
-		if jerr := nested_loop_join(&matched, left_rows, right_rows, on_expr, stmt.where_expr, &env); has_error(jerr) {
+
+		env.columns = flat_cols
+		env.sides = join_sides
+		if werr := filter_rows_where(&matched, working[:], stmt.where_expr, &env); has_error(werr) {
 			free_scanned_rows(matched[:])
 			delete(matched)
-			return {}, jerr
+			delete(working)
+			return {}, werr
 		}
+		delete(working)
 	} else {
 		tree, oerr := engine.catalog_open_table(e, table_name)
 		if oerr != .None {
@@ -805,7 +881,6 @@ validate_select_exprs :: proc(
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
 	sides: []Join_Side = nil,
-	on_expr: ^sql.Expr = nil,
 ) -> Exec_Error {
 	nulls := make([]Value, len(columns))
 	defer delete(nulls)
@@ -819,8 +894,11 @@ validate_select_exprs :: proc(
 		values  = nulls,
 		sides   = sides,
 	}
-	if on_expr != nil {
-		v, err := eval_expr(on_expr, &env)
+	for j in stmt.joins {
+		if j.on == nil {
+			continue
+		}
+		v, err := eval_expr(j.on, &env)
 		free_value(v)
 		if has_error(err) {
 			return err

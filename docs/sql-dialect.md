@@ -4,9 +4,9 @@
 
 Execute semantics migrate under [`sql-compliance.md`](sql-compliance.md) (phases S0–S6). Parser surface may still accept forms the executor rejects until those phases land. Intentional deviations (IPK/rowid alias, `IF NOT EXISTS`, bracket/backtick idents, shell `.commands`) are **named extensions**, not the baseline.
 
-Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6.
+Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6. **F1** widens joins to `LEFT OUTER` and 3+ tables (left-deep nested loop).
 
-**Post-S6:** further execute widening (LEFT OUTER, 3+ tables, composite PK, BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F0–F4) — not executed until those phases land.
+**Post-F1:** further execute widening (composite PK, BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F2–F4) — not executed until those phases land.
 
 ## Supported statements (parser v1 / Phase 5)
 
@@ -111,23 +111,24 @@ Single-table grouped aggregates. `WHERE` filters **before** grouping; `HAVING` f
 
 Keys-only `GROUP BY` (no aggregates in the select list) is supported (distinct groups).
 
-### JOIN (execute / S6)
+### JOIN (execute / S6 + F1)
 
-Two-table joins via **nested-loop** (correctness over clever plans). `WHERE` applies after the join predicate.
+**Left-deep nested-loop** joins (correctness over clever plans; no join reordering). Each `JOIN` clause is applied in written order; `ON` is evaluated at that join step; `WHERE` applies after the full join chain. Soft guidance for demos: keep to roughly ≤4 joins (no hard cap in code).
 
 | Form | Executed? | Notes |
 |------|-----------|-------|
 | `INNER JOIN` … `ON expr` / `JOIN` … `ON expr` | **yes** | Required `ON`; equi-join and general boolean `ON` |
 | `CROSS JOIN` / comma-join (`FROM a, b`) | **yes** | Cartesian product; filter with `WHERE` |
-| `LEFT [OUTER] JOIN` | **no** | `Unsupported_Ast` (planned: [`sql-followon.md`](sql-followon.md) **F1**) |
-| `JOIN` … `USING (…)` | **no** | `Unsupported_Ast` (use `ON`; follow-on default defer) |
-| Three+ tables / multiple `JOIN` clauses | **no** | `Unsupported_Ast` (planned: [`sql-followon.md`](sql-followon.md) **F1**) |
+| `LEFT [OUTER] JOIN` … `ON expr` | **yes (F1)** | NULL-extends **right** columns when no `ON` match; unmatched left rows preserved |
+| Multiple `JOIN` clauses / 3+ tables | **yes (F1)** | Left-deep composition; mix `LEFT` + `INNER` + `CROSS` / comma-join |
+| `JOIN` … `USING (…)` | **no** | `Unsupported_Ast` (use `ON`; deferred past F1) |
+| `RIGHT` / `FULL` / `NATURAL` | **no** | Parse `Unsupported_Syntax` → exec `Parse` |
 
-**Column binding:** optional table aliases and `t.col` / `alias.col` qualifiers. Unqualified names that appear in more than one input → `Unknown_Column` with message `ambiguous column: …`. Unknown names / qualifiers → `Unknown_Column`. Duplicate exposed aliases → `Invalid_Schema`.
+**Column binding:** optional table aliases and `t.col` / `alias.col` qualifiers across **N** `Join_Side`s. Unqualified names that appear in more than one input → `Unknown_Column` with message `ambiguous column: …`. Unknown names / qualifiers → `Unknown_Column`. Duplicate exposed aliases → `Invalid_Schema`.
 
-**With aggregates / `GROUP BY`:** joined row stream feeds the S4/S5 path (whole-query agg and grouped agg over two tables are supported).
+**With aggregates / `GROUP BY`:** joined row stream feeds the S4/S5 path (whole-query agg and grouped agg over widened joins are supported).
 
-**Not used on join queries:** single-table index point-lookup (both sides seq-scanned).
+**Not used on join queries:** single-table index point-lookup (all sides seq-scanned).
 
 ### Literals & comments
 
@@ -243,12 +244,12 @@ Parser v1 accepts a wider surface than the executor runs. **Execute support** li
 |------|----------------|----------|
 | `CREATE`/`DROP TABLE` | yes | **yes (E1/E2 + S3)** — `NOT NULL`; literal/`NULL` `DEFAULT`; **two PK shapes (S3):** (A) sole `INTEGER`/`INT PRIMARY KEY` = IPK/rowid alias (named extension); (B) single-column non-IPK PK (`TEXT`/`VARCHAR`/`UUID`/…) = `NOT NULL` + system unique index `strix_autoindex_<table>_<n>`; column/table `UNIQUE` → system unique indexes; `DROP TABLE` auto-drops system autoindexes (user indexes still block); `IF NOT EXISTS` / `IF EXISTS`; rejects **composite** PK; CHECK/FK still unsupported |
 | `INSERT` … `VALUES` | yes | **yes (E2 + S1 + S3)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; non-IPK PK / UNIQUE duplicates → `Constraint`; NULL PK → `Constraint`; UNIQUE allows multiple NULLs; **declared-type kind check (S1):** recognized types (`INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/…/`UUID` → Text; `BLOB` → Blob) reject mismatched literal kinds with `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5/S3) |
-| `SELECT` (single-table + two-table join) | yes | **yes (E3 + S1 + S2 + S4 + S5 + S6)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list, **`CAST` (S2)**); **strict boolean context (S1):** Integer/Float `0` = false, `≠0` = true; NULL unknown (3VL for AND/OR); Text/Blob (and other non-numeric non-null) in `WHERE`/`AND`/`OR`/`NOT` → `Unsupported_Ast`; **compare (S1):** Integer–Integer exact `i64`; mixed int/float via `f64`; same-kind Text/Blob byte/lex; Text/Blob↔numeric without `CAST` → `Unsupported_Ast`; **`CAST(expr AS type)` (S2)** in projection/WHERE — see [Scalar CAST](#scalar-cast-execute--s2); **whole-query aggregates (S4):** `COUNT(*)` / `COUNT(expr)` / `SUM` / `AVG` / `MIN` / `MAX` (numerics; null-skipping except `COUNT(*)`) without `GROUP BY` → one result row — see [Aggregates](#aggregates-execute--s4); **`GROUP BY` / `HAVING` (S5):** column-ref keys; strict select list; HAVING post-agg; empty groups → 0 rows — see [GROUP BY / HAVING](#group-by--having-execute--s5); **`JOIN` (S6):** two-table `INNER JOIN` … `ON` and `CROSS JOIN` / comma-join (nested-loop); qualified names / aliases; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY` over joins supported; rejects `LEFT OUTER`, `USING`, 3+ tables — see [JOIN](#join-execute--s6); ORDER BY / LIMIT / OFFSET (in-memory; group keys/aggs with GROUP BY; incompatible ORDER BY kinds → error); rejects DISTINCT / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only on **single-table** selects (E5; numeric eq stays on seq scan; joins always seq-scan both sides) |
+| `SELECT` (single-table + N-table join) | yes | **yes (E3 + S1 + S2 + S4 + S5 + S6 + F1)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list, **`CAST` (S2)**); **strict boolean context (S1):** Integer/Float `0` = false, `≠0` = true; NULL unknown (3VL for AND/OR); Text/Blob (and other non-numeric non-null) in `WHERE`/`AND`/`OR`/`NOT` → `Unsupported_Ast`; **compare (S1):** Integer–Integer exact `i64`; mixed int/float via `f64`; same-kind Text/Blob byte/lex; Text/Blob↔numeric without `CAST` → `Unsupported_Ast`; **`CAST(expr AS type)` (S2)** in projection/WHERE — see [Scalar CAST](#scalar-cast-execute--s2); **whole-query aggregates (S4):** `COUNT(*)` / `COUNT(expr)` / `SUM` / `AVG` / `MIN` / `MAX` (numerics; null-skipping except `COUNT(*)`) without `GROUP BY` → one result row — see [Aggregates](#aggregates-execute--s4); **`GROUP BY` / `HAVING` (S5):** column-ref keys; strict select list; HAVING post-agg; empty groups → 0 rows — see [GROUP BY / HAVING](#group-by--having-execute--s5); **`JOIN` (S6 + F1):** left-deep nested-loop `INNER` / `CROSS` / comma-join / **`LEFT [OUTER] JOIN` … `ON`**; 3+ tables; qualified names / aliases; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY`/`HAVING` over joins supported; rejects `USING`, `RIGHT`/`FULL`/`NATURAL` — see [JOIN](#join-execute--s6--f1); ORDER BY / LIMIT / OFFSET (in-memory; group keys/aggs with GROUP BY; incompatible ORDER BY kinds → error); rejects DISTINCT / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only on **single-table** selects (E5; numeric eq stays on seq scan; joins always seq-scan all sides) |
 | `UPDATE` / `DELETE` | yes | **yes (E4/E5 + S1 + S2)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env` (same S1 boolean/compare rules; **`CAST` in SET/WHERE (S2)**); `SET` values checked against declared column kinds (same as INSERT); row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL / type mismatch on SET → `Constraint` |
 | `CREATE`/`DROP INDEX` | yes | **yes (E5 + S3)** — `CREATE INDEX` / `CREATE UNIQUE INDEX`; register + backfill; unique indexes probe for collisions (`Constraint`); `IF NOT EXISTS` / `IF EXISTS`; catalog index v2 column list + Unique flag (bit1 of index column flags); `DESC` on index columns is **catalog metadata only** (key bytes are always ASC-encoded for v1); index names starting with `strix_autoindex_` (case-insensitive) are reserved → `Invalid_Schema`; `DROP TABLE` auto-drops `strix_autoindex_*` then still rejects while user indexes exist |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | yes (E6) | **yes (E6)** — explicit txn mode; nested `BEGIN` → `In_Txn`; statements inside txn do not auto-commit until `COMMIT`; `ROLLBACK` undoes; `COMMIT`/`ROLLBACK` without `BEGIN` → `No_Txn`; **write failure inside explicit txn aborts the whole txn** (no savepoints; clears `explicit_txn`, sets `txn_aborted`); **flush-fence recovery:** retry `COMMIT` on the still-open session (auto-commit fence promotes to `explicit_txn`; shell close/quit/EOF/`--bail` exit refused until recovered; batch process exit **forfeits** recovery) |
 | Scripts | yes | **yes (E6)** — stop-on-error default; optional `continue_on_error` / CLI `--continue-on-error`; **after an explicit-txn abort, the script always stops** (even with `continue_on_error`) so later statements cannot auto-commit outside the aborted txn; **after a flush fence, only recovery `COMMIT` and `SELECT` may run** (other stmts hard-stop; with `continue_on_error`, intervening non-allowed stmts are skipped until `COMMIT`); errors format as `file:line:col: message` when path+span known |
-| `ALTER`, subqueries, … | yes (subset) | reject at bind/exec (`JOIN` executed in S6 for INNER/CROSS two-table) |
+| `ALTER`, subqueries, … | yes (subset) | reject at bind/exec (`JOIN` executed in S6/F1 for INNER/CROSS/LEFT, N tables) |
 
 Update this table as execute phases land.
 

@@ -7,7 +7,7 @@ Wire the existing SQL parser (`src/sql`) to the storage stack (`src/engine`) so 
 | **Branch** | `feature/sql-execute` |
 | **Depends on** | Parser v1 DoD ([`sql-parser.md`](sql-parser.md)), storage v1 DoD ([`storage-engine.md`](storage-engine.md) S0–S4), CLI `init` ([`src/cli`](../src/cli)) |
 | **Supersedes** | Storage plan phase S5 (“SQL DDL/DML slice”) — execution work lives here |
-| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening (LEFT/3+ joins, composite PK, BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F0–F4). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
+| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening: **F1** LEFT/3+ joins landed; F2–F4 (composite PK, BOOLEAN/UUID, prepared `?`) planned in [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
 
 ---
 
@@ -50,7 +50,7 @@ Already landed (do not re-implement):
 ## Non-goals (execute v1)
 
 - Query planner / cost-based optimizer (trivial plans only: seq scan, point insert, etc.).
-- Subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore). `GROUP BY`/`HAVING` executed (S5). Two-table `INNER`/`CROSS` joins executed (S6); `LEFT OUTER` / `USING` / 3+ tables still rejected (planned in [`sql-followon.md`](sql-followon.md) F1 — not executed yet).
+- Subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore). `GROUP BY`/`HAVING` executed (S5). Joins: `INNER`/`CROSS`/`LEFT OUTER`, N tables left-deep (S6 + F1); `USING` / `RIGHT` / `FULL` / `NATURAL` still rejected — see [`sql-followon.md`](sql-followon.md) F1.
 - Prepared statements and parameter binding (`?` / `?N`): **defer** for execute v1 (literals only); planned in [`sql-followon.md`](sql-followon.md) **F4**.
 - Concurrent sessions / MVCC.
 - WAL (still deferred at storage layer).
@@ -271,7 +271,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] `FROM` single table; optional alias
 - [x] `WHERE` on bound columns (expression eval over row values — see [Expression evaluation](#expression-evaluation-binderexecutor))
 - [x] `ORDER BY` / `LIMIT` / `OFFSET` in executor (in-memory sort OK for v1)
-- [x] Reject subqueries / `DISTINCT` clearly; `GROUP BY`/`HAVING` executed in S5; two-table `INNER`/`CROSS` joins executed in S6 (`LEFT` / `USING` / 3+ tables still rejected)
+- [x] Reject subqueries / `DISTINCT` clearly; `GROUP BY`/`HAVING` executed in S5; joins executed in S6 + F1 (`INNER`/`CROSS`/`LEFT`, N tables; `USING` / `RIGHT`/`FULL`/`NATURAL` still rejected)
 - [x] CLI prints result sets
 - [x] Tests: filter/sort/limit; create/insert/select round-trip; negatives with codes
 - [x] Coverage inventory: [`exec-e3-coverage.md`](exec-e3-coverage.md)
@@ -325,7 +325,7 @@ For `WHERE` / `SET` / projections (mainly E3–E4):
 - **S2:** scalar `CAST(expr AS type)` is executed — supported pairs and Text→INTEGER rules live in [`sql-dialect.md`](sql-dialect.md) § Scalar CAST and [`sql-compliance.md`](sql-compliance.md) Phase S2. Invalid casts error (not NULL-by-affinity).
 - **S4:** whole-query aggregates (`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) on `SELECT` without `GROUP BY` — see [`sql-dialect.md`](sql-dialect.md) § Aggregates and [`sql-compliance.md`](sql-compliance.md) Phase S4. Mix of aggregates with bare columns without `GROUP BY` → `Unsupported_Ast` (strict).
 - **S5:** `GROUP BY` (column refs) + `HAVING`; strict select list; empty groups → 0 rows — see [`sql-dialect.md`](sql-dialect.md) § GROUP BY / HAVING and [`sql-compliance.md`](sql-compliance.md) Phase S5.
-- **S6:** two-table `INNER JOIN` … `ON` / `CROSS JOIN` / comma-join (nested-loop); multi-table column bind with aliases / `t.col`; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY` over joins supported — see [`sql-dialect.md`](sql-dialect.md) § JOIN and [`sql-compliance.md`](sql-compliance.md) Phase S6.
+- **S6 + F1:** left-deep nested-loop `INNER` / `CROSS` / comma-join / `LEFT [OUTER] JOIN` … `ON`, N tables; multi-table column bind with aliases / `t.col`; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY`/`HAVING` over joins supported — see [`sql-dialect.md`](sql-dialect.md) § JOIN and [`sql-followon.md`](sql-followon.md) Phase F1.
 
 Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union; conversion is explicit via `CAST`.
 
@@ -357,7 +357,7 @@ Exec_Error :: struct {
 | `exec` unit | Bind failures; schema meta; CREATE/DROP; later row codec + DML |
 | Integration | Temp `.strix` via `engine_create`; SQL → reopen catalog/rows |
 | CLI | Smoke from E1: `init` + `sql -c 'CREATE TABLE …'`; pure `parse_sql_command_args` unit tests |
-| Negative | Unsupported AST (`LEFT JOIN`, `DISTINCT`, etc.) → stable error code |
+| Negative | Unsupported AST (`USING`, `DISTINCT`, etc.) / parse rejects (`RIGHT`/`FULL`/`NATURAL`) → stable error codes |
 
 Wire `src/test/exec` into `./build.sh test` as part of E1.
 
@@ -414,4 +414,4 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.
 2. ~~Semantic north star after E6: [`sql-compliance.md`](sql-compliance.md) (S0–S6).~~
-3. Post-S6 execute widening: [`sql-followon.md`](sql-followon.md) (F0 freeze, then F1).
+3. Post-F1 execute widening: [`sql-followon.md`](sql-followon.md) (F2 composite PK → F3 types → F4 prepared `?`).

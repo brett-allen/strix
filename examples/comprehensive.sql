@@ -12,9 +12,10 @@
 --
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
 -- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK,
--- S4 whole-query aggregates, S5 GROUP BY / HAVING, and S6 INNER/CROSS JOIN.
--- Intentionally omits LEFT OUTER JOIN, DISTINCT, CHECK/FK, ALTER,
--- INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
+-- S4 whole-query aggregates, S5 GROUP BY / HAVING, S6 INNER/CROSS JOIN,
+-- and F1 LEFT OUTER + 3-table joins.
+-- Intentionally omits USING / RIGHT / FULL / NATURAL, DISTINCT, CHECK/FK,
+-- ALTER, INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
 
 -- ---------------------------------------------------------------------------
 -- Clean slate (idempotent-ish: drop children before parents)
@@ -206,6 +207,20 @@ SELECT c.name, COUNT(*) AS n_orders
   JOIN orders AS o ON c.id = o.customer_id
   GROUP BY c.name
   ORDER BY c.name;
+
+-- LEFT OUTER JOIN (F1; unmatched left preserved with NULL right cols)
+SELECT c.name, o.id AS order_id, o.qty
+  FROM customers AS c
+  LEFT JOIN orders AS o ON c.id = o.customer_id
+  ORDER BY c.name, o.id;
+
+-- 3-table left-deep join (F1)
+SELECT c.name, o.id AS order_id, p.name AS product, o.qty
+  FROM customers AS c
+  INNER JOIN orders AS o ON c.id = o.customer_id
+  INNER JOIN products AS p ON p.id = o.product_id
+  WHERE o.paid = 1
+  ORDER BY c.name, o.id;
 
 -- ---------------------------------------------------------------------------
 -- Explicit transactions
