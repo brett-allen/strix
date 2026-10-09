@@ -109,6 +109,7 @@ Exec_Result :: struct {
   // kind: rows_affected | result_set | ok
   // rows_affected: int
   // columns / rows for SELECT (allocator-owned; free via free_result)
+  // preceding: earlier statement results from exec_script (owned); primary fields = last stmt
 }
 ```
 

@@ -165,7 +165,9 @@ Keywords stay hard-reserved in the lexer. Expression specials:
 
 ## Phase 1 — Expressions
 
-Precedence (high → low): unary `+`/`-`/`NOT` → `*`/`/`/`%` → `+`/`-` → `||` → comparisons → `IS [NOT] NULL` / `[NOT] IN` / `[NOT] BETWEEN` → `AND` → `OR`.
+Precedence (high → low): unary `+`/`-` → `*`/`/`/`%` → `+`/`-` → `||` → comparisons → `IS [NOT] NULL` / `[NOT] IN` / `[NOT] BETWEEN` → unary `NOT` → `AND` → `OR`.
+
+**`NOT` vs comparisons (locking rule):** prefix `NOT` binds **after** comparisons / `IS` / `IN` / `BETWEEN` (H2 / common SQL), so `NOT a = b` parses as `NOT (a = b)`, not `(NOT a) = b`. Parenthesize when boolean-negating a bare column before comparing: `(NOT a) = b`. Nested `NOT NOT …` is allowed. `NOT` in `IS NOT NULL` / `NOT IN` / `NOT BETWEEN` is part of those postfix forms, not this unary operator.
 
 Still deferred: full `LIKE` semantics, `CASE`, bitwise ops, subqueries as expressions.
 

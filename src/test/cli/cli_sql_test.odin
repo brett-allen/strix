@@ -178,6 +178,35 @@ test_run_sql_select_prints_result_set :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_run_sql_prints_all_select_results :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-cli-multi-sel-%d.strix", os.get_pid())
+	defer os.remove(path)
+	testing.expect_value(t, cli.init_database(path), 0)
+
+	r, w, perr := os.pipe()
+	testing.expect(t, perr == nil)
+	old_stdout := os.stdout
+	os.stdout = w
+	code := cli.run_sql(
+		path,
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);" +
+		"INSERT INTO t (name) VALUES ('alpha'), ('beta');" +
+		"SELECT name FROM t WHERE id = 1;" +
+		"SELECT name FROM t WHERE id = 2;",
+	)
+	os.close(w)
+	os.stdout = old_stdout
+	data, rerr := os.read_entire_file_from_file(r, context.allocator)
+	os.close(r)
+	testing.expect(t, rerr == nil)
+	out := string(data)
+	defer delete(out)
+	testing.expect_value(t, code, 0)
+	testing.expect(t, strings.contains(out, "alpha"))
+	testing.expect(t, strings.contains(out, "beta"))
+}
+
+@(test)
 test_run_sql_create_insert_survives_reopen :: proc(t: ^testing.T) {
 	path := fmt.tprintf("/tmp/strix-e2-cli-insert-%d.strix", os.get_pid())
 	defer os.remove(path)

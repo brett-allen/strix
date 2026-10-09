@@ -199,6 +199,30 @@ test_expr_precedence_not_and :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_expr_not_binds_after_comparison :: proc(t: ^testing.T) {
+	// Dialect locking rule (H2 / common SQL): NOT a = b → NOT (a = b), not (NOT a) = b.
+	expr, err := sql.parse_expr("NOT a = b")
+	defer free_expr(expr)
+	defer sql.free_error(err)
+	testing.expect(t, !sql.has_error(err))
+	testing.expect_value(t, expr.kind, sql.Expr_Kind.Unary)
+	testing.expect_value(t, expr.data.(sql.Unary_Data).op, sql.Unary_Op.Not)
+	inner := expr.data.(sql.Unary_Data).expr
+	testing.expect_value(t, inner.kind, sql.Expr_Kind.Binary)
+	testing.expect_value(t, inner.data.(sql.Binary_Data).op, sql.Binary_Op.Eq)
+
+	paren, err2 := sql.parse_expr("(NOT a) = b")
+	defer free_expr(paren)
+	defer sql.free_error(err2)
+	testing.expect(t, !sql.has_error(err2))
+	testing.expect_value(t, paren.kind, sql.Expr_Kind.Binary)
+	testing.expect_value(t, paren.data.(sql.Binary_Data).op, sql.Binary_Op.Eq)
+	left := paren.data.(sql.Binary_Data).left
+	testing.expect_value(t, left.kind, sql.Expr_Kind.Unary)
+	testing.expect_value(t, left.data.(sql.Unary_Data).op, sql.Unary_Op.Not)
+}
+
+@(test)
 test_expr_concat_and_unary :: proc(t: ^testing.T) {
 	expr, err := sql.parse_expr("'a' || 'b' || 'c'")
 	defer free_expr(expr)

@@ -48,16 +48,18 @@ alloc_page :: proc(p: ^Pager) -> (page_no: dbfile.Page_No, err: Page_Error) {
 		if nerr != .None {
 			return 0, nerr
 		}
-		// Reject self-loop / out-of-range / cyclic remainder (M3).
+		// Reject self-loop / out-of-range next link (chain integrity validated at open).
 		if next == page_no {
 			return 0, .Io
 		}
 		if next != 0 && u32(next) >= p.page_count {
 			return 0, .Io // corrupt freelist
 		}
-		if verr := freelist_validate_chain(p, next); verr != .None {
-			return 0, verr
+		// Membership set must stay consistent with the chain head.
+		if !(page_no in p.free_pages) {
+			return 0, .Io
 		}
+		delete_key(&p.free_pages, page_no)
 		p.freelist_head = next
 		slice.zero(data)
 		return page_no, .None
@@ -100,11 +102,7 @@ free_page :: proc(p: ^Pager, page_no: dbfile.Page_No) -> Page_Error {
 		}
 	}
 
-	on_list, cerr := freelist_contains(p, page_no)
-	if cerr != .None {
-		return cerr
-	}
-	if on_list {
+	if page_no in p.free_pages {
 		return .Already_Free
 	}
 
@@ -119,12 +117,15 @@ free_page :: proc(p: ^Pager, page_no: dbfile.Page_No) -> Page_Error {
 		return err
 	}
 	p.freelist_head = page_no
+	p.free_pages[page_no] = true
 	return .None
 }
 
-// freelist_validate_chain walks from start with a step bound; rejects cycles / OOR.
-freelist_validate_chain :: proc(p: ^Pager, start: dbfile.Page_No) -> Page_Error {
-	cur := start
+// freelist_rebuild_set walks the chain from freelist_head into free_pages.
+// Validates cycle / OOR once (open, discard). O(n) in freelist length.
+freelist_rebuild_set :: proc(p: ^Pager) -> Page_Error {
+	clear(&p.free_pages)
+	cur := p.freelist_head
 	steps := 0
 	limit := int(p.page_count) + 1
 	for cur != 0 {
@@ -134,6 +135,9 @@ freelist_validate_chain :: proc(p: ^Pager, start: dbfile.Page_No) -> Page_Error 
 		}
 		if u32(cur) >= p.page_count {
 			return .Io
+		}
+		if cur in p.free_pages {
+			return .Io // cycle
 		}
 		next, nerr := peek_freelist_next(p, cur)
 		if nerr != .None {
@@ -145,37 +149,18 @@ freelist_validate_chain :: proc(p: ^Pager, start: dbfile.Page_No) -> Page_Error 
 		if next != 0 && u32(next) >= p.page_count {
 			return .Io
 		}
+		p.free_pages[cur] = true
 		cur = next
 	}
 	return .None
 }
 
-// freelist_contains walks the in-memory freelist chain (cache, else disk).
+// freelist_contains reports membership via the in-memory set (O(1)).
 freelist_contains :: proc(p: ^Pager, page_no: dbfile.Page_No) -> (found: bool, err: Page_Error) {
-	cur := p.freelist_head
-	steps := 0
-	limit := int(p.page_count) + 1
-	for cur != 0 {
-		if cur == page_no {
-			return true, .None
-		}
-		steps += 1
-		if steps > limit {
-			return false, .Io // cycle / corrupt freelist
-		}
-		next, nerr := peek_freelist_next(p, cur)
-		if nerr != .None {
-			return false, nerr
-		}
-		if next == cur {
-			return false, .Io
-		}
-		if next != 0 && u32(next) >= p.page_count {
-			return false, .Io
-		}
-		cur = next
+	if e := require_open(p); e != .None {
+		return false, e
 	}
-	return false, .None
+	return page_no in p.free_pages, .None
 }
 
 // peek_freelist_next reads next_free without permanently changing pin state.

@@ -33,6 +33,10 @@ Pager :: struct {
 	freelist_head:            dbfile.Page_No,
 	committed_page_count:     u32,
 	committed_freelist_head:  dbfile.Page_No,
+	// free_pages: in-memory membership set for O(1) double-free checks.
+	// Rebuilt from the on-disk/cache chain at open and after discard_dirty;
+	// kept in sync on alloc_page / free_page. On-disk format unchanged.
+	free_pages:               map[dbfile.Page_No]bool,
 	frames:                   []Frame,
 	page_index:               map[dbfile.Page_No]int, // page_no → frame index
 	lru_clock:                u64,

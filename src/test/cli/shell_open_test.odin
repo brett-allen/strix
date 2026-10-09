@@ -157,7 +157,8 @@ test_shell_clean_eof_exits_0 :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_shell_open_usage_rejects_extra_args :: proc(t: ^testing.T) {
+test_shell_open_path_with_spaces_keeps_session_on_miss :: proc(t: ^testing.T) {
+	// Remainder of line is one path (spaces allowed). Missing path keeps prior session.
 	path := fmt.tprintf("/tmp/strix-c4-open-usage-%d.strix", os.get_pid())
 	defer os.remove(path)
 	testing.expect_value(t, cli.init_database(path), 0)
@@ -172,6 +173,10 @@ test_shell_open_usage_rejects_extra_args :: proc(t: ^testing.T) {
 	testing.expect(t, !cli.meta_dispatch(&s, cli.meta_parse(".open a b")))
 	testing.expect_value(t, s.db_path, prev)
 	testing.expect(t, !s.quit)
+
+	// Quoted path with spaces also parses (still missing → keep session).
+	testing.expect(t, !cli.meta_dispatch(&s, cli.meta_parse(`.open "no such dir/db.strix"`)))
+	testing.expect_value(t, s.db_path, prev)
 }
 
 @(test)
