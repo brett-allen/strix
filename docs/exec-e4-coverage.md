@@ -27,8 +27,8 @@
 | `exec_update` | yes | update where/all/expr; reopen; negatives | SET exprs; multi-col; 0-row WHERE |
 | `table_indexes_maintained` (E5; legacy Has_Indexes) | yes | `test_update_delete_reject_when_indexes_lack_columns` | Has_Indexes for legacy indexes without column metadata |
 | `bind_update_assignments` | yes | unknown column; happy UPDATE; case-fold SET | Unknown_Column; bound idxs |
-| `validate_mutate_where` | yes | WHERE unknown col; CAST reject (via SET) | dry-run WHERE |
-| `validate_update_set_exprs` | yes | `test_update_unsupported_set_expr` | CAST → Unsupported_Ast |
+| `validate_mutate_where` | yes | WHERE unknown col | dry-run WHERE |
+| `validate_update_set_exprs` | yes | `test_update_unsupported_set_expr` | function call in SET → Unsupported_Ast (CAST executed in S2) |
 | `collect_matching_rowids` | yes | DELETE WHERE / DELETE ALL | keep/filter; rowid decode |
 | `collect_update_rewrites` | yes | UPDATE paths; NOT NULL | SET apply; Constraint; encode |
 | `free_pending_rewrite_payloads` / `free_pending_rewrites` | no | defer-only | — |
@@ -63,7 +63,7 @@
 | Unknown table / column codes | yes |
 | IPK SET rejected | yes |
 | NOT NULL SET → Constraint + rollback | yes |
-| Unsupported SET expr (CAST) | yes |
+| Unsupported SET expr (function call; CAST is S2) | yes |
 | Closed session | yes |
 | CLI UPDATE/DELETE exit 0 + durable read-back | yes |
 | E1–E3 still green | yes — full `./build.sh test` |

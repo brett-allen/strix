@@ -29,7 +29,7 @@ Already landed (do not re-implement):
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `CAST`, `JOIN`, `GROUP BY`/`HAVING`, aggregates-as-calls, UNIQUE/PK constraints — many reject at bind/exec |
 | `src/exec` | E1–E6 | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); rejects TEXT/composite PK |
-| Expression eval | E3 + **S1** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; `CAST` → `Unsupported_Ast` until S2 |
+| Expression eval | E3 + **S1** + **S2** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2) |
 | Catalog / rows | v2 tables, heap codec | `columns[]` + `next_rowid`; btree key = internal rowid |
 | CLI / shell | `strix sql` / `strix shell` | Batch + REPL; `.dot` meta-commands are **not** SQL |
 
@@ -204,12 +204,12 @@ User-visible: predicates stop lying; type mismatches fail clearly.
 
 ### Phase S2 — Scalar `CAST`
 
-- [ ] Execute `CAST(expr AS type)` for a documented type-name set (minimum: `INTEGER`/`INT`, `REAL`/`FLOAT`/`DOUBLE`, `TEXT`/`VARCHAR`, `BLOB`; UUID-as-TEXT acceptable until a native UUID type exists)
-- [ ] Invalid casts → clear error (not NULL-by-affinity)
-- [ ] Use `CAST` in projection, `WHERE`, `SET` (same eval path)
-- [ ] Dialect + execute notes list supported cast pairs
-- [ ] Tests: happy paths + reject matrix; interaction with S1 compare rules
-- [ ] Coverage inventory: [`sql-compliance-s2-coverage.md`](sql-compliance-s2-coverage.md) ≥80%
+- [x] Execute `CAST(expr AS type)` for a documented type-name set (minimum: `INTEGER`/`INT`, `REAL`/`FLOAT`/`DOUBLE`, `TEXT`/`VARCHAR`, `BLOB`; UUID-as-TEXT acceptable until a native UUID type exists)
+- [x] Invalid casts → clear error (not NULL-by-affinity)
+- [x] Use `CAST` in projection, `WHERE`, `SET` (same eval path)
+- [x] Dialect + execute notes list supported cast pairs
+- [x] Tests: happy paths + reject matrix; interaction with S1 compare rules
+- [x] Coverage inventory: [`sql-compliance-s2-coverage.md`](sql-compliance-s2-coverage.md) ≥80%
 
 **Exit:** Users can convert explicitly; no ambient affinity required for demos.
 
@@ -323,5 +323,6 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. ~~Land this plan + dialect/execute framing (S0)~~ — this PR/branch docs work.
 2. Confirm open Q defaults with PM (especially **IPK = A**).
-3. Implement **S1** (boolean + compare hygiene) with `sql-compliance-s1-coverage.md`.
-4. Then **S2** (`CAST`) → **S3** (UNIQUE + TEXT PK) as the first user-facing compliance arc.
+3. ~~Implement **S1** (boolean + compare hygiene) with `sql-compliance-s1-coverage.md`.~~
+4. ~~Implement **S2** (`CAST`) with `sql-compliance-s2-coverage.md`.~~
+5. Next: **S3** (UNIQUE + TEXT PK) as the first user-facing constraint arc.

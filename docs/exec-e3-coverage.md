@@ -43,7 +43,7 @@
 |--------|---------|--------------|------------------|
 | `exec_select` | yes | all select_* tests | scan; filter; project; sort; limit/offset; empty |
 | `validate_select_supported` | yes | DISTINCT/JOIN/GROUP BY negatives | Unsupported_Ast each |
-| `validate_select_exprs` | yes | Unknown_Column WHERE; CAST/BETWEEN | dry-run unbound/unsupported |
+| `validate_select_exprs` | yes | Unknown_Column WHERE; BETWEEN | dry-run unbound/unsupported |
 | `bind_select_projection` | yes | `*`; columns; `p.*`; expr alias | Star; Table_Star; Column; Expr |
 | `table_star_matches` | yes | `SELECT p.*` | alias match |
 | `resolve_proj_column` | yes | named cols; Unknown_Column | 1/2 seg; unknown |
@@ -76,7 +76,8 @@
 | ORDER BY / LIMIT / OFFSET | yes |
 | ORDER BY incompatible kinds → error | yes |
 | Reject DISTINCT / JOIN / GROUP BY → `Unsupported_Ast` | yes |
-| Reject CAST / BETWEEN / Call / Placeholder → `Unsupported_Ast` | yes |
+| Reject BETWEEN / Call / Placeholder → `Unsupported_Ast` | yes |
+| CAST → executed (S2; was `Unsupported_Ast` in E3) | yes — see [`sql-compliance-s2-coverage.md`](sql-compliance-s2-coverage.md) |
 | Unknown table / column codes | yes |
 | Identifier case-fold bind | yes |
 | create/insert/select reopen round-trip | yes |
@@ -93,7 +94,7 @@
 |------|------|
 | `Unknown_Table` | FROM missing table; bad `t.*` qualifier |
 | `Unknown_Column` | projection / WHERE / ORDER BY unbound name or bad qualifier |
-| `Unsupported_Ast` | DISTINCT, JOIN, GROUP BY/HAVING, CAST, BETWEEN, calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare |
+| `Unsupported_Ast` | DISTINCT, JOIN, GROUP BY/HAVING, BETWEEN, calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare; **(S2)** invalid/`CAST` target errors (CAST itself is executed) |
 | `Closed` | SELECT on closed session |
 | `Engine` | decode / cursor failures during scan |
 

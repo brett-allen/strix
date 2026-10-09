@@ -319,9 +319,10 @@ For `WHERE` / `SET` / projections (mainly E3–E4):
 - Eval AST `Expr` against a **row environment** (column name/index → `Value`).
 - Support parser Phase 1 exprs that are meaningful on scalars: literals, column refs, comparisons, `AND`/`OR`/`NOT`, arithmetic, `IS NULL`, `IN` list (see [`sql-parser.md`](sql-parser.md) Phase 1).
 - **Integer–Integer** comparisons use exact `i64` ordering (not `f64`); mixed integer/float still coerces via `f64`.
-- Fail clearly on unbound names, type conflicts, or unsupported nodes (`CAST` optional early; `BETWEEN` optional).
+- Fail clearly on unbound names, type conflicts, or unsupported nodes (`BETWEEN` optional; aggregates/joins later).
+- **S2:** scalar `CAST(expr AS type)` is executed — supported pairs and Text→INTEGER rules live in [`sql-dialect.md`](sql-dialect.md) § Scalar CAST and [`sql-compliance.md`](sql-compliance.md) Phase S2. Invalid casts error (not NULL-by-affinity).
 
-Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union.
+Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union; conversion is explicit via `CAST`.
 
 ---
 

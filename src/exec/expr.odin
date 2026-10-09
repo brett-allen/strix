@@ -1,6 +1,8 @@
 package exec
 
 import "core:fmt"
+import "core:math"
+import "core:strconv"
 import "core:strings"
 import engine "../engine"
 import sql "../sql"
@@ -43,9 +45,272 @@ eval_expr :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator
 	case .Between:
 		return {}, make_error(.Unsupported_Ast, "BETWEEN is not supported yet", span = expr.span)
 	case .Cast:
-		return {}, make_error(.Unsupported_Ast, "CAST is not supported yet", span = expr.span)
+		return eval_cast(expr.data.(sql.Cast_Data), expr.span, env, allocator)
 	}
 	return {}, make_error(.Unsupported_Ast, "unsupported expression", span = expr.span)
+}
+
+// eval_cast implements CAST(expr AS type) (S2). NULL → NULL. Invalid casts error
+// (never NULL-by-affinity). Target types: INTEGER/INT, REAL/FLOAT/DOUBLE,
+// TEXT/VARCHAR/…/UUID, BLOB — see cast_target_kind / sql-dialect.md.
+eval_cast :: proc(
+	d: sql.Cast_Data,
+	span: sql.Span,
+	env: ^Row_Env,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	target, ok := cast_target_kind(d.type_name)
+	if !ok {
+		return {}, make_error(
+			.Unsupported_Ast,
+			"unsupported CAST target type %q",
+			d.type_name,
+			span = span,
+		)
+	}
+	inner, err := eval_expr(d.expr, env, allocator)
+	if has_error(err) {
+		return {}, err
+	}
+	if value_is_null(inner) {
+		return value_null(), ok_error()
+	}
+	defer free_value(inner, allocator)
+	return cast_value(inner, target, d.type_name, span, allocator)
+}
+
+// cast_target_kind maps CAST AS type names (same families as declared_storage_kind).
+cast_target_kind :: proc(type_name: string) -> (kind: Value_Kind, ok: bool) {
+	k, enforced := declared_storage_kind(type_name)
+	return k, enforced
+}
+
+// cast_value converts a non-NULL value to target. Caller retains ownership of `v`
+// (may free after); returned Value is newly owned when Text/Blob.
+cast_value :: proc(
+	v: Value,
+	target: Value_Kind,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	if v.kind == target {
+		return clone_value(v, allocator), ok_error()
+	}
+	switch target {
+	case .Integer:
+		return cast_to_integer(v, type_name, span)
+	case .Float:
+		return cast_to_float(v, type_name, span)
+	case .Text:
+		return cast_to_text(v, type_name, span, allocator)
+	case .Blob:
+		return cast_to_blob(v, type_name, span, allocator)
+	case .Null:
+		return {}, make_error(.Unsupported_Ast, "invalid CAST target", span = span)
+	}
+	return {}, make_error(.Unsupported_Ast, "unsupported CAST target", span = span)
+}
+
+cast_to_integer :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Integer:
+		return value_integer(v.i), ok_error()
+	case .Float:
+		f := v.f
+		if math.is_nan(f) || math.is_inf(f) {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST non-finite REAL to %s",
+				type_name,
+				span = span,
+			)
+		}
+		if f > f64(max(i64)) || f < f64(min(i64)) {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST REAL %g to %s: out of INTEGER range",
+				f,
+				type_name,
+				span = span,
+			)
+		}
+		// Truncate toward zero (H2-ish / common SQL CAST).
+		return value_integer(i64(f)), ok_error()
+	case .Text:
+		n, status := parse_cast_integer_text(string(v.bytes))
+		switch status {
+		case .Ok:
+			return value_integer(n), ok_error()
+		case .Out_Of_Range:
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: out of INTEGER range",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		case .Bad_Format:
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: expected optional sign and decimal digits only",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+	case .Blob, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_float :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Float:
+		return value_float(v.f), ok_error()
+	case .Integer:
+		return value_float(f64(v.i)), ok_error()
+	case .Text:
+		s := strings.trim_space(string(v.bytes))
+		if s == "" {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: empty text",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		f, ok := strconv.parse_f64(s)
+		if !ok {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: invalid REAL text",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		return value_float(f), ok_error()
+	case .Blob, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_text :: proc(
+	v: Value,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Text:
+		return clone_value(v, allocator), ok_error()
+	case .Integer:
+		s := fmt.aprintf("%d", v.i, allocator = allocator)
+		return Value{kind = .Text, bytes = transmute([]u8)s}, ok_error()
+	case .Float:
+		s := fmt.aprintf("%g", v.f, allocator = allocator)
+		return Value{kind = .Text, bytes = transmute([]u8)s}, ok_error()
+	case .Blob:
+		// Interpret blob bytes as UTF-8 text (no hex encoding).
+		return value_text(string(v.bytes), allocator), ok_error()
+	case .Null:
+		return {}, make_error(.Unsupported_Ast, "cannot CAST NULL (handled upstream)", span = span)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_blob :: proc(
+	v: Value,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Blob:
+		return clone_value(v, allocator), ok_error()
+	case .Text:
+		return value_blob(v.bytes, allocator), ok_error()
+	case .Integer, .Float, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s; cast to TEXT first if needed",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+Cast_Int_Parse :: enum {
+	Ok,
+	Bad_Format,
+	Out_Of_Range,
+}
+
+// parse_cast_integer_text accepts optional surrounding whitespace, optional +/-,
+// then decimal digits only (no hex prefixes, underscores, or fractional part).
+// Digits that do not fit in i64 → Out_Of_Range (no silent wrap).
+parse_cast_integer_text :: proc(s: string) -> (i64, Cast_Int_Parse) {
+	t := strings.trim_space(s)
+	if t == "" {
+		return 0, .Bad_Format
+	}
+	neg := false
+	i := 0
+	if t[0] == '+' || t[0] == '-' {
+		if len(t) == 1 {
+			return 0, .Bad_Format
+		}
+		neg = t[0] == '-'
+		i = 1
+	}
+	// Accumulate magnitude in u64 so min(i64) (-2^63) is representable.
+	max_mag := u64(max(i64)) // 2^63-1
+	if neg {
+		max_mag += 1 // 2^63
+	}
+	mag: u64 = 0
+	saw_digit := false
+	for j in i ..< len(t) {
+		c := t[j]
+		if c < '0' || c > '9' {
+			return 0, .Bad_Format
+		}
+		saw_digit = true
+		d := u64(c - '0')
+		if mag > (max_mag - d) / 10 {
+			return 0, .Out_Of_Range
+		}
+		mag = mag * 10 + d
+	}
+	if !saw_digit {
+		return 0, .Bad_Format
+	}
+	if neg {
+		if mag == u64(max(i64)) + 1 {
+			return min(i64), .Ok
+		}
+		return -i64(mag), .Ok
+	}
+	return i64(mag), .Ok
 }
 
 // eval_expr_bool evaluates expr and returns whether it is TRUE (WHERE keep-row).
@@ -363,7 +628,7 @@ eval_compare :: proc(op: sql.Binary_Op, left, right: Value, span: sql.Span) -> (
 //   - Integer–Integer: exact i64
 //   - Mixed int/float: allow via f64
 //   - Same-kind Text/Blob: byte/lex compare
-//   - Text/Blob ↔ numeric (or other kind mismatch): Unsupported_Ast (use CAST later)
+//   - Text/Blob ↔ numeric (or other kind mismatch): Unsupported_Ast (use CAST)
 compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Error) {
 	if left.kind == .Null && right.kind == .Null {
 		return 0, ok_error()

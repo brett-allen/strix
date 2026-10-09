@@ -282,12 +282,7 @@ test_select_negatives_codes :: proc(t: ^testing.T) {
 	exec.free_error(e6)
 	exec.free_result(r6)
 
-	r7, e7 := exec.exec_statement(&s, "SELECT CAST(score AS TEXT) FROM people;")
-	testing.expect(t, exec.has_error(e7))
-	testing.expect_value(t, e7.code, exec.Exec_Error_Code.Unsupported_Ast)
-	exec.free_error(e7)
-	exec.free_result(r7)
-
+	// CAST is executed (S2); still reject BETWEEN.
 	r8, e8 := exec.exec_statement(&s, "SELECT name FROM people WHERE score BETWEEN 1 AND 9;")
 	testing.expect(t, exec.has_error(e8))
 	testing.expect_value(t, e8.code, exec.Exec_Error_Code.Unsupported_Ast)

@@ -11,8 +11,9 @@
 --   .read examples/comprehensive.sql
 --
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
--- "Executed vs parsed only"). Intentionally omits JOINs, GROUP BY, DISTINCT,
--- CHECK/FK, ALTER, INSERT…SELECT, OR REPLACE/IGNORE, composite/non-INT PKs.
+-- "Executed vs parsed only"). Includes S2 CAST. Intentionally omits JOINs,
+-- GROUP BY, DISTINCT, CHECK/FK, ALTER, INSERT…SELECT, OR REPLACE/IGNORE,
+-- composite/non-INT PKs.
 
 -- ---------------------------------------------------------------------------
 -- Clean slate (idempotent-ish: drop children before parents)
@@ -148,10 +149,18 @@ SELECT id, tag || '-paid' AS label, qty * 10 AS scaled
 
 SELECT * FROM scratch ORDER BY id;
 
+-- Scalar CAST (S2): projection, WHERE, SET — no affinity; Text↔numeric needs CAST
+SELECT id, CAST(price AS TEXT) AS price_text, CAST(price AS INTEGER) AS price_int
+  FROM products
+ ORDER BY id;
+
+SELECT id, name FROM products WHERE CAST(CAST(price AS INTEGER) AS TEXT) = '19';
+
 -- ---------------------------------------------------------------------------
 -- UPDATE / DELETE (index-maintained)
 -- ---------------------------------------------------------------------------
 UPDATE products SET price = price + 0.01, note = 'touched' WHERE id = 10;
+UPDATE products SET note = CAST(id AS TEXT) WHERE id = 30;
 UPDATE orders SET paid = 1, qty = qty + 1 WHERE tag = 'wholesale';
 UPDATE customers SET active = 0 WHERE email = 'dave@example.com';
 

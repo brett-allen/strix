@@ -66,7 +66,9 @@ declared_storage_kind :: proc(type_name: string) -> (kind: Value_Kind, enforced:
 	   strings.equal_fold(base, "CHAR") ||
 	   strings.equal_fold(base, "CHARACTER") ||
 	   strings.equal_fold(base, "CLOB") ||
-	   strings.equal_fold(base, "NVARCHAR") {
+	   strings.equal_fold(base, "NVARCHAR") ||
+	   strings.equal_fold(base, "UUID") {
+		// UUID is TEXT until a native UUID type exists (S2 / sql-compliance).
 		return .Text, true
 	}
 	if strings.equal_fold(base, "BLOB") {
