@@ -20,6 +20,7 @@ Engine_Error :: enum {
 	Too_Large,
 	Corrupt,
 	Flush_Failed,
+	Torn_Flush,
 	Unbound_Root,
 	Paging,
 	Db,
@@ -51,6 +52,7 @@ error_string :: proc(err: Engine_Error) -> string {
 	case .Too_Large:         return "key or payload too large for page"
 	case .Corrupt:           return "corrupt btree page"
 	case .Flush_Failed:      return "partial flush failed; recovery flush required — retry COMMIT (close refused)"
+	case .Torn_Flush:        return "incomplete flush (torn commit); database refused"
 	case .Unbound_Root:      return "btree root split without root ownership bind"
 	case .Paging:            return "paging error"
 	case .Db:                return "database error"
@@ -77,6 +79,8 @@ from_page_error :: proc(err: paging.Page_Error) -> Engine_Error {
 		return .Already_Free
 	case .Flush_Failed:
 		return .Flush_Failed
+	case .Torn_Flush:
+		return .Torn_Flush
 	case .Db:
 		return .Db
 	}

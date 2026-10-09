@@ -226,6 +226,52 @@ test_open_create_rejects_existing :: proc(t: ^testing.T) {
 	testing.expect_value(t, err2, dbfile.Db_Error.Exist)
 }
 
+@(test)
+test_open_rejects_flush_in_progress_fence :: proc(t: ^testing.T) {
+	path := test_temp_path("strix-dbfile-torn-flush.strix")
+	defer os.remove(path)
+
+	{
+		f, err := dbfile.open_create(path)
+		testing.expect(t, dbfile.ok(err))
+		defer dbfile.close(&f)
+
+		page := make([]u8, f.page_size)
+		defer delete(page)
+		page[0] = 0xAB
+		testing.expect(t, dbfile.ok(dbfile.write_page(&f, 1, page)))
+		boot, berr := dbfile.read_bootstrap(&f)
+		testing.expect(t, dbfile.ok(berr))
+		boot.page_count = f.page_count
+		testing.expect(t, dbfile.ok(dbfile.write_bootstrap(&f, boot)))
+		testing.expect(t, dbfile.ok(dbfile.sync(&f)))
+
+		// Simulate crash after fence was set mid-flush.
+		testing.expect(t, dbfile.ok(dbfile.mark_flush_in_progress(&f)))
+	}
+
+	_, err := dbfile.open_existing(path)
+	testing.expect_value(t, err, dbfile.Db_Error.Torn_Flush)
+}
+
+@(test)
+test_page_size_max_32768_accepted_65536_rejected :: proc(t: ^testing.T) {
+	f, err := dbfile.open_memory({page_size = 32768})
+	testing.expectf(t, dbfile.ok(err), "32768: %v", err)
+	testing.expect_value(t, f.page_size, u32(32768))
+	dbfile.close(&f)
+
+	_, err2 := dbfile.open_memory({page_size = 65536})
+	testing.expect_value(t, err2, dbfile.Db_Error.Bad_Page_Size)
+
+	path := test_temp_path("strix-dbfile-pagesz.strix")
+	defer os.remove(path)
+	f3, err3 := dbfile.open_create(path, {page_size = 32768})
+	testing.expect(t, dbfile.ok(err3))
+	testing.expect_value(t, f3.page_size, u32(32768))
+	dbfile.close(&f3)
+}
+
 test_temp_path :: proc(name: string) -> string {
 	return fmt.tprintf("/tmp/%s", name)
 }

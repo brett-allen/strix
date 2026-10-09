@@ -165,22 +165,25 @@ exec_update :: proc(s: ^Exec_Session, stmt: sql.Update_Stmt, span: sql.Span) -> 
 	}
 	defer free_pending_rewrites(pending)
 
-	for item in pending {
-		if len(idx_refs) > 0 {
+	// Set-oriented unique index maintenance: delete all old keys for the update
+	// set first, then insert all new keys. Per-row delete→insert false-fails on
+	// key swaps (e.g. UPDATE SET id = 3 - id with unique ids 1,2).
+	if len(idx_refs) > 0 {
+		for item in pending {
 			old_vals, derr := decode_heap_row(item.old_payload)
 			if has_error(derr) {
 				return {}, finish_write_error(s, e, started, derr, span)
 			}
-			new_vals, nerr := decode_heap_row(item.payload)
-			if has_error(nerr) {
-				free_values(old_vals)
-				return {}, finish_write_error(s, e, started, nerr, span)
-			}
 			merr := index_delete_for_row(e, idx_refs, entry.columns, old_vals, item.rowid, span)
 			free_values(old_vals)
 			if has_error(merr) {
-				free_values(new_vals)
 				return {}, finish_write_error(s, e, started, merr, span)
+			}
+		}
+		for item in pending {
+			new_vals, nerr := decode_heap_row(item.payload)
+			if has_error(nerr) {
+				return {}, finish_write_error(s, e, started, nerr, span)
 			}
 			merr2 := index_insert_for_row(e, idx_refs, entry.columns, new_vals, item.rowid, span)
 			free_values(new_vals)
@@ -188,6 +191,8 @@ exec_update :: proc(s: ^Exec_Session, stmt: sql.Update_Stmt, span: sql.Span) -> 
 				return {}, finish_write_error(s, e, started, merr2, span)
 			}
 		}
+	}
+	for item in pending {
 		rerr := engine.table_rewrite_row(&tree, item.rowid, item.payload)
 		if rerr != .None {
 			return {}, finish_write_error(s, e, started, from_engine_error(rerr, span), span)

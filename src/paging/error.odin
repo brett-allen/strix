@@ -13,6 +13,7 @@ Page_Error :: enum {
 	Not_Pinned,
 	Already_Free,
 	Flush_Failed,
+	Torn_Flush,
 	Db,
 }
 
@@ -36,6 +37,7 @@ error_string :: proc(err: Page_Error) -> string {
 	case .Not_Pinned:        return "page is not pinned"
 	case .Already_Free:      return "page is already on the freelist"
 	case .Flush_Failed:      return "partial flush failed; close/discard refused until flush succeeds"
+	case .Torn_Flush:        return "incomplete flush (torn commit); database refused"
 	case .Db:                return "database file error"
 	}
 	return "unknown paging error"
@@ -54,6 +56,8 @@ from_db_error :: proc(err: dbfile.Db_Error) -> Page_Error {
 		return .Page_Out_Of_Range
 	case .Io, .Short_Read, .Short_Write:
 		return .Io
+	case .Torn_Flush:
+		return .Torn_Flush
 	}
 	return .Db
 }

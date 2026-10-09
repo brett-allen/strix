@@ -389,10 +389,8 @@ print_expr :: proc(expr: ^Expr, allocator := context.allocator) -> string {
 		data := expr.data.(Column_Ref_Data)
 		return join_segments(data.segments, allocator)
 	case .Placeholder:
+		// Always print ?N (including ?0) so print/reparse preserves indices.
 		idx := expr.data.(Placeholder_Data).index
-		if idx == 0 {
-			return strings.clone("?", allocator)
-		}
 		return fmt.aprintf("?%d", idx, allocator = allocator)
 	case .Star:
 		return strings.clone("*", allocator)

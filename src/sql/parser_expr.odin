@@ -382,10 +382,20 @@ parse_primary_expr :: proc(p: ^Parser) -> (^Expr, Parse_Error) {
 		return make_literal(p, .Boolean, tok.text, tok.span), ok_error()
 	case .Question:
 		next(p)
+		idx, iok := assign_placeholder_index(p, tok.text)
+		if !iok {
+			return nil, make_error(
+				tok.span,
+				"placeholder index out of range (max %d): %s",
+				MAX_PLACEHOLDER_INDEX,
+				tok.text,
+				code = .Invalid_Number,
+			)
+		}
 		node := new(Expr, p.allocator)
 		node.kind = .Placeholder
 		node.span = tok.span
-		node.data = Placeholder_Data{index = assign_placeholder_index(p, tok.text)}
+		node.data = Placeholder_Data{index = idx}
 		return node, ok_error()
 	case .Star:
 		next(p)

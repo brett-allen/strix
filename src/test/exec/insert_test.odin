@@ -2,6 +2,7 @@ package exec_tests
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 import engine "../../engine"
 import exec "../../exec"
@@ -478,4 +479,30 @@ test_insert_blob_literal_x_hex :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(vals[1].bytes), 2)
 	testing.expect_value(t, vals[1].bytes[0], u8(0xAB))
 	testing.expect_value(t, vals[1].bytes[1], u8(0xCD))
+}
+
+@(test)
+test_ipk_autoalloc_rejects_past_max_i64 :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_statement(&s, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT);")
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	// Explicit max(i64) bumps next_rowid past the auto-alloc ceiling.
+	r1, e1 := exec.exec_statement(&s, "INSERT INTO t VALUES (9223372036854775807, 1);")
+	testing.expectf(t, !exec.has_error(e1), "%s", e1.message)
+	exec.free_error(e1)
+	exec.free_result(r1)
+
+	r2, e2 := exec.exec_statement(&s, "INSERT INTO t (n) VALUES (2);")
+	testing.expect(t, exec.has_error(e2))
+	testing.expect_value(t, e2.code, exec.Exec_Error_Code.Constraint)
+	testing.expect(t, strings.contains(e2.message, "max i64") || strings.contains(e2.message, "exhausted"))
+	exec.free_error(e2)
+	exec.free_result(r2)
 }

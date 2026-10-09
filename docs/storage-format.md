@@ -1,7 +1,7 @@
 # Strix Storage Format
 
-**Version:** 0.4.6  
-**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1); heap row payload (E2); index catalog payload **v2** + index key tags (E5); Unique flag on index/table columns (SQL-compliance S3)  
+**Version:** 0.4.7  
+**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1); heap row payload (E2); index catalog payload **v2** + index key tags (E5); Unique flag on index/table columns (SQL-compliance S3); max page size 32768; flush-in-progress reopen refuse  
 **Companion:** [`storage-engine.md`](storage-engine.md), [`btrees.md`](btrees.md), [`sql-execute.md`](sql-execute.md)
 
 Strix uses a **native** single-file, page-oriented format. It is **not** SQLite-compatible.
@@ -16,7 +16,7 @@ Strix uses a **native** single-file, page-oriented format. It is **not** SQLite-
 | Page numbering | **0-based** |
 | Page 0 | Bootstrap meta page (not a B+tree leaf) |
 | Default page size | **4096** bytes |
-| Page size | Power of two in `[512, 65536]`; **frozen at create** |
+| Page size | Power of two in `[512, 32768]`; **frozen at create** (65536 rejected — `u16` cell pointers cannot address a full 64KiB page) |
 | Durability files (v1) | Single DB file only (no `-wal` / `-journal`) |
 
 ---
@@ -37,7 +37,8 @@ The first **40** bytes of page 0 are the bootstrap header. The remainder of page
 | 28 | 4 | u32 | `schema_cookie` | Catalog change counter; bumped in-txn on register; persisted on commit; restored on rollback |
 | 32 | 4 | u32 | `table_prime_root` | `Page_No` of current `table_prime` root; `0` = unset; must be `< page_count` if non-zero |
 | 36 | 4 | u32 | `checksum` | CRC-32 of bytes `[0..36)` (checksum field not included in input) |
-| 40 | `page_size - 40` | bytes | `reserved` | Must be zero through v0.2 |
+| 40 | 4 | u32 | `flush_in_progress` | `0` = idle; `0x5358464C` (“LFXS” LE) while a commit flush has begun overwriting data pages. Cleared by successful `write_bootstrap`. Non-zero / magic on open → `.Torn_Flush` (refuse). Not covered by bootstrap CRC. |
+| 44 | `page_size - 44` | bytes | `reserved` | Must be zero when idle |
 
 ### Magic
 
@@ -58,9 +59,10 @@ ASCII:   S  t  r  i  x  D  B \0
 ### Open validation
 
 1. Read at least the 40-byte header from offset 0.
-2. Verify magic, `format_version == 1`, `reserved0 == 0`, valid power-of-two `page_size`, `page_count >= 1`.
+2. Verify magic, `format_version == 1`, `reserved0 == 0`, valid power-of-two `page_size` in `[512, 32768]`, `page_count >= 1`.
 3. Verify checksum.
 4. Require file byte length `>= page_count * page_size`.
+5. If bytes `[40..44)` hold the flush-in-progress magic → **refuse open** (`.Torn_Flush`). The prior commit may still be intact on some pages, but v1 has no rollback journal to restore them; fail-closed avoids silently serving a torn file.
 
 ### Page count contract (S1)
 
@@ -322,13 +324,14 @@ On open, `freelist_head` and `table_prime_root` must be `0` or strictly less tha
 
 ## Commit write order (enforced by `paging.flush`)
 
-1. Write dirty **data pages** (`page_no >= 1`) in ascending `page_no` order.
-2. Write **page 0** last (updated `page_count`, `freelist_head`, caller meta, checksum).
-3. `dbfile.sync()` (`fsync`) once.
+1. If any dirty data pages: set page-0 **`flush_in_progress`** magic at offset 40 and `sync` (durable fence before in-place overwrites).
+2. Write dirty **data pages** (`page_no >= 1`) in ascending `page_no` order.
+3. Write **page 0** last (updated `page_count`, `freelist_head`, caller meta, checksum; **clears** `flush_in_progress`).
+4. `dbfile.sync()` (`fsync`) once.
 
-Crash during a multi-page flush may leave a torn file in v1 (no WAL yet).
+Crash during a multi-page flush may leave a torn file in v1 (no WAL / rollback journal). **Honesty:** reopen of a file that still has the flush-in-progress magic is **refused** (`.Torn_Flush`) rather than serving mixed old/new pages. There is no automatic restore of the prior commit; recovery is external (restore from backup) until WAL lands. Probe: `dbfile.open_existing` / `engine_open` → `.Torn_Flush`.
 
-If flush fails after writing one or more data pages, the pager sets a **`flush_failed` fence**: `discard_dirty` / `txn_rollback` / `pager_close` return `.Flush_Failed` until a subsequent flush succeeds (v1 recovery: retry flush / `COMMIT` / `txn_commit` **on the still-open session**; no WAL). Auto-commit flush failure promotes the session to `explicit_txn` so SQL can retry `COMMIT` (see [`sql-execute.md`](sql-execute.md)).
+If flush fails after the fence is set (or after writing one or more data pages), the pager sets an in-session **`flush_failed` fence**: `discard_dirty` / `txn_rollback` / `pager_close` return `.Flush_Failed` until a subsequent flush succeeds (v1 recovery: retry flush / `COMMIT` / `txn_commit` **on the still-open session**; no WAL). Auto-commit flush failure promotes the session to `explicit_txn` so SQL can retry `COMMIT` (see [`sql-execute.md`](sql-execute.md)).
 
 `engine_close` / `session_close` / `shell_state_destroy` must **refuse to close** while the fence is live — they return `.Flush_Failed` and leave the pager, dirty frames, and file handle intact so recovery `COMMIT` can retry. They must never `pager_close` over a live fence (that would destroy the only recovery state). There is no default “surface then close” path.
 
@@ -362,3 +365,4 @@ Rollback (no durability, and only when not fenced): `paging.discard_dirty` drops
 | 0.4.4 | 2026-10-03 | Heap row payload v1; optional column `Has_Default` trailer on catalog v2 |
 | 0.4.5 | 2026-10-03 | Index catalog payload v2 (`columns[]` + DESC flag); index key byte tags (E5) |
 | 0.4.6 | 2026-10-10 | Heap/index tags for Boolean (5) and Uuid (16-byte, tag 6); catalog DEFAULT Boolean/Uuid (F3) |
+| 0.4.7 | 2026-10-10 | Max page size 32768; page-0 `flush_in_progress` fence (refuse torn reopen) |

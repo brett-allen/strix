@@ -661,5 +661,93 @@ test_multi_column_table_unique :: proc(t: ^testing.T) {
 	testing.expectf(t, !exec.has_error(serr), "%s", serr.message)
 	defer exec.free_error(serr)
 	defer delete(text)
-	testing.expect(t, strings.contains(text, "CREATE UNIQUE INDEX strix_autoindex_t_1 ON t (a, b);"))
+	testing.expect(t, strings.contains(text, "UNIQUE (a, b)"))
+	testing.expect(t, !strings.contains(text, "strix_autoindex_"))
+	testing.expect(t, !strings.contains(text, "CREATE UNIQUE INDEX"))
+}
+
+@(test)
+test_drop_index_rejects_system_autoindex :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_script(
+		&s,
+		"CREATE TABLE t (id TEXT PRIMARY KEY, n INT);" +
+		"INSERT INTO t VALUES ('a', 1), ('b', 2);",
+	)
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	idx, ierr := engine.catalog_get_index_entry(&e, "strix_autoindex_t_1")
+	testing.expect(t, engine.ok(ierr))
+	engine.free_catalog_entry(idx)
+
+	rd, ed := exec.exec_statement(&s, "DROP INDEX strix_autoindex_t_1;")
+	testing.expect(t, exec.has_error(ed))
+	testing.expect_value(t, ed.code, exec.Exec_Error_Code.Invalid_Schema)
+	testing.expect(t, strings.contains(ed.message, "reserved") || strings.contains(ed.message, "strix_autoindex_"))
+	exec.free_error(ed)
+	exec.free_result(rd)
+
+	// Case-insensitive reserve; IF EXISTS must not dismantle uniqueness either.
+	rd2, ed2 := exec.exec_statement(&s, "DROP INDEX IF EXISTS STRIX_AUTOINDEX_t_1;")
+	testing.expect(t, exec.has_error(ed2))
+	testing.expect_value(t, ed2.code, exec.Exec_Error_Code.Invalid_Schema)
+	exec.free_error(ed2)
+	exec.free_result(rd2)
+
+	still, gerr := engine.catalog_get_index_entry(&e, "strix_autoindex_t_1")
+	testing.expect(t, engine.ok(gerr))
+	engine.free_catalog_entry(still)
+
+	rdup, edup := exec.exec_statement(&s, "INSERT INTO t VALUES ('a', 99);")
+	testing.expect(t, exec.has_error(edup))
+	testing.expect_value(t, edup.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(edup)
+	exec.free_result(rdup)
+}
+
+@(test)
+test_update_unique_key_swap_set_oriented :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r0, e0 := exec.exec_script(
+		&s,
+		"CREATE TABLE s (id INT UNIQUE, label TEXT);" +
+		"INSERT INTO s VALUES (1, 'a'), (2, 'b');",
+	)
+	testing.expectf(t, !exec.has_error(e0), "%s", e0.message)
+	exec.free_error(e0)
+	exec.free_result(r0)
+
+	// Multi-row key swap must succeed (set-oriented unique maintenance).
+	rs, es := exec.exec_statement(&s, "UPDATE s SET id = 3 - id;")
+	testing.expectf(t, !exec.has_error(es), "%s", es.message)
+	testing.expect_value(t, rs.rows_affected, 2)
+	exec.free_error(es)
+	exec.free_result(rs)
+
+	r1, e1 := exec.exec_statement(&s, "SELECT id, label FROM s ORDER BY label;")
+	testing.expectf(t, !exec.has_error(e1), "%s", e1.message)
+	testing.expect_value(t, len(r1.rows), 2)
+	testing.expect_value(t, r1.rows[0][0], "2")
+	testing.expect_value(t, r1.rows[0][1], "a")
+	testing.expect_value(t, r1.rows[1][0], "1")
+	testing.expect_value(t, r1.rows[1][1], "b")
+	exec.free_error(e1)
+	exec.free_result(r1)
+
+	// True duplicate UPDATE still Constraint.
+	rdup, edup := exec.exec_statement(&s, "UPDATE s SET id = 1;")
+	testing.expect(t, exec.has_error(edup))
+	testing.expect_value(t, edup.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(edup)
+	exec.free_result(rdup)
 }

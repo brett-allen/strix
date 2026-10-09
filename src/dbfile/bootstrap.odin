@@ -167,3 +167,37 @@ default_bootstrap :: proc(page_size: u32) -> Bootstrap {
 		checksum         = 0,
 	}
 }
+
+flush_in_progress_set :: proc(marker_le: []u8) -> bool {
+	if len(marker_le) < 4 {
+		return false
+	}
+	v, ok := endian.get_u32(marker_le[0:4], .Little)
+	return ok && v == FLUSH_IN_PROGRESS_MAGIC
+}
+
+// mark_flush_in_progress sets the durable flush fence in page-0 reserved bytes
+// and syncs. Call before in-place dirty data page overwrites.
+mark_flush_in_progress :: proc(f: ^Db_File) -> Db_Error {
+	if err := require_open(f); err != .None {
+		return err
+	}
+	if f.page_size < FLUSH_IN_PROGRESS_OFFSET + 4 {
+		return .Invalid_Argument
+	}
+	buf := make([]u8, f.page_size)
+	defer delete(buf)
+	if err := read_page(f, 0, buf); err != .None {
+		return err
+	}
+	if _, derr := decode_bootstrap(buf, true); derr != .None {
+		return derr
+	}
+	if !endian.put_u32(buf[FLUSH_IN_PROGRESS_OFFSET:FLUSH_IN_PROGRESS_OFFSET + 4], .Little, FLUSH_IN_PROGRESS_MAGIC) {
+		return .Invalid_Argument
+	}
+	if err := f.vfs.write_at(&f.vfs, 0, buf); err != .None {
+		return err
+	}
+	return sync(f)
+}

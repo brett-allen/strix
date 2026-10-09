@@ -14,6 +14,7 @@ Db_Error :: enum {
 	Closed,
 	Exist,
 	Not_Exist,
+	Torn_Flush, // page-0 flush-in-progress fence set; refuse open
 }
 
 ok :: proc(err: Db_Error) -> bool {
@@ -39,6 +40,7 @@ error_string :: proc(err: Db_Error) -> string {
 	case .Closed:           return "database file is closed"
 	case .Exist:            return "file already exists"
 	case .Not_Exist:        return "file does not exist"
+	case .Torn_Flush:       return "incomplete flush (torn commit); database refused"
 	}
 	return "unknown dbfile error"
 }

@@ -11,9 +11,17 @@ DEFAULT_PAGE_SIZE :: u32(4096)
 BOOTSTRAP_HEADER_SIZE :: 40
 BOOTSTRAP_CHECKSUM_LEN :: 36 // bytes [0..36) hashed with checksum field zeroed
 
+// Durable flush fence in page-0 reserved area (not covered by bootstrap CRC).
+// Set + synced before in-place dirty data writes; cleared by successful write_bootstrap.
+// Non-zero / magic on open → refuse (torn commit possible). See storage-format.md.
+FLUSH_IN_PROGRESS_OFFSET :: 40
+FLUSH_IN_PROGRESS_MAGIC :: u32(0x5358464C) // "LFXS" LE — Strix flush fence
+
 // Minimum / maximum allowed page sizes (power-of-two, frozen at create).
+// Cap is 32768: u16 cell_area / cell pointers cannot encode a 65536-byte page
+// (u16(65536)==0), so 64KiB pages break btree packing.
 MIN_PAGE_SIZE :: u32(512)
-MAX_PAGE_SIZE :: u32(65536)
+MAX_PAGE_SIZE :: u32(32768)
 
 Page_No :: u32 // 0 = bootstrap page
 

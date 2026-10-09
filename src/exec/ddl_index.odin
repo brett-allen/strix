@@ -196,6 +196,15 @@ exec_drop_index :: proc(s: ^Exec_Session, stmt: sql.Drop_Index_Stmt, span: sql.S
 	if stmt.name == "" {
 		return {}, make_error(.Invalid_Schema, "DROP INDEX requires an index name", span = span)
 	}
+	if is_system_autoindex_name(stmt.name) {
+		return {}, make_error(
+			.Invalid_Schema,
+			"cannot DROP INDEX %q: reserved system autoindex (prefix %s)",
+			stmt.name,
+			SYSTEM_AUTOINDEX_PREFIX,
+			span = span,
+		)
+	}
 
 	started, btxn := stmt_write_begin(s, e, span)
 	if has_error(btxn) {

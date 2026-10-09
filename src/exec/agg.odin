@@ -10,7 +10,7 @@ import sql "../sql"
 // Whole-query empty input: one row (COUNT→0; SUM/AVG/MIN/MAX→NULL).
 // GROUP BY empty input: zero result rows (no groups).
 
-// i64_add_checked returns (sum, overflowed). Fail-closed for SUM(i64).
+// i64_add_checked returns (sum, overflowed). Fail-closed for SUM(i64) and scalar +.
 i64_add_checked :: proc(a, b: i64) -> (i64, bool) {
 	if b > 0 && a > max(i64) - b {
 		return 0, true
@@ -19,6 +19,37 @@ i64_add_checked :: proc(a, b: i64) -> (i64, bool) {
 		return 0, true
 	}
 	return a + b, false
+}
+
+i64_sub_checked :: proc(a, b: i64) -> (i64, bool) {
+	if b > 0 && a < min(i64) + b {
+		return 0, true
+	}
+	if b < 0 && a > max(i64) + b {
+		return 0, true
+	}
+	return a - b, false
+}
+
+i64_mul_checked :: proc(a, b: i64) -> (i64, bool) {
+	if a == 0 || b == 0 {
+		return 0, false
+	}
+	if (a == -1 && b == min(i64)) || (b == -1 && a == min(i64)) {
+		return 0, true
+	}
+	res := a * b
+	if res / a != b {
+		return 0, true
+	}
+	return res, false
+}
+
+i64_neg_checked :: proc(a: i64) -> (i64, bool) {
+	if a == min(i64) {
+		return 0, true
+	}
+	return -a, false
 }
 
 Agg_Fn :: enum {
