@@ -28,8 +28,8 @@ Uncovered (1): `cli.print_usage` — help text only; not part of the DDL execute
 | `format_error` | error.odin | yes | `test_format_error_with_and_without_span` | no span; `line:col:`; empty ok |
 | `ok_result` | result.odin | yes | `test_ok_result_and_free_result` | kind=Ok |
 | `free_result` | result.odin | yes | `test_ok_result_and_free_result` | empty Ok; owned Result_Set columns/rows |
-| `column_from_def` | ddl.odin | yes | `test_column_from_def_pk_not_null`, bind constraint tests | PK+NOT NULL; UNIQUE/DEFAULT/CHECK/REFERENCES → Unsupported_Ast |
-| `bind_create_table_columns` | ddl.odin | yes | `test_bind_rejects_empty_columns`, duplicate/PK/constraint tests | empty; duplicate names; table PK; unknown PK col; unsupported table constraints |
+| `column_from_def` | ddl.odin | yes | `test_column_from_def_pk_not_null`, bind constraint tests | PK+NOT NULL; UNIQUE accepted (S3); DEFAULT/CHECK/REFERENCES → Unsupported_Ast (CHECK/REFERENCES still) |
+| `bind_create_table_columns` | ddl.odin | yes | `test_bind_rejects_empty_columns`, duplicate/PK/constraint tests | empty; duplicate names; table PK; unknown PK col; UNIQUE accepted (S3); CHECK/FK table constraints → Unsupported_Ast |
 | `exec_create_table` | ddl.odin | yes | create/IF NOT EXISTS/closed AST tests | happy; Table_Exists; IF NOT EXISTS; closed session |
 | `exec_drop_table` | ddl.odin | yes | drop/IF EXISTS/indexes/closed AST tests | happy; Unknown_Table; IF EXISTS; Has_Indexes (table remains); closed |
 | `exec_script` | exec.odin | yes | multi-stmt, stop-on-error, parse, closed | multi CREATE/DROP; stop on Table_Exists; Parse; Closed |
@@ -78,8 +78,8 @@ Uncovered (1): `cli.print_usage` — help text only; not part of the DDL execute
 | CREATE IF NOT EXISTS | yes — Ok, schema unchanged |
 | CREATE duplicate → Table_Exists | yes |
 | CREATE empty columns | yes — `Invalid_Schema` via `bind_create_table_columns` |
-| Unsupported column constraints | yes — UNIQUE/DEFAULT/CHECK/REFERENCES |
-| Unsupported table constraints | yes — UNIQUE/CHECK/FK |
+| Unsupported column constraints | yes — CHECK/REFERENCES (UNIQUE/DEFAULT literal supported post-E1/S3) |
+| Unsupported table constraints | yes — CHECK/FK (UNIQUE supported in S3) |
 | Duplicate column names | yes — `Invalid_Schema` |
 | Table PRIMARY KEY unknown col | yes — `Invalid_Schema` |
 | Table PRIMARY KEY applies flag | yes — `VARCHAR(32)` preserved |

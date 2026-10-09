@@ -87,32 +87,37 @@ test_select_where_filter_and_exprs :: proc(t: ^testing.T) {
 	exec.free_error(e3)
 	exec.free_result(r3)
 
-	// Non-NULL Text is TRUE in boolean context (SQLite-shaped).
-	r4, e4 := exec.exec_statement(&s, "SELECT name FROM people WHERE name;")
+	// Integer boolean context: 1 = true, 0 = false.
+	r4, e4 := exec.exec_statement(&s, "SELECT name FROM people WHERE 1;")
 	testing.expectf(t, !exec.has_error(e4), "%s", e4.message)
-	testing.expect_value(t, len(r4.rows), 3)
-	testing.expect_value(t, r4.rows[0][0], "alice")
-	testing.expect_value(t, r4.rows[1][0], "bob")
-	testing.expect_value(t, r4.rows[2][0], "cara")
+	testing.expect_value(t, len(r4.rows), 4)
 	exec.free_error(e4)
 	exec.free_result(r4)
 
-	// NOT name: non-NULL → FALSE; NULL → unknown; WHERE keeps only TRUE → 0 rows.
-	r5, e5 := exec.exec_statement(&s, "SELECT name FROM people WHERE NOT name;")
+	r5, e5 := exec.exec_statement(&s, "SELECT name FROM people WHERE 0;")
 	testing.expectf(t, !exec.has_error(e5), "%s", e5.message)
 	testing.expect_value(t, len(r5.rows), 0)
 	exec.free_error(e5)
 	exec.free_result(r5)
 
-	// 0 OR name: same truthiness as bare name.
-	r6, e6 := exec.exec_statement(&s, "SELECT name FROM people WHERE 0 OR name;")
-	testing.expectf(t, !exec.has_error(e6), "%s", e6.message)
-	testing.expect_value(t, len(r6.rows), 3)
-	testing.expect_value(t, r6.rows[0][0], "alice")
-	testing.expect_value(t, r6.rows[1][0], "bob")
-	testing.expect_value(t, r6.rows[2][0], "cara")
+	// S1: Text/Blob in boolean context → Unsupported_Ast (no SQLite truthiness).
+	r6, e6 := exec.exec_statement(&s, "SELECT name FROM people WHERE name;")
+	testing.expect(t, exec.has_error(e6))
+	testing.expect_value(t, e6.code, exec.Exec_Error_Code.Unsupported_Ast)
 	exec.free_error(e6)
 	exec.free_result(r6)
+
+	r7, e7 := exec.exec_statement(&s, "SELECT name FROM people WHERE NOT name;")
+	testing.expect(t, exec.has_error(e7))
+	testing.expect_value(t, e7.code, exec.Exec_Error_Code.Unsupported_Ast)
+	exec.free_error(e7)
+	exec.free_result(r7)
+
+	r8, e8 := exec.exec_statement(&s, "SELECT name FROM people WHERE 0 OR name;")
+	testing.expect(t, exec.has_error(e8))
+	testing.expect_value(t, e8.code, exec.Exec_Error_Code.Unsupported_Ast)
+	exec.free_error(e8)
+	exec.free_result(r8)
 }
 
 @(test)
@@ -262,27 +267,24 @@ test_select_negatives_codes :: proc(t: ^testing.T) {
 	exec.free_error(e4)
 	exec.free_result(r4)
 
+	// INNER JOIN is executed (S6); LEFT OUTER still rejected.
 	r5, e5 := exec.exec_statement(
 		&s,
-		"SELECT * FROM people JOIN people AS q ON people.id = q.id;",
+		"SELECT * FROM people LEFT JOIN people AS q ON people.id = q.id;",
 	)
 	testing.expect(t, exec.has_error(e5))
 	testing.expect_value(t, e5.code, exec.Exec_Error_Code.Unsupported_Ast)
 	exec.free_error(e5)
 	exec.free_result(r5)
 
-	r6, e6 := exec.exec_statement(&s, "SELECT name FROM people GROUP BY name;")
+	// GROUP BY is executed (S5); keep a still-unsupported form in this reject suite.
+	r6, e6 := exec.exec_statement(&s, "SELECT DISTINCT name FROM people;")
 	testing.expect(t, exec.has_error(e6))
 	testing.expect_value(t, e6.code, exec.Exec_Error_Code.Unsupported_Ast)
 	exec.free_error(e6)
 	exec.free_result(r6)
 
-	r7, e7 := exec.exec_statement(&s, "SELECT CAST(score AS TEXT) FROM people;")
-	testing.expect(t, exec.has_error(e7))
-	testing.expect_value(t, e7.code, exec.Exec_Error_Code.Unsupported_Ast)
-	exec.free_error(e7)
-	exec.free_result(r7)
-
+	// CAST is executed (S2); still reject BETWEEN.
 	r8, e8 := exec.exec_statement(&s, "SELECT name FROM people WHERE score BETWEEN 1 AND 9;")
 	testing.expect(t, exec.has_error(e8))
 	testing.expect_value(t, e8.code, exec.Exec_Error_Code.Unsupported_Ast)

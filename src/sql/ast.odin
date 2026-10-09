@@ -115,6 +115,7 @@ Create_Index_Stmt :: struct {
 	name:          string,
 	table_name:    string,
 	if_not_exists: bool,
+	unique:        bool,
 	columns:       []Index_Column,
 }
 

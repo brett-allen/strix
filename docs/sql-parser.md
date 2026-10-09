@@ -250,7 +250,7 @@ Early engine work can stub a hand-built AST, but **DDL/DML support for real SQL 
 
 ## Open questions
 
-1. **Type names:** free-form SQLite affinity strings vs a fixed enum plus `Custom` — lean free-form with normalized affinity later.
+1. **Type names:** free-form declared type strings (no SQLite affinity); execute recognizes a fixed family set for INSERT/UPDATE kind checks — see [`sql-dialect.md`](sql-dialect.md).
 2. **Script vs REPL:** prioritize `parse_script` for files, or single-statement for a CLI first?
 3. **AST stability:** allow breaking AST changes until Phase 4 ends; then document and treat as semi-stable.
 4. **Test package layout:** single `src/test` package vs `src/test/sql` package — choose when the first fixtures land.

@@ -88,12 +88,22 @@ parse_create_statement :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Err
 	#partial switch peek(p).kind {
 	case .Kw_Table:
 		return parse_create_table(p, start)
+	case .Kw_Unique:
+		next(p) // UNIQUE
+		if peek(p).kind != .Kw_Index {
+			return Statement{}, make_error(
+				peek(p).span,
+				"expected INDEX after CREATE UNIQUE",
+				allocator = p.allocator,
+			)
+		}
+		return parse_create_index(p, start, unique = true)
 	case .Kw_Index:
-		return parse_create_index(p, start)
+		return parse_create_index(p, start, unique = false)
 	case:
 		return Statement{}, make_error(
 			peek(p).span,
-			"expected TABLE or INDEX after CREATE",
+			"expected TABLE, INDEX, or UNIQUE INDEX after CREATE",
 			allocator = p.allocator,
 		)
 	}
@@ -769,7 +779,7 @@ parse_object_name :: proc(p: ^Parser) -> (string, Span, Parse_Error) {
 	return name, span, ok_error()
 }
 
-parse_create_index :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Error) {
+parse_create_index :: proc(p: ^Parser, start: Span, unique := false) -> (Statement, Parse_Error) {
 	next(p) // INDEX
 	if_not_exists := false
 	if peek(p).kind == .Kw_If {
@@ -822,6 +832,7 @@ parse_create_index :: proc(p: ^Parser, start: Span) -> (Statement, Parse_Error) 
 			name          = idx_name,
 			table_name    = table_name,
 			if_not_exists = if_not_exists,
+			unique        = unique,
 			columns       = cols,
 		},
 	}, ok_error()

@@ -21,6 +21,7 @@ Catalog_Column_Flag :: enum u8 {
 	Primary_Key = 1,
 	Has_Default = 2,
 	Desc        = 3, // index column DESC (catalog only; key bytes are ASC for v1)
+	Unique      = 4, // table column UNIQUE; also marks unique secondary indexes (S3)
 }
 
 // Catalog_Default_Kind mirrors heap / SQL literal kinds for persisted DEFAULT values.
@@ -143,10 +144,13 @@ encode_catalog_row :: proc(
 			copy(buf[off:], transmute([]u8)c.name)
 			off += len(c.name)
 			flags := c.flags
-			// Persist DESC only for index columns.
+			// Index column flags: bit0 = DESC, bit1 = Unique (index-level uniqueness).
 			flag_byte: u8 = 0
 			if .Desc in flags {
-				flag_byte = 1
+				flag_byte |= 1
+			}
+			if .Unique in flags {
+				flag_byte |= 2
 			}
 			buf[off] = flag_byte
 			off += 1
@@ -292,6 +296,9 @@ decode_catalog_row :: proc(payload: []u8, allocator := context.allocator) -> (Ca
 			flags: bit_set[Catalog_Column_Flag; u8]
 			if (flag_byte & 1) != 0 {
 				flags += {.Desc}
+			}
+			if (flag_byte & 2) != 0 {
+				flags += {.Unique}
 			}
 			cols[i] = Catalog_Column{name = name, flags = flags}
 		}
@@ -583,13 +590,28 @@ catalog_register_table :: proc(
 	return root, .None
 }
 
+// catalog_index_is_unique reports whether an index entry was registered as UNIQUE.
+catalog_index_is_unique :: proc(entry: Catalog_Entry) -> bool {
+	if entry.kind != .Index {
+		return false
+	}
+	for c in entry.columns {
+		if .Unique in c.flags {
+			return true
+		}
+	}
+	return false
+}
+
 // catalog_register_index allocates a secondary index btree and records parent table.
 // When `columns` is non-empty, writes index catalog payload v2 (column list for maintenance).
 // Empty/nil columns writes legacy v1 (no column list — UPDATE/DELETE cannot maintain).
+// When `unique` is true, marks index columns with the Unique flag (enforced by exec).
 catalog_register_index :: proc(
 	e: ^Engine,
 	index_name, table_name: string,
 	columns: []Catalog_Column = nil,
+	unique := false,
 ) -> (root: dbfile.Page_No, err: Engine_Error) {
 	if err = require_txn(e); err != .None {
 		return 0, err
@@ -632,12 +654,26 @@ catalog_register_index :: proc(
 	if len(columns) > 0 {
 		version = CATALOG_ROW_VERSION_V2
 	}
+	// Apply Unique onto a scratch copy so callers' slices are unchanged.
+	idx_cols := columns
+	owned_cols: []Catalog_Column
+	if unique && len(columns) > 0 {
+		owned_cols = make([]Catalog_Column, len(columns))
+		for c, i in columns {
+			owned_cols[i] = c
+			owned_cols[i].flags += {.Unique}
+		}
+		idx_cols = owned_cols
+	}
+	defer if owned_cols != nil {
+		delete(owned_cols)
+	}
 	payload := encode_catalog_row({
 		version      = version,
 		kind         = .Index,
 		root         = root,
 		parent_table = table_name,
-		columns      = columns,
+		columns      = idx_cols,
 	})
 	defer delete(payload)
 	if err = btree_insert(&prime, ikey, payload); err != .None {

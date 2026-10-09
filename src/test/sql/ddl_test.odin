@@ -99,10 +99,27 @@ test_create_index :: proc(t: ^testing.T) {
 	testing.expect(t, !sql.has_error(err))
 	ci := stmt.data.(sql.Create_Index_Stmt)
 	testing.expect_value(t, ci.if_not_exists, true)
+	testing.expect_value(t, ci.unique, false)
 	testing.expect_value(t, ci.table_name, "users")
 	testing.expect_value(t, len(ci.columns), 2)
 	testing.expect_value(t, ci.columns[0].desc, true)
 	testing.expect_value(t, ci.columns[1].desc, false)
+}
+
+@(test)
+test_create_unique_index_parse :: proc(t: ^testing.T) {
+	src := "CREATE UNIQUE INDEX IF NOT EXISTS idx ON users (email)"
+	stmt, err := sql.parse_statement(src)
+	defer sql.free_error(err)
+	defer sql.free_statement(stmt)
+	testing.expect(t, !sql.has_error(err))
+	ci := stmt.data.(sql.Create_Index_Stmt)
+	testing.expect_value(t, ci.unique, true)
+	testing.expect_value(t, ci.if_not_exists, true)
+	testing.expect_value(t, ci.name, "idx")
+	dump := sql.print_statement(stmt)
+	defer delete(dump)
+	testing.expect(t, strings.contains(dump, "CREATE UNIQUE INDEX"))
 }
 
 @(test)

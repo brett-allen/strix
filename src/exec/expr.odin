@@ -1,17 +1,31 @@
 package exec
 
 import "core:fmt"
+import "core:math"
+import "core:strconv"
 import "core:strings"
 import engine "../engine"
 import sql "../sql"
 
+// Join_Side describes one FROM/JOIN input in a multi-table Row_Env.
+// Column indices in env.columns / env.values are [offset, offset+ncols).
+Join_Side :: struct {
+	table:  string, // catalog table name
+	alias:  string, // optional correlation name (may be "")
+	offset: int,
+	ncols:  int,
+}
+
 // Row_Env binds table/alias + column names to the current decoded row values.
 // Used by SELECT WHERE/projection/ORDER BY and UPDATE/DELETE SET/WHERE.
+// When sides is non-empty, columns/values are the flattened join row and
+// column resolution uses multi-table rules (qualified names + ambiguity).
 Row_Env :: struct {
-	table:   string, // catalog table name
+	table:   string, // catalog table name (single-table)
 	alias:   string, // optional FROM alias (may be "")
 	columns: []engine.Catalog_Column,
 	values:  []Value,
+	sides:   []Join_Side, // nil/empty → single-table mode
 }
 
 // eval_expr evaluates an AST expression against a row environment.
@@ -43,19 +57,288 @@ eval_expr :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator
 	case .Between:
 		return {}, make_error(.Unsupported_Ast, "BETWEEN is not supported yet", span = expr.span)
 	case .Cast:
-		return {}, make_error(.Unsupported_Ast, "CAST is not supported yet", span = expr.span)
+		return eval_cast(expr.data.(sql.Cast_Data), expr.span, env, allocator)
 	}
 	return {}, make_error(.Unsupported_Ast, "unsupported expression", span = expr.span)
 }
 
+// eval_cast implements CAST(expr AS type) (S2). NULL → NULL. Invalid casts error
+// (never NULL-by-affinity). Target types: INTEGER/INT, REAL/FLOAT/DOUBLE,
+// TEXT/VARCHAR/…/UUID, BLOB — see cast_target_kind / sql-dialect.md.
+eval_cast :: proc(
+	d: sql.Cast_Data,
+	span: sql.Span,
+	env: ^Row_Env,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	target, ok := cast_target_kind(d.type_name)
+	if !ok {
+		return {}, make_error(
+			.Unsupported_Ast,
+			"unsupported CAST target type %q",
+			d.type_name,
+			span = span,
+		)
+	}
+	inner, err := eval_expr(d.expr, env, allocator)
+	if has_error(err) {
+		return {}, err
+	}
+	if value_is_null(inner) {
+		return value_null(), ok_error()
+	}
+	defer free_value(inner, allocator)
+	return cast_value(inner, target, d.type_name, span, allocator)
+}
+
+// cast_target_kind maps CAST AS type names (same families as declared_storage_kind).
+cast_target_kind :: proc(type_name: string) -> (kind: Value_Kind, ok: bool) {
+	k, enforced := declared_storage_kind(type_name)
+	return k, enforced
+}
+
+// cast_value converts a non-NULL value to target. Caller retains ownership of `v`
+// (may free after); returned Value is newly owned when Text/Blob.
+cast_value :: proc(
+	v: Value,
+	target: Value_Kind,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	if v.kind == target {
+		return clone_value(v, allocator), ok_error()
+	}
+	switch target {
+	case .Integer:
+		return cast_to_integer(v, type_name, span)
+	case .Float:
+		return cast_to_float(v, type_name, span)
+	case .Text:
+		return cast_to_text(v, type_name, span, allocator)
+	case .Blob:
+		return cast_to_blob(v, type_name, span, allocator)
+	case .Null:
+		return {}, make_error(.Unsupported_Ast, "invalid CAST target", span = span)
+	}
+	return {}, make_error(.Unsupported_Ast, "unsupported CAST target", span = span)
+}
+
+cast_to_integer :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Integer:
+		return value_integer(v.i), ok_error()
+	case .Float:
+		f := v.f
+		if math.is_nan(f) || math.is_inf(f) {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST non-finite REAL to %s",
+				type_name,
+				span = span,
+			)
+		}
+		if f > f64(max(i64)) || f < f64(min(i64)) {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST REAL %g to %s: out of INTEGER range",
+				f,
+				type_name,
+				span = span,
+			)
+		}
+		// Truncate toward zero (H2-ish / common SQL CAST).
+		return value_integer(i64(f)), ok_error()
+	case .Text:
+		n, status := parse_cast_integer_text(string(v.bytes))
+		switch status {
+		case .Ok:
+			return value_integer(n), ok_error()
+		case .Out_Of_Range:
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: out of INTEGER range",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		case .Bad_Format:
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: expected optional sign and decimal digits only",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+	case .Blob, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_float :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Float:
+		return value_float(v.f), ok_error()
+	case .Integer:
+		return value_float(f64(v.i)), ok_error()
+	case .Text:
+		s := strings.trim_space(string(v.bytes))
+		if s == "" {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: empty text",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		f, ok := strconv.parse_f64(s)
+		if !ok {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: invalid REAL text",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		return value_float(f), ok_error()
+	case .Blob, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_text :: proc(
+	v: Value,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Text:
+		return clone_value(v, allocator), ok_error()
+	case .Integer:
+		s := fmt.aprintf("%d", v.i, allocator = allocator)
+		return Value{kind = .Text, bytes = transmute([]u8)s}, ok_error()
+	case .Float:
+		s := fmt.aprintf("%g", v.f, allocator = allocator)
+		return Value{kind = .Text, bytes = transmute([]u8)s}, ok_error()
+	case .Blob:
+		// Interpret blob bytes as UTF-8 text (no hex encoding).
+		return value_text(string(v.bytes), allocator), ok_error()
+	case .Null:
+		return {}, make_error(.Unsupported_Ast, "cannot CAST NULL (handled upstream)", span = span)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_blob :: proc(
+	v: Value,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Blob:
+		return clone_value(v, allocator), ok_error()
+	case .Text:
+		return value_blob(v.bytes, allocator), ok_error()
+	case .Integer, .Float, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s; cast to TEXT first if needed",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+Cast_Int_Parse :: enum {
+	Ok,
+	Bad_Format,
+	Out_Of_Range,
+}
+
+// parse_cast_integer_text accepts optional surrounding whitespace, optional +/-,
+// then decimal digits only (no hex prefixes, underscores, or fractional part).
+// Digits that do not fit in i64 → Out_Of_Range (no silent wrap).
+parse_cast_integer_text :: proc(s: string) -> (i64, Cast_Int_Parse) {
+	t := strings.trim_space(s)
+	if t == "" {
+		return 0, .Bad_Format
+	}
+	neg := false
+	i := 0
+	if t[0] == '+' || t[0] == '-' {
+		if len(t) == 1 {
+			return 0, .Bad_Format
+		}
+		neg = t[0] == '-'
+		i = 1
+	}
+	// Accumulate magnitude in u64 so min(i64) (-2^63) is representable.
+	max_mag := u64(max(i64)) // 2^63-1
+	if neg {
+		max_mag += 1 // 2^63
+	}
+	mag: u64 = 0
+	saw_digit := false
+	for j in i ..< len(t) {
+		c := t[j]
+		if c < '0' || c > '9' {
+			return 0, .Bad_Format
+		}
+		saw_digit = true
+		d := u64(c - '0')
+		if mag > (max_mag - d) / 10 {
+			return 0, .Out_Of_Range
+		}
+		mag = mag * 10 + d
+	}
+	if !saw_digit {
+		return 0, .Bad_Format
+	}
+	if neg {
+		if mag == u64(max(i64)) + 1 {
+			return min(i64), .Ok
+		}
+		return -i64(mag), .Ok
+	}
+	return i64(mag), .Ok
+}
+
 // eval_expr_bool evaluates expr and returns whether it is TRUE (WHERE keep-row).
-// NULL / FALSE → false. Errors propagate.
+// NULL / FALSE → false. Text/Blob in boolean context → Unsupported_Ast. Errors propagate.
 eval_expr_bool :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator) -> (bool, Exec_Error) {
 	v, err := eval_expr(expr, env, allocator)
 	if has_error(err) {
 		return false, err
 	}
 	defer free_value(v, allocator)
+	if value_is_null(v) {
+		return false, ok_error()
+	}
+	if berr := require_bool_operand(v, expr.span); has_error(berr) {
+		return false, berr
+	}
 	return value_is_true(v), ok_error()
 }
 
@@ -78,16 +361,15 @@ eval_const_integer :: proc(expr: ^sql.Expr, what: string, allocator := context.a
 	return v.i, ok_error()
 }
 
-// SQLite-shaped boolean context: non-zero numbers and any non-NULL Text/Blob
-// are TRUE; zero is FALSE; NULL is neither (unknown).
+// Strict boolean context (S1 / sql-compliance): Integer/Float 0 = false, ≠0 = true;
+// NULL is unknown (neither). Text/Blob must be rejected via require_bool_operand
+// before calling these — they treat non-numeric as neither true nor false.
 value_is_true :: proc(v: Value) -> bool {
 	#partial switch v.kind {
 	case .Integer:
 		return v.i != 0
 	case .Float:
 		return v.f != 0
-	case .Text, .Blob:
-		return true
 	}
 	return false
 }
@@ -98,14 +380,34 @@ value_is_false :: proc(v: Value) -> bool {
 		return v.i == 0
 	case .Float:
 		return v.f == 0
-	case .Text, .Blob:
-		return false
 	}
 	return false
 }
 
 value_is_null :: proc(v: Value) -> bool {
 	return v.kind == .Null
+}
+
+// require_bool_operand rejects Text/Blob (and other non-numeric non-null kinds)
+// in WHERE / AND / OR / NOT. NULL is allowed (three-valued unknown).
+require_bool_operand :: proc(v: Value, span: sql.Span = {}) -> Exec_Error {
+	#partial switch v.kind {
+	case .Null, .Integer, .Float:
+		return ok_error()
+	case .Text, .Blob:
+		return make_error(
+			.Unsupported_Ast,
+			"boolean context requires a numeric value (got %v); use a comparison",
+			v.kind,
+			span = span,
+		)
+	}
+	return make_error(
+		.Unsupported_Ast,
+		"boolean context requires a numeric value (got %v)",
+		v.kind,
+		span = span,
+	)
 }
 
 eval_column_ref :: proc(
@@ -117,17 +419,104 @@ eval_column_ref :: proc(
 	if env == nil || len(env.columns) == 0 {
 		return {}, make_error(.Unknown_Column, "column reference outside of a row context", span = span)
 	}
+	idx, rerr := resolve_column_index(
+		ref,
+		env.columns,
+		env.table,
+		env.alias,
+		span,
+		env.sides,
+	)
+	if has_error(rerr) {
+		return {}, rerr
+	}
+	if idx < 0 || idx >= len(env.values) {
+		return {}, make_error(.Engine, "row value missing resolved column", span = span)
+	}
+	return clone_value(env.values[idx], allocator), ok_error()
+}
+
+// resolve_column_index maps a column ref to a flat index in columns.
+// Multi-table (sides non-empty): unqualified names error if ambiguous;
+// qualified names must match a side table/alias.
+resolve_column_index :: proc(
+	ref: sql.Column_Ref_Data,
+	columns: []engine.Catalog_Column,
+	table_name, alias: string,
+	span: sql.Span,
+	sides: []Join_Side = nil,
+) -> (idx: int, err: Exec_Error) {
 	segs := ref.segments
 	if len(segs) == 0 {
-		return {}, make_error(.Unknown_Column, "empty column reference", span = span)
+		return -1, make_error(.Unknown_Column, "empty column reference", span = span)
 	}
+	if len(sides) > 0 {
+		if len(segs) == 1 {
+			col_name := segs[0]
+			found := -1
+			n_hits := 0
+			for side in sides {
+				for i in 0 ..< side.ncols {
+					cidx := side.offset + i
+					if cidx < 0 || cidx >= len(columns) {
+						continue
+					}
+					if strings.equal_fold(columns[cidx].name, col_name) {
+						n_hits += 1
+						found = cidx
+					}
+				}
+			}
+			if n_hits == 0 {
+				return -1, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+			}
+			if n_hits > 1 {
+				return -1, make_error(.Unknown_Column, "ambiguous column: %q", col_name, span = span)
+			}
+			return found, ok_error()
+		}
+		if len(segs) == 2 {
+			qual := segs[0]
+			col_name := segs[1]
+			side_i := -1
+			for side, si in sides {
+				if side_qualifier_matches(qual, side) {
+					side_i = si
+					break
+				}
+			}
+			if side_i < 0 {
+				return -1, make_error(
+					.Unknown_Column,
+					"no such table/alias %q in FROM",
+					qual,
+					span = span,
+				)
+			}
+			side := sides[side_i]
+			for i in 0 ..< side.ncols {
+				cidx := side.offset + i
+				if cidx >= 0 && cidx < len(columns) && strings.equal_fold(columns[cidx].name, col_name) {
+					return cidx, ok_error()
+				}
+			}
+			return -1, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+		}
+		return -1, make_error(
+			.Unsupported_Ast,
+			"multi-part column references are not supported",
+			span = span,
+		)
+	}
+
+	// Single-table
 	col_name: string
 	if len(segs) == 1 {
 		col_name = segs[0]
 	} else if len(segs) == 2 {
 		qual := segs[0]
-		if !qualifier_matches(qual, env) {
-			return {}, make_error(
+		if !(strings.equal_fold(qual, table_name) || (alias != "" && strings.equal_fold(qual, alias))) {
+			return -1, make_error(
 				.Unknown_Column,
 				"no such table/alias %q in FROM",
 				qual,
@@ -136,19 +525,48 @@ eval_column_ref :: proc(
 		}
 		col_name = segs[1]
 	} else {
-		return {}, make_error(.Unsupported_Ast, "multi-part column references are not supported", span = span)
+		return -1, make_error(
+			.Unsupported_Ast,
+			"multi-part column references are not supported",
+			span = span,
+		)
 	}
-	idx := find_column_index(env.columns, col_name)
+	idx = find_column_index(columns, col_name)
 	if idx < 0 {
-		return {}, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+		return -1, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
 	}
-	if idx >= len(env.values) {
-		return {}, make_error(.Engine, "row value missing column %q", col_name, span = span)
+	return idx, ok_error()
+}
+
+side_qualifier_matches :: proc(qual: string, side: Join_Side) -> bool {
+	if strings.equal_fold(qual, side.table) {
+		return true
 	}
-	return clone_value(env.values[idx], allocator), ok_error()
+	if side.alias != "" && strings.equal_fold(qual, side.alias) {
+		return true
+	}
+	return false
+}
+
+side_exposed_name :: proc(side: Join_Side) -> string {
+	if side.alias != "" {
+		return side.alias
+	}
+	return side.table
 }
 
 qualifier_matches :: proc(qual: string, env: ^Row_Env) -> bool {
+	if env == nil {
+		return false
+	}
+	if len(env.sides) > 0 {
+		for side in env.sides {
+			if side_qualifier_matches(qual, side) {
+				return true
+			}
+		}
+		return false
+	}
 	if strings.equal_fold(qual, env.table) {
 		return true
 	}
@@ -202,6 +620,9 @@ eval_unary :: proc(
 		defer free_value(inner, allocator)
 		if value_is_null(inner) {
 			return value_null(), ok_error()
+		}
+		if berr := require_bool_operand(inner, span); has_error(berr) {
+			return {}, berr
 		}
 		if value_is_true(inner) {
 			return value_integer(0), ok_error()
@@ -257,6 +678,11 @@ eval_logic :: proc(
 	}
 	defer free_value(left, allocator)
 
+	left_span := b.left.span if b.left != nil else span
+	if berr := require_bool_operand(left, left_span); has_error(berr) {
+		return {}, berr
+	}
+
 	if b.op == .And {
 		if value_is_false(left) {
 			return value_integer(0), ok_error()
@@ -272,6 +698,11 @@ eval_logic :: proc(
 		return {}, rerr
 	}
 	defer free_value(right, allocator)
+
+	right_span := b.right.span if b.right != nil else span
+	if berr := require_bool_operand(right, right_span); has_error(berr) {
+		return {}, berr
+	}
 
 	if b.op == .And {
 		if value_is_false(right) {
@@ -321,8 +752,11 @@ eval_compare :: proc(op: sql.Binary_Op, left, right: Value, span: sql.Span) -> (
 }
 
 // compare_values returns -1 / 0 / 1. NULL handling is caller's responsibility.
-// Integer–Integer compares as i64 exactly (not via f64). Mixed integer/float
-// coerces through f64 only when a float operand is involved.
+// Policy (S1 / sql-compliance north star):
+//   - Integer–Integer: exact i64
+//   - Mixed int/float: allow via f64
+//   - Same-kind Text/Blob: byte/lex compare
+//   - Text/Blob ↔ numeric (or other kind mismatch): Unsupported_Ast (use CAST)
 compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Error) {
 	if left.kind == .Null && right.kind == .Null {
 		return 0, ok_error()

@@ -1,10 +1,14 @@
 # E3 Symbol Coverage Inventory
 
+> **Superseded by S1 for boolean / compare truthiness.**  
+> Non-NULL Text/Blob is **not** TRUE in boolean context. S1 rejects Text/Blob in `WHERE` / `AND` / `OR` / `NOT` with `Unsupported_Ast`. See [`sql-compliance-s1-coverage.md`](sql-compliance-s1-coverage.md) and [`sql-dialect.md`](sql-dialect.md) § Boolean context & comparisons.  
+> Rows below that mention Text-as-boolean describe **historical E3 ship behavior** only; the branch matrix and `value_is_*` notes have been rewritten to match **current (S1) reject behavior** so this file does not conflict with S1.
+
 **Phase:** E3 (single-table `SELECT` + expression evaluation + CLI result-set print)  
 **Prior:** [`exec-e2-coverage.md`](exec-e2-coverage.md)  
 **Method:** Manual inventory (no llvm-cov). A symbol counts as covered only if a test asserts a **code and/or durable outcome** on a meaningful branch. Defer-only frees and padding helpers do not count as covered.
 
-**Coverage ratio:** **40 / 44 = 91%** (≥ 80% required)
+**Coverage ratio:** **40 / 44 = 91%** (≥ 80% required) — E3 ship ratio retained; boolean negatives now live under S1 inventory.
 
 ---
 
@@ -13,11 +17,11 @@
 | Symbol | Tested? | Test name(s) | Branches covered |
 |--------|---------|--------------|------------------|
 | `eval_expr` | yes | where/projection/order + negatives | Literal; Column_Ref; Unary; Binary; Is_Null; In_List; reject Call/Between/Cast/Star/Placeholder |
-| `eval_expr_bool` | yes | WHERE filter tests | TRUE keep (incl. Text); FALSE/NULL drop |
+| `eval_expr_bool` | yes | WHERE filter tests; S1 Text/Blob reject | TRUE keep (numeric); FALSE/NULL drop; Text/Blob → `Unsupported_Ast` (S1) |
 | `eval_const_integer` | yes | LIMIT/OFFSET tests | non-neg integer constants |
 | `eval_column_ref` | yes | alias select; Unknown_Column | 1-seg; 2-seg qualifier; unknown → Unknown_Column |
 | `qualifier_matches` / `find_column_index` | yes | alias select; identifier case-fold test | table name + alias; equal_fold |
-| `eval_unary` | yes | `-score`; `NOT (…)` | Minus numeric; NOT |
+| `eval_unary` | yes | `-score`; `NOT (…)` | Minus numeric; NOT (Text → `Unsupported_Ast` under S1) |
 | `eval_binary` / `eval_logic` / `eval_compare` | yes | WHERE AND/OR/comparisons | AND/OR; Eq/NotEq/Lt/…; NULL → NULL |
 | `compare_values` | yes | ORDER BY; IN; incompatible ORDER BY kinds | numeric; text; type mismatch → error |
 | `is_numeric_kind` / `value_as_f64` | yes | score sort; comparisons | int/float coerce |
@@ -28,7 +32,7 @@
 | `eval_is_null` | yes | `IS NULL` / `IS NOT NULL` | negated + plain |
 | `eval_in_list` | yes | `id IN (1, 3)` | match |
 | `format_value_cell` / `format_blob_hex` | yes | cells; `test_select_blob_and_empty_result` | NULL/int/text/blob `X'…'` |
-| `value_is_true` / `value_is_false` / `value_is_null` | yes | WHERE AND short-circuit; `WHERE name` / `NOT name` / `0 OR name`; IS NULL | int/float; non-NULL Text/Blob → TRUE; NULL unknown |
+| `value_is_true` / `value_is_false` / `value_is_null` | yes | WHERE AND short-circuit; S1 boolean negatives; IS NULL | int/float only in bool context; Text/Blob rejected before `value_is_*` (S1); NULL unknown |
 | `clone_value` (E2) | yes | dual `name` projection | text clone independence |
 
 ---
@@ -38,8 +42,8 @@
 | Symbol | Tested? | Test name(s) | Branches covered |
 |--------|---------|--------------|------------------|
 | `exec_select` | yes | all select_* tests | scan; filter; project; sort; limit/offset; empty |
-| `validate_select_supported` | yes | DISTINCT/JOIN/GROUP BY negatives | Unsupported_Ast each |
-| `validate_select_exprs` | yes | Unknown_Column WHERE; CAST/BETWEEN | dry-run unbound/unsupported |
+| `validate_select_supported` | yes | DISTINCT/JOIN negatives; GROUP BY executed (S5) | Unsupported_Ast for DISTINCT/JOIN |
+| `validate_select_exprs` | yes | Unknown_Column WHERE; BETWEEN | dry-run unbound/unsupported |
 | `bind_select_projection` | yes | `*`; columns; `p.*`; expr alias | Star; Table_Star; Column; Expr |
 | `table_star_matches` | yes | `SELECT p.*` | alias match |
 | `resolve_proj_column` | yes | named cols; Unknown_Column | 1/2 seg; unknown |
@@ -68,11 +72,12 @@
 | `SELECT *` / column list / simple exprs | yes |
 | FROM single table + optional alias | yes |
 | WHERE: literals, cols, comparisons, AND/OR/NOT, arith, IS NULL, IN | yes |
-| WHERE: non-NULL Text column as boolean (`name` / `NOT name` / `0 OR name`) | yes |
+| WHERE: Text/Blob as boolean → `Unsupported_Ast` (S1; E3 once treated non-NULL Text as TRUE) | yes — see S1 inventory |
 | ORDER BY / LIMIT / OFFSET | yes |
 | ORDER BY incompatible kinds → error | yes |
-| Reject DISTINCT / JOIN / GROUP BY → `Unsupported_Ast` | yes |
-| Reject CAST / BETWEEN / Call / Placeholder → `Unsupported_Ast` | yes |
+| Reject DISTINCT / JOIN → `Unsupported_Ast`; GROUP BY → S5 | yes |
+| Reject BETWEEN / Call / Placeholder → `Unsupported_Ast` | yes |
+| CAST → executed (S2; was `Unsupported_Ast` in E3) | yes — see [`sql-compliance-s2-coverage.md`](sql-compliance-s2-coverage.md) |
 | Unknown table / column codes | yes |
 | Identifier case-fold bind | yes |
 | create/insert/select reopen round-trip | yes |
@@ -89,7 +94,7 @@
 |------|------|
 | `Unknown_Table` | FROM missing table; bad `t.*` qualifier |
 | `Unknown_Column` | projection / WHERE / ORDER BY unbound name or bad qualifier |
-| `Unsupported_Ast` | DISTINCT, JOIN, GROUP BY/HAVING, CAST, BETWEEN, calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch |
+| `Unsupported_Ast` | DISTINCT, JOIN, BETWEEN, non-agg calls, placeholders, non-integer LIMIT/OFFSET; ORDER BY type mismatch; **(S1)** Text/Blob in boolean context; Text/Blob↔numeric compare; **(S2)** invalid/`CAST` target errors (CAST itself is executed); **(S4)** whole-query `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` are executed — see [`sql-compliance-s4-coverage.md`](sql-compliance-s4-coverage.md); **(S5)** `GROUP BY`/`HAVING` executed — see [`sql-compliance-s5-coverage.md`](sql-compliance-s5-coverage.md) |
 | `Closed` | SELECT on closed session |
 | `Engine` | decode / cursor failures during scan |
 

@@ -281,7 +281,8 @@ test_update_unsupported_set_expr :: proc(t: ^testing.T) {
 	s := exec.session_adopt(&e)
 	seed_items(t, &s)
 
-	r, eerr := exec.exec_statement(&s, "UPDATE items SET qty = CAST(qty AS INT);")
+	// CAST is executed (S2); function calls in SET remain unsupported.
+	r, eerr := exec.exec_statement(&s, "UPDATE items SET qty = abs(qty);")
 	testing.expect(t, exec.has_error(eerr))
 	testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Unsupported_Ast)
 	exec.free_error(eerr)

@@ -7,6 +7,7 @@ Wire the existing SQL parser (`src/sql`) to the storage stack (`src/engine`) so 
 | **Branch** | `feature/sql-execute` |
 | **Depends on** | Parser v1 DoD ([`sql-parser.md`](sql-parser.md)), storage v1 DoD ([`storage-engine.md`](storage-engine.md) S0–S4), CLI `init` ([`src/cli`](../src/cli)) |
 | **Supersedes** | Storage plan phase S5 (“SQL DDL/DML slice”) — execution work lives here |
+| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). This doc remains the execute **wiring** history (E1–E6); compliance owns boolean/`CAST`/UNIQUE/PK/agg/join semantic evolution. |
 
 ---
 
@@ -49,11 +50,11 @@ Already landed (do not re-implement):
 ## Non-goals (execute v1)
 
 - Query planner / cost-based optimizer (trivial plans only: seq scan, point insert, etc.).
-- Joins, `GROUP BY`, subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore).
+- Subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore). `GROUP BY`/`HAVING` executed (S5). Two-table `INNER`/`CROSS` joins executed (S6); `LEFT OUTER` / `USING` / 3+ tables still rejected.
 - Prepared statements and parameter binding (`?` / `?N`): **defer**; literals only for v1 DML.
 - Concurrent sessions / MVCC.
 - WAL (still deferred at storage layer).
-- Full SQLite type affinity / collation matrix — pragmatic scalar `Value` tags only.
+- SQLite type affinity / collation matrix — out of scope; declared types + explicit `CAST` (S2); pragmatic scalar `Value` tags only.
 - Network protocol / multi-user server.
 - `ALTER TABLE` execution (parser may accept `ADD COLUMN`; reject at bind until a later plan).
 
@@ -122,7 +123,7 @@ Extend the table payload (keep `kind`, `root_page`; add schema fields):
 | `version` | `2` |
 | `kind` | `1` = table (unchanged) |
 | `root_page` | Heap btree root |
-| `columns[]` | Ordered: name, type name string (affinity later), not_null, pk flag |
+| `columns[]` | Ordered: name, type name string (declared type; no SQLite affinity), not_null, pk flag |
 | `next_rowid` | High-water for IPK (`INTEGER`/`INT PRIMARY KEY`) / implicit rowid |
 
 Index rows: v1 (legacy, no columns) through E4; **v2 column list** landed in E5 — see [`storage-format.md`](storage-format.md).
@@ -141,8 +142,10 @@ version u8 | col_count u16 | [null_bitmap] | concatenated field encodings
 
 - Values: NULL / integer / float / text / blob (align with SQL literal kinds / runtime `Value`).
 - Btree **key** = **big-endian u64 rowid** (already used by `table_insert_row`).
-- **IPK (rowid alias):** exactly **one** `PRIMARY KEY` column whose type name is `INTEGER` or `INT` (case-insensitive `equal_fold`; no `INTEGER(n)`, `BIGINT`, etc.). That column aliases the btree rowid; omit/`NULL` auto-allocates via `next_rowid++` (persisted in the catalog).
-- **Unsupported until UNIQUE enforcement:** composite / multi-column `PRIMARY KEY`, and single-column PK whose type is not `INTEGER`/`INT` → reject at `CREATE TABLE` (and guard on `INSERT`) with `Unsupported_Ast`. No silent decorative PK.
+- **IPK (rowid alias, named extension):** exactly **one** `PRIMARY KEY` column whose type name is `INTEGER` or `INT` (case-insensitive `equal_fold`; no `INTEGER(n)`, `BIGINT`, etc.). That column aliases the btree rowid; omit/`NULL` auto-allocates via `next_rowid++` (persisted in the catalog). No secondary unique index is required for the IPK column itself.
+- **Non-IPK PRIMARY KEY (S3):** single-column PK on any other type (e.g. `TEXT`, `VARCHAR`, `UUID`) implies `NOT NULL` + a system unique secondary index (`strix_autoindex_<table>_<n>`). Duplicate / NULL PK → `Constraint`. Internal rowid is still allocated but **not** exposed as a SQL column.
+- **UNIQUE (S3):** column/table `UNIQUE` and `CREATE UNIQUE INDEX` create/maintain unique secondary indexes; collisions → `Constraint`. Multiple NULLs are allowed on nullable UNIQUE columns.
+- **Still rejected:** composite / multi-column `PRIMARY KEY` → `Unsupported_Ast`.
 
 ---
 
@@ -254,7 +257,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] Row encode/decode for heap payloads; document in [`storage-format.md`](storage-format.md)
 - [x] `INSERT INTO t [(cols)] VALUES (...), (...)`
 - [x] Auto rowid / PK rowid rules; persist `next_rowid` (`catalog_update_next_rowid`)
-- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` only; reject composite and non-integer PK at CREATE/INSERT
+- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` = rowid alias (extension); S3 adds non-IPK single-column PK + UNIQUE; still reject composite PK
 - [x] Column default: only literal / `NULL` defaults if already on AST; else error
 - [x] Reject `INSERT … SELECT` / `DEFAULT VALUES` / conflict clauses with clear errors unless already trivial
 - [x] Tests: insert → reopen → `table_get_row` + decode (SQL `SELECT` once E3 lands); multi-row INSERT rollback on mid-statement failure
@@ -268,7 +271,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] `FROM` single table; optional alias
 - [x] `WHERE` on bound columns (expression eval over row values — see [Expression evaluation](#expression-evaluation-binderexecutor))
 - [x] `ORDER BY` / `LIMIT` / `OFFSET` in executor (in-memory sort OK for v1)
-- [x] Reject joins / `GROUP BY` / subqueries / `DISTINCT` (unless trivial) clearly
+- [x] Reject subqueries / `DISTINCT` clearly; `GROUP BY`/`HAVING` executed in S5; two-table `INNER`/`CROSS` joins executed in S6 (`LEFT` / `USING` / 3+ tables still rejected)
 - [x] CLI prints result sets
 - [x] Tests: filter/sort/limit; create/insert/select round-trip; negatives with codes
 - [x] Coverage inventory: [`exec-e3-coverage.md`](exec-e3-coverage.md)
@@ -318,9 +321,13 @@ For `WHERE` / `SET` / projections (mainly E3–E4):
 - Eval AST `Expr` against a **row environment** (column name/index → `Value`).
 - Support parser Phase 1 exprs that are meaningful on scalars: literals, column refs, comparisons, `AND`/`OR`/`NOT`, arithmetic, `IS NULL`, `IN` list (see [`sql-parser.md`](sql-parser.md) Phase 1).
 - **Integer–Integer** comparisons use exact `i64` ordering (not `f64`); mixed integer/float still coerces via `f64`.
-- Fail clearly on unbound names, type conflicts, or unsupported nodes (`CAST` optional early; `BETWEEN` optional).
+- Fail clearly on unbound names, type conflicts, or unsupported nodes (`BETWEEN` optional).
+- **S2:** scalar `CAST(expr AS type)` is executed — supported pairs and Text→INTEGER rules live in [`sql-dialect.md`](sql-dialect.md) § Scalar CAST and [`sql-compliance.md`](sql-compliance.md) Phase S2. Invalid casts error (not NULL-by-affinity).
+- **S4:** whole-query aggregates (`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) on `SELECT` without `GROUP BY` — see [`sql-dialect.md`](sql-dialect.md) § Aggregates and [`sql-compliance.md`](sql-compliance.md) Phase S4. Mix of aggregates with bare columns without `GROUP BY` → `Unsupported_Ast` (strict).
+- **S5:** `GROUP BY` (column refs) + `HAVING`; strict select list; empty groups → 0 rows — see [`sql-dialect.md`](sql-dialect.md) § GROUP BY / HAVING and [`sql-compliance.md`](sql-compliance.md) Phase S5.
+- **S6:** two-table `INNER JOIN` … `ON` / `CROSS JOIN` / comma-join (nested-loop); multi-table column bind with aliases / `t.col`; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY` over joins supported — see [`sql-dialect.md`](sql-dialect.md) § JOIN and [`sql-compliance.md`](sql-compliance.md) Phase S6.
 
-Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union.
+Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union; conversion is explicit via `CAST`.
 
 ---
 
@@ -350,7 +357,7 @@ Exec_Error :: struct {
 | `exec` unit | Bind failures; schema meta; CREATE/DROP; later row codec + DML |
 | Integration | Temp `.strix` via `engine_create`; SQL → reopen catalog/rows |
 | CLI | Smoke from E1: `init` + `sql -c 'CREATE TABLE …'`; pure `parse_sql_command_args` unit tests |
-| Negative | Unsupported AST (join, etc.) → stable error code |
+| Negative | Unsupported AST (`LEFT JOIN`, `DISTINCT`, etc.) → stable error code |
 
 Wire `src/test/exec` into `./build.sh test` as part of E1.
 
@@ -362,7 +369,8 @@ Wire `src/test/exec` into `./build.sh test` as part of E1.
 
 | Doc | Purpose |
 |-----|---------|
-| `docs/sql-execute.md` | This plan (living) |
+| `docs/sql-execute.md` | This plan (living) — E1–E6 wiring |
+| `docs/sql-compliance.md` | Post-E6 semantic north star (compliance subset) |
 | `docs/storage-format.md` | Catalog v2 (E1) / row payload bytes (E2) |
 | `docs/sql-dialect.md` | **Executed** vs **Parsed only** — update as phases land |
 | `docs/storage-engine.md` | S5 points here (done) |
@@ -404,3 +412,4 @@ Defaults stand unless overridden before/during the relevant phase:
 ## Immediate next steps
 
 1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.
+2. Semantic north star after E6: [`sql-compliance.md`](sql-compliance.md) (start at S1 hygiene on `feature/sql-compliance`).
