@@ -33,6 +33,14 @@ column_from_def :: proc(col: sql.Column_Def) -> (engine.Catalog_Column, Exec_Err
 				)
 			}
 			flags += {.Has_Default}
+			// Typed bind for DEFAULT: UUID string → Uuid; BOOLEAN TRUE/FALSE already Boolean.
+			if cerr := coerce_value_for_column(
+				engine.Catalog_Column{name = col.name, type_name = col.type_name},
+				&def_val,
+			); has_error(cerr) {
+				free_value(def_val)
+				return {}, cerr
+			}
 			switch def_val.kind {
 			case .Null:
 				out.default_kind = .Null
@@ -42,12 +50,19 @@ column_from_def :: proc(col: sql.Column_Def) -> (engine.Catalog_Column, Exec_Err
 			case .Float:
 				out.default_kind = .Float
 				out.default_f = def_val.f
+			case .Boolean:
+				out.default_kind = .Boolean
+				out.default_i = def_val.i
 			case .Text:
 				out.default_kind = .Text
 				out.default_bytes = string(def_val.bytes) // owned; Catalog_Column takes ownership
 				def_val.bytes = nil
 			case .Blob:
 				out.default_kind = .Blob
+				out.default_bytes = string(def_val.bytes)
+				def_val.bytes = nil
+			case .Uuid:
+				out.default_kind = .Uuid
 				out.default_bytes = string(def_val.bytes)
 				def_val.bytes = nil
 			}

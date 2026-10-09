@@ -274,6 +274,7 @@ Literal_Kind :: enum {
 	String,
 	Blob,
 	Null,
+	Boolean, // TRUE / FALSE
 }
 
 Literal_Data :: struct {

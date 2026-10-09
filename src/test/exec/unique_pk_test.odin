@@ -420,6 +420,7 @@ test_ipk_unique_skips_redundant_autoindex :: proc(t: ^testing.T) {
 
 @(test)
 test_uuid_type_as_text_pk :: proc(t: ^testing.T) {
+	// F3: UUID PRIMARY KEY is typed 16-byte storage (string bind still accepted).
 	e, err := engine.engine_open_memory()
 	testing.expect(t, engine.ok(err))
 	defer engine.engine_close(&e)
@@ -436,13 +437,23 @@ test_uuid_type_as_text_pk :: proc(t: ^testing.T) {
 
 	r, eerr := exec.exec_statement(
 		&s,
-		"SELECT label FROM t WHERE id = '550e8400-e29b-41d4-a716-446655440000';",
+		"SELECT id, label FROM t WHERE id = '550e8400-e29b-41d4-a716-446655440000';",
 	)
 	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
 	testing.expect_value(t, len(r.rows), 1)
-	testing.expect_value(t, r.rows[0][0], "x")
+	testing.expect_value(t, r.rows[0][0], "550e8400-e29b-41d4-a716-446655440000")
+	testing.expect_value(t, r.rows[0][1], "x")
 	exec.free_error(eerr)
 	exec.free_result(r)
+
+	rdup, edup := exec.exec_statement(
+		&s,
+		"INSERT INTO t VALUES ('550e8400-e29b-41d4-a716-446655440000', 'y');",
+	)
+	testing.expect(t, exec.has_error(edup))
+	testing.expect_value(t, edup.code, exec.Exec_Error_Code.Constraint)
+	exec.free_error(edup)
+	exec.free_result(rdup)
 }
 
 @(test)

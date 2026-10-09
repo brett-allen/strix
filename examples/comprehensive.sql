@@ -13,7 +13,8 @@
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
 -- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK,
 -- S4 whole-query aggregates, S5 GROUP BY / HAVING, S6 INNER/CROSS JOIN,
--- F1 LEFT OUTER + 3-table joins, and F2 composite PRIMARY KEY.
+-- F1 LEFT OUTER + 3-table joins, F2 composite PRIMARY KEY, and F3
+-- BOOLEAN + typed UUID.
 -- Intentionally omits USING / RIGHT / FULL / NATURAL, DISTINCT, CHECK/FK,
 -- ALTER, INSERT…SELECT, OR REPLACE/IGNORE.
 
@@ -31,6 +32,7 @@ DROP TABLE IF EXISTS customers;
 DROP TABLE IF EXISTS scratch;
 DROP TABLE IF EXISTS tags;
 DROP TABLE IF EXISTS line_items;
+DROP TABLE IF EXISTS accounts;
 
 -- ---------------------------------------------------------------------------
 -- Schema: tables
@@ -79,6 +81,13 @@ CREATE TABLE IF NOT EXISTS scratch (
   text_col TEXT
 );
 
+-- Native BOOLEAN + typed UUID (F3)
+CREATE TABLE accounts (
+  id UUID PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
 -- ---------------------------------------------------------------------------
 -- Schema: indexes (DESC is catalog-only; keys are ASC)
 -- ---------------------------------------------------------------------------
@@ -115,6 +124,17 @@ INSERT INTO orders (id, customer_id, product_id, qty, paid, tag) VALUES
   (103, 2, 30, 3, 1, 'retail'),
   (104, 3, 40, 1, 0, 'vip'),
   (105, 4, 20, 2, 1, 'retail');
+
+INSERT INTO accounts (id, email, active) VALUES
+  ('550e8400-e29b-41d4-a716-446655440000', 'acct@example.com', TRUE),
+  ('550e8400-e29b-41d4-a716-446655440001', 'off@example.com', FALSE);
+-- DEFAULT TRUE for omitted active
+INSERT INTO accounts (id, email) VALUES
+  ('550e8400-e29b-41d4-a716-446655440002', 'def@example.com');
+
+SELECT id, email, active FROM accounts WHERE active ORDER BY email;
+SELECT id FROM accounts WHERE id = '550e8400-e29b-41d4-a716-446655440001';
+SELECT CAST(active AS INTEGER), CAST(id AS TEXT) FROM accounts WHERE email = 'acct@example.com';
 
 INSERT INTO scratch (id, blob_col, text_col) VALUES
   (1, X'DEADBEEF', 'hex blob'),
@@ -275,6 +295,7 @@ DROP TABLE line_items;
 DROP TABLE orders;
 DROP TABLE products;
 DROP TABLE customers;
+DROP TABLE IF EXISTS accounts;
 DROP TABLE IF EXISTS scratch;
 DROP TABLE IF EXISTS tags;
 

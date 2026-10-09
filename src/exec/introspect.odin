@@ -237,6 +237,8 @@ write_default_literal :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
 		fmt.sbprintf(b, "%d", col.default_i)
 	case .Float:
 		fmt.sbprintf(b, "%g", col.default_f)
+	case .Boolean:
+		strings.write_string(b, "TRUE" if col.default_i != 0 else "FALSE")
 	case .Text:
 		strings.write_byte(b, '\'')
 		for i in 0 ..< len(col.default_bytes) {
@@ -253,6 +255,12 @@ write_default_literal :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
 		for i in 0 ..< len(col.default_bytes) {
 			fmt.sbprintf(b, "%02X", col.default_bytes[i])
 		}
+		strings.write_byte(b, '\'')
+	case .Uuid:
+		canon := format_uuid_canonical(transmute([]u8)col.default_bytes)
+		defer delete(canon)
+		strings.write_byte(b, '\'')
+		strings.write_string(b, canon)
 		strings.write_byte(b, '\'')
 	}
 }

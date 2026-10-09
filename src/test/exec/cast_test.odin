@@ -35,10 +35,11 @@ test_cast_happy_paths_projection :: proc(t: ^testing.T) {
 	exec.free_error(e1)
 	exec.free_result(r1)
 
-	// TEXT ↔ BLOB; BLOB → TEXT; VARCHAR / DOUBLE aliases; UUID-as-TEXT
+	// TEXT ↔ BLOB; BLOB → TEXT; VARCHAR / DOUBLE aliases; UUID text round-trip (F3)
 	r2, e2 := exec.exec_statement(
 		&s,
-		"SELECT CAST(s AS BLOB), CAST(b AS TEXT), CAST(i AS VARCHAR), CAST(i AS DOUBLE), CAST(s AS UUID) FROM t;",
+		"SELECT CAST(s AS BLOB), CAST(b AS TEXT), CAST(i AS VARCHAR), CAST(i AS DOUBLE), " +
+		"CAST(CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID) AS TEXT) FROM t;",
 	)
 	testing.expectf(t, !exec.has_error(e2), "%s", e2.message)
 	testing.expect_value(t, len(r2.rows), 1)
@@ -46,7 +47,7 @@ test_cast_happy_paths_projection :: proc(t: ^testing.T) {
 	testing.expect_value(t, r2.rows[0][1], "AB")
 	testing.expect_value(t, r2.rows[0][2], "42")
 	testing.expect_value(t, r2.rows[0][3], "42")
-	testing.expect_value(t, r2.rows[0][4], "99")
+	testing.expect_value(t, r2.rows[0][4], "550e8400-e29b-41d4-a716-446655440000")
 	exec.free_error(e2)
 	exec.free_result(r2)
 
@@ -174,12 +175,19 @@ test_cast_reject_matrix :: proc(t: ^testing.T) {
 	exec.free_error(e8)
 	exec.free_result(r8)
 
-	// Unknown target type
-	r9, e9 := exec.exec_statement(&s, "SELECT CAST(1 AS BOOLEAN) FROM t;")
+	// Unknown target type (BOOLEAN is executed as of F3 — use a nonsense name)
+	r9, e9 := exec.exec_statement(&s, "SELECT CAST(1 AS NOTATYPE) FROM t;")
 	testing.expect(t, exec.has_error(e9))
 	testing.expect_value(t, e9.code, exec.Exec_Error_Code.Unsupported_Ast)
 	exec.free_error(e9)
 	exec.free_result(r9)
+
+	// Invalid text → UUID
+	r9b, e9b := exec.exec_statement(&s, "SELECT CAST(s AS UUID) FROM t;")
+	testing.expect(t, exec.has_error(e9b))
+	testing.expect_value(t, e9b.code, exec.Exec_Error_Code.Unsupported_Ast)
+	exec.free_error(e9b)
+	exec.free_result(r9b)
 
 	// Invalid REAL text
 	r10, e10 := exec.exec_statement(&s, "SELECT CAST('nope' AS REAL) FROM t;")

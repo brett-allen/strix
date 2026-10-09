@@ -224,8 +224,18 @@ Default payload (when `Has_Default`):
 
 | Field | Size | Notes |
 |-------|------|-------|
-| `default_kind` | u8 | `1`=NULL, `2`=integer, `3`=float, `4`=text, `5`=blob |
-| payload | … | NULL: empty; integer: i64 LE; float: f64 LE; text/blob: u32 LE length + bytes |
+| `default_kind` | u8 | `Catalog_Default_Kind`: `1`=NULL, `2`=integer, `3`=float, `4`=text, `5`=blob, `6`=Boolean, `7`=Uuid (`0`=None is unused when trailer present) |
+| payload | … | kind-dependent (below) |
+
+| `default_kind` | Payload |
+|----------------|---------|
+| `1` NULL | (empty) |
+| `2` Integer | i64 LE |
+| `3` Float | f64 LE |
+| `4` Text | u32 LE length + UTF-8 bytes |
+| `5` Blob | u32 LE length + bytes |
+| `6` Boolean | u8 `0`/`1` (stored; non-zero decodes as true) |
+| `7` Uuid | exactly 16 bytes (no length prefix) |
 
 Columns without `Has_Default` omit the default trailer (same layout as E1 v2 columns). Empty tables (engine register with no schema) use `col_count = 0` and still store `next_rowid`. Root / `next_rowid` updates rewrite the same version/size in place.
 
@@ -257,8 +267,10 @@ Non-NULL field encoding:
 | `2` Float | f64 LE |
 | `3` Text | u32 LE byte length + UTF-8 bytes |
 | `4` Blob | u32 LE byte length + bytes |
+| `5` Boolean | u8 `0`/`1` |
+| `6` Uuid | exactly 16 bytes |
 
-NULL columns appear only in the null bitmap (no tag/payload). A sole `INTEGER` or `INT PRIMARY KEY` column (IPK) aliases the btree rowid key; the column value is still stored in the payload when present. Non-IPK single-column PRIMARY KEY / UNIQUE constraints are enforced via unique secondary indexes (`strix_autoindex_*`, Unique flag on index columns). Composite PRIMARY KEY remains rejected by the executor.
+NULL columns appear only in the null bitmap (no tag/payload). A sole `INTEGER` or `INT PRIMARY KEY` column (IPK) aliases the btree rowid key; the column value is still stored in the payload when present. Non-IPK single-column PRIMARY KEY / UNIQUE constraints are enforced via unique secondary indexes (`strix_autoindex_*`, Unique flag on index columns). Composite PRIMARY KEY uses a composite unique system index (never aliases rowid).
 
 ### Secondary index btree
 
@@ -278,6 +290,8 @@ Registration and opens go through `engine` catalog APIs (`catalog_register_*`, `
 | `2` Float | u64 BE of IEEE-754 bits after SQLite-style order transform (positive: flip sign bit; negative: flip all bits) so `memcmp` matches numeric order |
 | `3` Text | u32 BE length + UTF-8 bytes + `0x00` |
 | `4` Blob | u32 BE length + bytes + `0x00` |
+| `5` Boolean | u8 `0`/`1` |
+| `6` Uuid | exactly 16 bytes (memcmp order = byte order) |
 
 Executor helpers: `encode_index_key` / `index_insert_entry` / `index_delete_entry` / `index_collect_rowids`.
 
@@ -347,3 +361,4 @@ Rollback (no durability, and only when not fenced): `paging.discard_dirty` drops
 | 0.4.3 | 2026-10-03 | Table catalog payload v2 (`columns[]` + `next_rowid`); index rows remain v1 |
 | 0.4.4 | 2026-10-03 | Heap row payload v1; optional column `Has_Default` trailer on catalog v2 |
 | 0.4.5 | 2026-10-03 | Index catalog payload v2 (`columns[]` + DESC flag); index key byte tags (E5) |
+| 0.4.6 | 2026-10-10 | Heap/index tags for Boolean (5) and Uuid (16-byte, tag 6); catalog DEFAULT Boolean/Uuid (F3) |

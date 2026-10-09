@@ -377,6 +377,9 @@ parse_primary_expr :: proc(p: ^Parser) -> (^Expr, Parse_Error) {
 	case .Kw_Null:
 		next(p)
 		return make_literal(p, .Null, tok.text, tok.span), ok_error()
+	case .Kw_True, .Kw_False:
+		next(p)
+		return make_literal(p, .Boolean, tok.text, tok.span), ok_error()
 	case .Question:
 		next(p)
 		node := new(Expr, p.allocator)

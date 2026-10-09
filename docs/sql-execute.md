@@ -7,7 +7,7 @@ Wire the existing SQL parser (`src/sql`) to the storage stack (`src/engine`) so 
 | **Branch** | `feature/sql-execute` |
 | **Depends on** | Parser v1 DoD ([`sql-parser.md`](sql-parser.md)), storage v1 DoD ([`storage-engine.md`](storage-engine.md) S0–S4), CLI `init` ([`src/cli`](../src/cli)) |
 | **Supersedes** | Storage plan phase S5 (“SQL DDL/DML slice”) — execution work lives here |
-| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening: **F1** LEFT/3+ joins + **F2** composite PK landed; F3–F4 (BOOLEAN/UUID, prepared `?`) planned in [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
+| **Post-E6 semantics** | Prefer SQL compliance over SQLite quirks — living plan [`sql-compliance.md`](sql-compliance.md) (S0–S6). Post-S6 widening: **F1** LEFT/3+ joins + **F2** composite PK + **F3** BOOLEAN/typed UUID landed; **F4** prepared `?` planned in [`sql-followon.md`](sql-followon.md). This doc remains the execute **wiring** history (E1–E6); compliance + follow-on own later semantic evolution. |
 
 ---
 
@@ -414,4 +414,4 @@ Defaults stand unless overridden before/during the relevant phase:
 
 1. ~~Land this plan~~ / ~~E1~~ / ~~E2~~ / ~~E3~~ / ~~E4~~ / ~~E5~~ / ~~E6~~ done on `feature/sql-execute`.
 2. ~~Semantic north star after E6: [`sql-compliance.md`](sql-compliance.md) (S0–S6).~~
-3. Post-F2 execute widening: [`sql-followon.md`](sql-followon.md) (F3 BOOLEAN/UUID → F4 prepared `?`).
+3. Post-F3 execute widening: [`sql-followon.md`](sql-followon.md) (F4 prepared `?`).

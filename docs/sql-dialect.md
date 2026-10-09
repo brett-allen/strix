@@ -4,9 +4,9 @@
 
 Execute semantics migrate under [`sql-compliance.md`](sql-compliance.md) (phases S0–S6). Parser surface may still accept forms the executor rejects until those phases land. Intentional deviations (IPK/rowid alias, `IF NOT EXISTS`, bracket/backtick idents, shell `.commands`) are **named extensions**, not the baseline.
 
-Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6. **F1** widens joins to `LEFT OUTER` and 3+ tables; **F2** executes composite `PRIMARY KEY`.
+Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes; **S4** executes whole-query aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`); **S5** executes single-table `GROUP BY` / `HAVING`; **S6** executes two-table `INNER` / `CROSS` joins. Compliance program query arc complete through S6. **F1** widens joins to `LEFT OUTER` and 3+ tables; **F2** executes composite `PRIMARY KEY`; **F3** adds native `BOOLEAN` + typed `UUID`.
 
-**Post-F2:** further widening (BOOLEAN/UUID, prepared `?`) is planned in [`sql-followon.md`](sql-followon.md) (F3–F4).
+**Post-F3:** prepared `?` binding is planned in [`sql-followon.md`](sql-followon.md) (F4).
 
 ## Supported statements (parser v1 / Phase 5)
 
@@ -35,25 +35,31 @@ Keywords are case-insensitive; quoted forms are always `Ident`. Unicode unquoted
 - **Columns** (and IPK type names): case-insensitive `equal_fold` at bind (CREATE duplicate/PK matching, INSERT column lists, SELECT/UPDATE SET/WHERE, index column bind). Case-only duplicate column names at `CREATE TABLE` are rejected (`Invalid_Schema`).
 - **Tables / indexes:** catalog keys are **case-sensitive** (exact match on the name as stored). `Users` and `users` are distinct; wrong-case `FROM` / `DROP INDEX` → `Unknown_Table` / `Unknown_Index` (no silent fold). Docs must not claim fold “everywhere.”
 
-### Boolean context & comparisons (execute / S1)
+### Boolean context & comparisons (execute / S1 + F3)
 
 | Rule | Behavior |
 |------|----------|
-| Boolean (`WHERE` / `AND` / `OR` / `NOT`) | Integer/Float: `0` = false, `≠0` = true. NULL = unknown (3VL preserved; short-circuit may skip the other side). Text/Blob (and other non-numeric non-null) → `Unsupported_Ast`. |
+| Boolean (`WHERE` / `AND` / `OR` / `NOT`) | Integer/Float: `0` = false, `≠0` = true. Native `BOOLEAN`: `TRUE`/`FALSE`. NULL = unknown (3VL preserved; short-circuit may skip the other side). Text/Blob/Uuid → `Unsupported_Ast`. |
+| Literals `TRUE` / `FALSE` | Lexer keywords → `Value_Kind.Boolean`; usable in projection, `WHERE`, `INSERT`/`UPDATE`, `DEFAULT` |
 | Integer–Integer compare | Exact `i64` (not via `f64`) |
 | Mixed int/float compare | Allowed via `f64` (north-star default; documented) |
-| Text/Blob ↔ numeric | Error without `CAST` (`Unsupported_Ast`) |
+| Boolean–Boolean | `false` < `true` (0/1) |
+| Uuid–Uuid | Byte compare of 16-byte values |
+| Uuid ↔ Text | Text parsed as UUID string form (8-4-4-4-12 or 32 hex); invalid → `Unsupported_Ast` |
+| Text/Blob ↔ numeric; Boolean ↔ Integer | Error without `CAST` (`Unsupported_Ast`) — no affinity |
 | Same-kind Text/Blob | Byte/lex compare unchanged |
 
-### INSERT / UPDATE declared-type kinds (execute / S1)
+### INSERT / UPDATE declared-type kinds (execute / S1 + F3)
 
 | Rule | Behavior |
 |------|----------|
-| Recognized types | Bound value kind must match: `INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/`CHAR`/`CHARACTER`/`CLOB`/`NVARCHAR`/`UUID` → Text; `BLOB` → Blob. Parameters (e.g. `VARCHAR(10)`) ignored for matching. |
-| Mismatch | `Constraint` (e.g. `INSERT INTO t (n) VALUES ('10')` into `n INT`) — no soft coerce, no affinity |
+| Recognized types | Bound value kind must match: `INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/`CHAR`/`CHARACTER`/`CLOB`/`NVARCHAR` → Text; `BLOB` → Blob; `BOOLEAN`/`BOOL` → Boolean; `UUID` → Uuid (16 bytes). Parameters (e.g. `VARCHAR(10)`) ignored for matching. |
+| UUID string bind | A Text string literal into a `UUID` column is **validated and stored as typed Uuid** (canonical lowercase on display). Malformed → `Constraint`. This is typed-column bind, not ambient affinity (other types still reject wrong kinds). |
+| Mismatch | `Constraint` (e.g. `INSERT INTO t (n) VALUES ('10')` into `n INT`; `INSERT INTO t (ok) VALUES (1)` into `ok BOOLEAN`) — use `CAST` for conversions |
 | NULL | Allowed unless `NOT NULL` |
 | Empty / unknown type name | Store bound kind as-is (no check until a recognized name) |
 | `UPDATE SET` | Same kind check on assigned values |
+| Pre-F3 UUID-as-Text | Tables created before F3 that declared `UUID` but stored Text heap tags remain Text on disk; new `UUID` columns use typed storage |
 
 ### PRIMARY KEY shapes (execute / S3 + F2)
 
@@ -68,21 +74,25 @@ Ill-formed mixes (e.g. column-level IPK plus a different table `PRIMARY KEY (…
 
 `UNIQUE` (column or table) and `CREATE UNIQUE INDEX` use the same unique-index maintenance path. Nullable UNIQUE columns allow multiple NULLs.
 
-### Scalar `CAST` (execute / S2)
+### Scalar `CAST` (execute / S2 + F3)
 
 `CAST(expr AS type)` is the **only** conversion path (no type affinity). Same `eval_expr` path as projection / `WHERE` / `SET`. NULL → NULL. Invalid casts → `Unsupported_Ast` (never NULL-by-affinity).
 
-**Target type names** (parameters stripped, case-insensitive): `INTEGER`/`INT`; `REAL`/`FLOAT`/`DOUBLE`; `TEXT`/`VARCHAR`/`CHAR`/`CHARACTER`/`CLOB`/`NVARCHAR`/`UUID` (UUID → Text until a native UUID type); `BLOB`. Other names (e.g. `BOOLEAN`) → error.
+**Target type names** (parameters stripped, case-insensitive): `INTEGER`/`INT`; `REAL`/`FLOAT`/`DOUBLE`; `TEXT`/`VARCHAR`/`CHAR`/`CHARACTER`/`CLOB`/`NVARCHAR`; `BLOB`; `BOOLEAN`/`BOOL`; `UUID` (typed 16-byte). Unknown names → error.
 
-| From → To | INTEGER | REAL | TEXT | BLOB |
-|-----------|---------|------|------|------|
-| NULL | NULL | NULL | NULL | NULL |
-| Integer | identity | `f64` | decimal string | **reject** |
-| Float | truncate toward 0 (finite, in `i64` range) | identity | `%g` string | **reject** |
-| Text | strict decimal\* | full `f64` parse (trim) | identity | UTF-8 bytes |
-| Blob | **reject** | **reject** | bytes as UTF-8 text | identity |
+| From → To | INTEGER | REAL | TEXT | BLOB | BOOLEAN | UUID |
+|-----------|---------|------|------|------|---------|------|
+| NULL | NULL | NULL | NULL | NULL | NULL | NULL |
+| Integer | identity | `f64` | decimal string | **reject** | `≠0`→TRUE | **reject** |
+| Float | truncate toward 0 (finite, in `i64` range) | identity | `%g` string | **reject** | `≠0`→TRUE | **reject** |
+| Text | strict decimal\* | full `f64` parse (trim) | identity | UTF-8 bytes | `TRUE`/`FALSE` only | parse UUID† |
+| Blob | **reject** | **reject** | bytes as UTF-8 text | identity | **reject** | exactly 16 bytes |
+| Boolean | 0/1 | 0.0/1.0 | `TRUE`/`FALSE` | **reject** | identity | **reject** |
+| Uuid | **reject** | **reject** | canonical 8-4-4-4-12 | 16 raw bytes | **reject** | identity |
 
 \* **Text → INTEGER:** trim surrounding whitespace; optional leading `+`/`-`; remaining must be **decimal digits only**. Reject empty, fractional (`'10.5'`), hex (`'0x10'`), underscores, trailing garbage (`'10x'`), or digits that do not fit in `i64` (no silent wrap; same `Unsupported_Ast` / out-of-range honesty as Float→INTEGER). Use `CAST(… AS REAL)` then `CAST(… AS INTEGER)` if you need float-then-truncate from text.
+
+† **Text → UUID:** accept hyphenated 8-4-4-4-12 (any hex case) or 32 hex digits; store 16 bytes; display lowercase hyphenated.
 
 ### Aggregates (execute / S4)
 
@@ -92,7 +102,7 @@ Whole-query aggregates on a **single table** without `GROUP BY`. `WHERE` filters
 |----------|----------|
 | `COUNT(*)` | Counts all filtered rows (including rows with NULLs elsewhere) |
 | `COUNT(expr)` | Counts non-NULL `expr` values (null-skipping) |
-| `SUM(expr)` | Numeric sum; null-skipping; empty/all-NULL → `NULL`; Integer until a Float appears |
+| `SUM(expr)` | Numeric sum; null-skipping; empty/all-NULL → `NULL`; Integer until a Float appears; **i64 overflow → `Unsupported_Ast`** (fail-closed, F3) |
 | `AVG(expr)` | Numeric average; null-skipping; **always Float** (integers promote); empty/all-NULL → `NULL` |
 | `MIN(expr)` / `MAX(expr)` | Numeric only (S4); null-skipping; empty/all-NULL → `NULL` |
 
@@ -244,9 +254,9 @@ Parser v1 accepts a wider surface than the executor runs. **Execute support** li
 
 | Area | Parsed (today) | Executed |
 |------|----------------|----------|
-| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2 + S3 + F2)** — `NOT NULL`; literal/`NULL` `DEFAULT`; **PK shapes:** (A) sole `INTEGER`/`INT PRIMARY KEY` = IPK/rowid alias (named extension); (B) single-column non-IPK PK (`TEXT`/`VARCHAR`/`UUID`/…) = `NOT NULL` + system unique index; (C) **composite** `PRIMARY KEY (c1, c2, …)` = `NOT NULL` on all PK cols + composite unique system index (never rowid alias); column/table `UNIQUE` → system unique indexes; `DROP TABLE` auto-drops system autoindexes (user indexes still block); `IF NOT EXISTS` / `IF EXISTS`; rejects conflicting PK mixes; CHECK/FK still unsupported |
-| `INSERT` … `VALUES` | yes | **yes (E2 + S1 + S3)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; non-IPK PK / UNIQUE duplicates → `Constraint`; NULL PK → `Constraint`; UNIQUE allows multiple NULLs; **declared-type kind check (S1):** recognized types (`INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/…/`UUID` → Text; `BLOB` → Blob) reject mismatched literal kinds with `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5/S3) |
-| `SELECT` (single-table + N-table join) | yes | **yes (E3 + S1 + S2 + S4 + S5 + S6 + F1)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list, **`CAST` (S2)**); **strict boolean context (S1):** Integer/Float `0` = false, `≠0` = true; NULL unknown (3VL for AND/OR); Text/Blob (and other non-numeric non-null) in `WHERE`/`AND`/`OR`/`NOT` → `Unsupported_Ast`; **compare (S1):** Integer–Integer exact `i64`; mixed int/float via `f64`; same-kind Text/Blob byte/lex; Text/Blob↔numeric without `CAST` → `Unsupported_Ast`; **`CAST(expr AS type)` (S2)** in projection/WHERE — see [Scalar CAST](#scalar-cast-execute--s2); **whole-query aggregates (S4):** `COUNT(*)` / `COUNT(expr)` / `SUM` / `AVG` / `MIN` / `MAX` (numerics; null-skipping except `COUNT(*)`) without `GROUP BY` → one result row — see [Aggregates](#aggregates-execute--s4); **`GROUP BY` / `HAVING` (S5):** column-ref keys; strict select list; HAVING post-agg; empty groups → 0 rows — see [GROUP BY / HAVING](#group-by--having-execute--s5); **`JOIN` (S6 + F1):** left-deep nested-loop `INNER` / `CROSS` / comma-join / **`LEFT [OUTER] JOIN` … `ON`**; 3+ tables; qualified names / aliases; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY`/`HAVING` over joins supported; rejects `USING`, `RIGHT`/`FULL`/`NATURAL` — see [JOIN](#join-execute--s6--f1); ORDER BY / LIMIT / OFFSET (in-memory; group keys/aggs with GROUP BY; incompatible ORDER BY kinds → error); rejects DISTINCT / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only on **single-table** selects (E5; numeric eq stays on seq scan; joins always seq-scan all sides) |
+| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2 + S3 + F2 + F3)** — `NOT NULL`; literal/`NULL`/`TRUE`/`FALSE` `DEFAULT`; **PK shapes:** (A) sole `INTEGER`/`INT PRIMARY KEY` = IPK/rowid alias (named extension); (B) single-column non-IPK PK (`TEXT`/`VARCHAR`/`UUID`/…) = `NOT NULL` + system unique index; (C) **composite** `PRIMARY KEY (c1, c2, …)` = `NOT NULL` on all PK cols + composite unique system index (never rowid alias); column/table `UNIQUE` → system unique indexes; `BOOLEAN`/`UUID` column types (F3); `DROP TABLE` auto-drops system autoindexes (user indexes still block); `IF NOT EXISTS` / `IF EXISTS`; rejects conflicting PK mixes; CHECK/FK still unsupported |
+| `INSERT` … `VALUES` | yes | **yes (E2 + S1 + S3 + F3)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; non-IPK PK / UNIQUE duplicates → `Constraint`; NULL PK → `Constraint`; UNIQUE allows multiple NULLs; **declared-type kind check (S1/F3):** recognized types include `BOOLEAN`→Boolean and `UUID`→Uuid (string→Uuid bind for UUID cols); mismatch → `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5/S3) |
+| `SELECT` (single-table + N-table join) | yes | **yes (E3 + S1 + S2 + S4 + S5 + S6 + F1 + F3)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals incl. **`TRUE`/`FALSE`**, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list, **`CAST` (S2/F3)**); **strict boolean context (S1/F3):** Integer/Float/`BOOLEAN`; NULL unknown (3VL for AND/OR); Text/Blob/Uuid in bool context → `Unsupported_Ast`; **compare** includes Boolean–Boolean and Uuid (+ UUID string form); **`CAST`** matrix includes BOOLEAN/UUID — see [Scalar CAST](#scalar-cast-execute--s2--f3); **whole-query aggregates (S4):** `COUNT(*)` / `COUNT(expr)` / `SUM` / `AVG` / `MIN` / `MAX` (numerics; null-skipping except `COUNT(*)`; **SUM i64 overflow fail-closed**) without `GROUP BY` → one result row — see [Aggregates](#aggregates-execute--s4); **`GROUP BY` / `HAVING` (S5):** column-ref keys; strict select list; HAVING post-agg; empty groups → 0 rows — see [GROUP BY / HAVING](#group-by--having-execute--s5); **`JOIN` (S6 + F1):** left-deep nested-loop `INNER` / `CROSS` / comma-join / **`LEFT [OUTER] JOIN` … `ON`**; 3+ tables; qualified names / aliases; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY`/`HAVING` over joins supported; rejects `USING`, `RIGHT`/`FULL`/`NATURAL` — see [JOIN](#join-execute--s6--f1); ORDER BY / LIMIT / OFFSET (in-memory; group keys/aggs with GROUP BY; incompatible ORDER BY kinds → error); rejects DISTINCT / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob/uuid** `WHERE col = const` only on **single-table** selects (E5; numeric eq stays on seq scan; joins always seq-scan all sides) |
 | `UPDATE` / `DELETE` | yes | **yes (E4/E5 + S1 + S2)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env` (same S1 boolean/compare rules; **`CAST` in SET/WHERE (S2)**); `SET` values checked against declared column kinds (same as INSERT); row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL / type mismatch on SET → `Constraint` |
 | `CREATE`/`DROP INDEX` | yes | **yes (E5 + S3)** — `CREATE INDEX` / `CREATE UNIQUE INDEX`; register + backfill; unique indexes probe for collisions (`Constraint`); `IF NOT EXISTS` / `IF EXISTS`; catalog index v2 column list + Unique flag (bit1 of index column flags); `DESC` on index columns is **catalog metadata only** (key bytes are always ASC-encoded for v1); index names starting with `strix_autoindex_` (case-insensitive) are reserved → `Invalid_Schema`; `DROP TABLE` auto-drops `strix_autoindex_*` then still rejects while user indexes exist |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | yes (E6) | **yes (E6)** — explicit txn mode; nested `BEGIN` → `In_Txn`; statements inside txn do not auto-commit until `COMMIT`; `ROLLBACK` undoes; `COMMIT`/`ROLLBACK` without `BEGIN` → `No_Txn`; **write failure inside explicit txn aborts the whole txn** (no savepoints; clears `explicit_txn`, sets `txn_aborted`); **flush-fence recovery:** retry `COMMIT` on the still-open session (auto-commit fence promotes to `explicit_txn`; shell close/quit/EOF/`--bail` exit refused until recovered; batch process exit **forfeits** recovery) |

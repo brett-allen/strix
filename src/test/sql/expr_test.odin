@@ -17,6 +17,8 @@ test_expr_literals :: proc(t: ^testing.T) {
 		{"X'AB01'", .Blob},
 		{"NULL", .Null},
 		{"null", .Null},
+		{"TRUE", .Boolean},
+		{"false", .Boolean},
 	}
 	for c in cases {
 		expr, err := sql.parse_expr(c.src)

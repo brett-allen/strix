@@ -66,10 +66,15 @@ declared_storage_kind :: proc(type_name: string) -> (kind: Value_Kind, enforced:
 	   strings.equal_fold(base, "CHAR") ||
 	   strings.equal_fold(base, "CHARACTER") ||
 	   strings.equal_fold(base, "CLOB") ||
-	   strings.equal_fold(base, "NVARCHAR") ||
-	   strings.equal_fold(base, "UUID") {
-		// UUID is TEXT until a native UUID type exists (S2 / sql-compliance).
+	   strings.equal_fold(base, "NVARCHAR") {
 		return .Text, true
+	}
+	if strings.equal_fold(base, "UUID") {
+		// F3: typed 16-byte UUID. Pre-F3 rows that stored UUID-as-Text remain Text on disk.
+		return .Uuid, true
+	}
+	if strings.equal_fold(base, "BOOLEAN") || strings.equal_fold(base, "BOOL") {
+		return .Boolean, true
 	}
 	if strings.equal_fold(base, "BLOB") {
 		return .Blob, true
@@ -77,9 +82,14 @@ declared_storage_kind :: proc(type_name: string) -> (kind: Value_Kind, enforced:
 	return {}, false
 }
 
-// check_value_matches_column_type rejects bound kinds that disagree with a recognized
-// declared type. NULL is always allowed here (NOT NULL is separate). No soft coerce / affinity.
-check_value_matches_column_type :: proc(col: engine.Catalog_Column, v: Value) -> Exec_Error {
+// coerce_value_for_column applies typed bind rules (not ambient affinity):
+//   - UUID columns: Text string → parse/validate → Uuid (malformed → Constraint)
+// Boolean ↔ Integer still requires CAST. Mutates *v on success when coercing.
+coerce_value_for_column :: proc(
+	col: engine.Catalog_Column,
+	v: ^Value,
+	allocator := context.allocator,
+) -> Exec_Error {
 	if v.kind == .Null {
 		return ok_error()
 	}
@@ -90,6 +100,20 @@ check_value_matches_column_type :: proc(col: engine.Catalog_Column, v: Value) ->
 	if v.kind == expected {
 		return ok_error()
 	}
+	if expected == .Uuid && v.kind == .Text {
+		u, ok := value_uuid_from_text(string(v.bytes), allocator)
+		if !ok {
+			return make_error(
+				.Constraint,
+				"invalid UUID for column %s: %q",
+				col.name,
+				string(v.bytes),
+			)
+		}
+		free_value(v^, allocator)
+		v^ = u
+		return ok_error()
+	}
 	return make_error(
 		.Constraint,
 		"type mismatch for column %s: declared %s requires %v, got %v",
@@ -98,6 +122,17 @@ check_value_matches_column_type :: proc(col: engine.Catalog_Column, v: Value) ->
 		expected,
 		v.kind,
 	)
+}
+
+// check_value_matches_column_type rejects bound kinds that disagree with a recognized
+// declared type. NULL is always allowed here (NOT NULL is separate). No soft coerce / affinity
+// except UUID string → typed Uuid bind (see coerce_value_for_column).
+check_value_matches_column_type :: proc(
+	col: engine.Catalog_Column,
+	v: ^Value,
+	allocator := context.allocator,
+) -> Exec_Error {
+	return coerce_value_for_column(col, v, allocator)
 }
 
 // find_ipk_column returns the sole INTEGER/INT PRIMARY KEY column index, or -1.
@@ -137,10 +172,18 @@ catalog_default_to_value :: proc(
 		return value_integer(col.default_i), ok_error()
 	case .Float:
 		return value_float(col.default_f), ok_error()
+	case .Boolean:
+		return value_boolean(col.default_i != 0), ok_error()
 	case .Text:
 		return value_text(col.default_bytes, allocator), ok_error()
 	case .Blob:
 		return value_blob(transmute([]u8)col.default_bytes, allocator), ok_error()
+	case .Uuid:
+		u, ok := value_uuid(transmute([]u8)col.default_bytes, allocator)
+		if !ok {
+			return {}, error_at(.Constraint, "corrupt UUID default")
+		}
+		return u, ok_error()
 	}
 	return {}, error_at(.Constraint, "column has no default")
 }
@@ -257,8 +300,9 @@ build_insert_row_values :: proc(
 	}
 
 	// Declared-type kind check (no affinity / soft coerce). Untyped / unknown types skipped.
+	// UUID string literals coerce to typed Uuid here.
 	for i in 0 ..< ncol {
-		if cerr := check_value_matches_column_type(columns[i], vals[i]); has_error(cerr) {
+		if cerr := check_value_matches_column_type(columns[i], &vals[i], allocator); has_error(cerr) {
 			free_values(vals, allocator)
 			return nil, cerr
 		}

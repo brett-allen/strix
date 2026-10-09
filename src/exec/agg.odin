@@ -10,6 +10,17 @@ import sql "../sql"
 // Whole-query empty input: one row (COUNT→0; SUM/AVG/MIN/MAX→NULL).
 // GROUP BY empty input: zero result rows (no groups).
 
+// i64_add_checked returns (sum, overflowed). Fail-closed for SUM(i64).
+i64_add_checked :: proc(a, b: i64) -> (i64, bool) {
+	if b > 0 && a > max(i64) - b {
+		return 0, true
+	}
+	if b < 0 && a < min(i64) - b {
+		return 0, true
+	}
+	return a + b, false
+}
+
 Agg_Fn :: enum {
 	Count_Star,
 	Count,
@@ -840,7 +851,15 @@ accumulate_agg_slot :: proc(
 				}
 				slot.sum_f += value_as_f64(v)
 			} else {
-				slot.sum_i += v.i
+				sum, overflowed := i64_add_checked(slot.sum_i, v.i)
+				if overflowed {
+					return make_error(
+						.Unsupported_Ast,
+						"SUM overflow: integer sum does not fit in i64",
+						span = slot.call.span if slot.call != nil else {},
+					)
+				}
+				slot.sum_i = sum
 			}
 			return ok_error()
 		case .Min, .Max:
@@ -997,7 +1016,7 @@ eval_unary_with_aggs :: proc(
 		#partial switch inner.kind {
 		case .Null, .Integer, .Float:
 			return inner, ok_error()
-		case .Text, .Blob:
+		case .Text, .Blob, .Boolean, .Uuid:
 			free_value(inner, allocator)
 			return {}, make_error(.Unsupported_Ast, "unary + requires a numeric value", span = span)
 		}
@@ -1009,7 +1028,7 @@ eval_unary_with_aggs :: proc(
 			return value_integer(-inner.i), ok_error()
 		case .Float:
 			return value_float(-inner.f), ok_error()
-		case .Text, .Blob:
+		case .Text, .Blob, .Boolean, .Uuid:
 			free_value(inner, allocator)
 			return {}, make_error(.Unsupported_Ast, "unary - requires a numeric value", span = span)
 		}
