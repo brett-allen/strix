@@ -112,7 +112,16 @@ schema_sql_one :: proc(
 		if len(ref.entry.columns) == 0 {
 			continue // v1 rows without column meta — skip awkwardly empty INDEX
 		}
-		fmt.sbprintf(&b, "CREATE INDEX %s ON %s (", ref.name, table_name)
+		// Single-column system autoindexes are implied by PRIMARY KEY / UNIQUE on columns.
+		// Multi-column UNIQUE only exists as an autoindex — still emit those.
+		if is_system_autoindex_name(ref.name) && len(ref.entry.columns) == 1 {
+			continue
+		}
+		if engine.catalog_index_is_unique(ref.entry) {
+			fmt.sbprintf(&b, "CREATE UNIQUE INDEX %s ON %s (", ref.name, table_name)
+		} else {
+			fmt.sbprintf(&b, "CREATE INDEX %s ON %s (", ref.name, table_name)
+		}
 		for col, i in ref.entry.columns {
 			if i > 0 {
 				strings.write_string(&b, ", ")
@@ -133,11 +142,14 @@ write_column_def :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
 	if col.type_name != "" {
 		fmt.sbprintf(b, " %s", col.type_name)
 	}
-	if .Not_Null in col.flags {
+	// PRIMARY KEY implies NOT NULL; avoid redundant NOT NULL before PK.
+	if .Not_Null in col.flags && .Primary_Key not_in col.flags {
 		strings.write_string(b, " NOT NULL")
 	}
 	if .Primary_Key in col.flags {
 		strings.write_string(b, " PRIMARY KEY")
+	} else if .Unique in col.flags {
+		strings.write_string(b, " UNIQUE")
 	}
 	if .Has_Default in col.flags {
 		strings.write_string(b, " DEFAULT ")

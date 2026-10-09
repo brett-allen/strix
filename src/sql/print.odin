@@ -258,7 +258,11 @@ print_drop_table :: proc(stmt: Drop_Table_Stmt, allocator := context.allocator) 
 
 print_create_index :: proc(stmt: Create_Index_Stmt, allocator := context.allocator) -> string {
 	b := strings.builder_make(context.temp_allocator)
-	strings.write_string(&b, "CREATE INDEX")
+	if stmt.unique {
+		strings.write_string(&b, "CREATE UNIQUE INDEX")
+	} else {
+		strings.write_string(&b, "CREATE INDEX")
+	}
 	if stmt.if_not_exists {
 		strings.write_string(&b, " IF NOT EXISTS")
 	}

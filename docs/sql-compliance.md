@@ -28,7 +28,7 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `CAST`, `JOIN`, `GROUP BY`/`HAVING`, aggregates-as-calls, UNIQUE/PK constraints — many reject at bind/exec |
-| `src/exec` | E1–E6 | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); rejects TEXT/composite PK |
+| `src/exec` | E1–E6 + **S3** | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; rejects composite PK |
 | Expression eval | E3 + **S1** + **S2** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2) |
 | Catalog / rows | v2 tables, heap codec | `columns[]` + `next_rowid`; btree key = internal rowid |
 | CLI / shell | `strix sql` / `strix shell` | Batch + REPL; `.dot` meta-commands are **not** SQL |
@@ -217,14 +217,14 @@ User-visible: predicates stop lying; type mismatches fail clearly.
 
 ### Phase S3 — `UNIQUE` constraints + TEXT/UUID PK
 
-- [ ] Enforce column/table `UNIQUE` via unique secondary index (create on `CREATE TABLE` / `CREATE UNIQUE INDEX` as applicable; maintain on `INSERT`/`UPDATE`/`DELETE`)
-- [ ] Single-column `PRIMARY KEY` on non-IPK types (e.g. `TEXT`, `VARCHAR(…)`): imply `NOT NULL` + unique index; reject NULL PK values with `Constraint`
-- [ ] Duplicate PK/UNIQUE → `Constraint` (stable code)
-- [ ] IPK path **unchanged** under default (A); document both shapes in dialect
-- [ ] Reject or defer composite PK with clear error until a follow-on slice (default: **still reject composite** in S3)
-- [ ] Catalog/schema flags as needed; update [`storage-format.md`](storage-format.md) if on-disk meta grows
-- [ ] Tests: TEXT PK insert/select/update/delete; unique violation; IPK regression; reopen durable
-- [ ] Coverage inventory: [`sql-compliance-s3-coverage.md`](sql-compliance-s3-coverage.md) ≥80%
+- [x] Enforce column/table `UNIQUE` via unique secondary index (create on `CREATE TABLE` / `CREATE UNIQUE INDEX` as applicable; maintain on `INSERT`/`UPDATE`/`DELETE`)
+- [x] Single-column `PRIMARY KEY` on non-IPK types (e.g. `TEXT`, `VARCHAR(…)`): imply `NOT NULL` + unique index; reject NULL PK values with `Constraint`
+- [x] Duplicate PK/UNIQUE → `Constraint` (stable code)
+- [x] IPK path **unchanged** under default (A); document both shapes in dialect
+- [x] Reject or defer composite PK with clear error until a follow-on slice (default: **still reject composite** in S3)
+- [x] Catalog/schema flags as needed; update [`storage-format.md`](storage-format.md) if on-disk meta grows
+- [x] Tests: TEXT PK insert/select/update/delete; unique violation; IPK regression; reopen durable
+- [x] Coverage inventory: [`sql-compliance-s3-coverage.md`](sql-compliance-s3-coverage.md) ≥80%
 
 **Exit:** `CREATE TABLE t (id TEXT PRIMARY KEY, …); INSERT …;` works end-to-end via CLI; duplicates fail closed.
 
@@ -325,4 +325,5 @@ Defaults stand unless overridden before/during the relevant phase:
 2. Confirm open Q defaults with PM (especially **IPK = A**).
 3. ~~Implement **S1** (boolean + compare hygiene) with `sql-compliance-s1-coverage.md`.~~
 4. ~~Implement **S2** (`CAST`) with `sql-compliance-s2-coverage.md`.~~
-5. Next: **S3** (UNIQUE + TEXT PK) as the first user-facing constraint arc.
+5. ~~Implement **S3** (UNIQUE + TEXT PK) with `sql-compliance-s3-coverage.md`.~~
+6. Next: **S4** (`COUNT(*)` / aggregates).

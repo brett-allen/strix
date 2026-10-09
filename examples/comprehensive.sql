@@ -11,9 +11,9 @@
 --   .read examples/comprehensive.sql
 --
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
--- "Executed vs parsed only"). Includes S2 CAST. Intentionally omits JOINs,
--- GROUP BY, DISTINCT, CHECK/FK, ALTER, INSERT…SELECT, OR REPLACE/IGNORE,
--- composite/non-INT PKs.
+-- "Executed vs parsed only"). Includes S2 CAST and S3 UNIQUE / TEXT PK.
+-- Intentionally omits JOINs, GROUP BY, DISTINCT, CHECK/FK, ALTER,
+-- INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
 
 -- ---------------------------------------------------------------------------
 -- Clean slate (idempotent-ish: drop children before parents)
@@ -22,17 +22,19 @@ DROP INDEX IF EXISTS idx_orders_customer;
 DROP INDEX IF EXISTS idx_orders_sku;
 DROP INDEX IF EXISTS idx_customers_email;
 DROP INDEX IF EXISTS idx_products_name;
+DROP INDEX IF EXISTS idx_tags_label;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS products;
 DROP TABLE IF EXISTS customers;
 DROP TABLE IF EXISTS scratch;
+DROP TABLE IF EXISTS tags;
 
 -- ---------------------------------------------------------------------------
 -- Schema: tables
 -- ---------------------------------------------------------------------------
 CREATE TABLE customers (
   id INTEGER PRIMARY KEY,
-  email TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
   name TEXT NOT NULL DEFAULT 'anonymous',
   active INTEGER DEFAULT 1
 );
@@ -41,8 +43,14 @@ CREATE TABLE products (
   id INT PRIMARY KEY,
   name TEXT NOT NULL,
   price REAL NOT NULL,
-  sku TEXT,
+  sku TEXT UNIQUE,
   note TEXT
+);
+
+-- Non-IPK TEXT PRIMARY KEY (S3): NOT NULL + system unique index
+CREATE TABLE tags (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL
 );
 
 CREATE TABLE orders (
@@ -63,10 +71,11 @@ CREATE TABLE IF NOT EXISTS scratch (
 -- ---------------------------------------------------------------------------
 -- Schema: indexes (DESC is catalog-only; keys are ASC)
 -- ---------------------------------------------------------------------------
-CREATE INDEX idx_customers_email ON customers (email);
+-- email/sku already have UNIQUE system indexes; keep a non-unique name index
 CREATE INDEX IF NOT EXISTS idx_products_name ON products (name);
 CREATE INDEX idx_orders_customer ON orders (customer_id);
 CREATE INDEX idx_orders_sku ON orders (tag DESC);
+CREATE UNIQUE INDEX idx_tags_label ON tags (label);
 
 -- ---------------------------------------------------------------------------
 -- INSERT: named columns, multi-row, NULL, defaults, blob, auto rowid
@@ -101,10 +110,15 @@ INSERT INTO scratch (id, blob_col, text_col) VALUES
   (2, X'00', 'nul byte'),
   (3, NULL, 'no blob');
 
+INSERT INTO tags (id, label) VALUES
+  ('tag-retail', 'retail'),
+  ('tag-vip', 'vip');
+
 -- ---------------------------------------------------------------------------
 -- SELECT: projection, alias, WHERE, exprs, IN, IS NULL, ORDER/LIMIT/OFFSET
 -- ---------------------------------------------------------------------------
 SELECT * FROM customers ORDER BY id;
+SELECT id, label FROM tags WHERE id = 'tag-vip';
 
 SELECT c.id, c.email, c.name
   FROM customers AS c
@@ -202,11 +216,13 @@ DROP INDEX IF EXISTS idx_orders_customer;
 DROP INDEX IF EXISTS idx_products_sku;
 DROP INDEX IF EXISTS idx_products_name;
 DROP INDEX IF EXISTS idx_customers_email;
+DROP INDEX IF EXISTS idx_tags_label;
 
 DROP TABLE orders;
 DROP TABLE products;
 DROP TABLE customers;
 DROP TABLE IF EXISTS scratch;
+DROP TABLE IF EXISTS tags;
 
 -- Recreate a tiny durable footprint so a reopen still shows something useful
 CREATE TABLE smoke (

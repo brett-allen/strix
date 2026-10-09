@@ -142,8 +142,10 @@ version u8 | col_count u16 | [null_bitmap] | concatenated field encodings
 
 - Values: NULL / integer / float / text / blob (align with SQL literal kinds / runtime `Value`).
 - Btree **key** = **big-endian u64 rowid** (already used by `table_insert_row`).
-- **IPK (rowid alias):** exactly **one** `PRIMARY KEY` column whose type name is `INTEGER` or `INT` (case-insensitive `equal_fold`; no `INTEGER(n)`, `BIGINT`, etc.). That column aliases the btree rowid; omit/`NULL` auto-allocates via `next_rowid++` (persisted in the catalog).
-- **Unsupported until UNIQUE enforcement:** composite / multi-column `PRIMARY KEY`, and single-column PK whose type is not `INTEGER`/`INT` → reject at `CREATE TABLE` (and guard on `INSERT`) with `Unsupported_Ast`. No silent decorative PK.
+- **IPK (rowid alias, named extension):** exactly **one** `PRIMARY KEY` column whose type name is `INTEGER` or `INT` (case-insensitive `equal_fold`; no `INTEGER(n)`, `BIGINT`, etc.). That column aliases the btree rowid; omit/`NULL` auto-allocates via `next_rowid++` (persisted in the catalog). No secondary unique index is required for the IPK column itself.
+- **Non-IPK PRIMARY KEY (S3):** single-column PK on any other type (e.g. `TEXT`, `VARCHAR`, `UUID`) implies `NOT NULL` + a system unique secondary index (`strix_autoindex_<table>_<n>`). Duplicate / NULL PK → `Constraint`. Internal rowid is still allocated but **not** exposed as a SQL column.
+- **UNIQUE (S3):** column/table `UNIQUE` and `CREATE UNIQUE INDEX` create/maintain unique secondary indexes; collisions → `Constraint`. Multiple NULLs are allowed on nullable UNIQUE columns.
+- **Still rejected:** composite / multi-column `PRIMARY KEY` → `Unsupported_Ast`.
 
 ---
 
@@ -255,7 +257,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] Row encode/decode for heap payloads; document in [`storage-format.md`](storage-format.md)
 - [x] `INSERT INTO t [(cols)] VALUES (...), (...)`
 - [x] Auto rowid / PK rowid rules; persist `next_rowid` (`catalog_update_next_rowid`)
-- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` only; reject composite and non-integer PK at CREATE/INSERT
+- [x] IPK policy: sole `INTEGER`/`INT PRIMARY KEY` = rowid alias (extension); S3 adds non-IPK single-column PK + UNIQUE; still reject composite PK
 - [x] Column default: only literal / `NULL` defaults if already on AST; else error
 - [x] Reject `INSERT … SELECT` / `DEFAULT VALUES` / conflict clauses with clear errors unless already trivial
 - [x] Tests: insert → reopen → `table_get_row` + decode (SQL `SELECT` once E3 lands); multi-row INSERT rollback on mid-statement failure

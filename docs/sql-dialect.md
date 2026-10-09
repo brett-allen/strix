@@ -4,7 +4,7 @@
 
 Execute semantics migrate under [`sql-compliance.md`](sql-compliance.md) (phases S0–S6). Parser surface may still accept forms the executor rejects until those phases land. Intentional deviations (IPK/rowid alias, `IF NOT EXISTS`, bracket/backtick idents, shell `.commands`) are **named extensions**, not the baseline.
 
-Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`. Remaining demotions/widenings are in the compliance plan’s breaking-changes table.
+Historical note: early execute (E1–E6) followed SQLite-shaped shortcuts (Text truthiness, IPK-only PK). **S1** removed Text/Blob truthiness and tightened compares; **S2** executes scalar `CAST`; **S3** enforces `UNIQUE` / non-IPK `PRIMARY KEY` via unique secondary indexes. Remaining work (aggregates, `GROUP BY`, joins) is in the compliance plan.
 
 ## Supported statements (parser v1 / Phase 5)
 
@@ -52,6 +52,17 @@ Keywords are case-insensitive; quoted forms are always `Ident`. Unicode unquoted
 | NULL | Allowed unless `NOT NULL` |
 | Empty / unknown type name | Store bound kind as-is (no check until a recognized name) |
 | `UPDATE SET` | Same kind check on assigned values |
+
+### PRIMARY KEY shapes (execute / S3)
+
+| Shape | Behavior |
+|-------|----------|
+| **IPK (extension)** | Sole column `INTEGER`/`INT PRIMARY KEY` aliases btree rowid; omit/`NULL` auto-allocates via `next_rowid`. No system unique index on the IPK column. |
+| **Non-IPK PK** | Single-column PK on other types (`TEXT`, `VARCHAR(…)`, `UUID`, `REAL`, …) → implied `NOT NULL` + system unique index `strix_autoindex_<table>_<n>`. NULL / duplicate → `Constraint`. |
+| **Composite PK** | Still rejected (`Unsupported_Ast`). |
+| **Internal rowid** | Always present as the heap btree key; **not** exposed as a SQL column in S3. |
+
+`UNIQUE` (column or table) and `CREATE UNIQUE INDEX` use the same unique-index maintenance path. Nullable UNIQUE columns allow multiple NULLs.
 
 ### Scalar `CAST` (execute / S2)
 
@@ -181,11 +192,11 @@ Parser v1 accepts a wider surface than the executor runs. **Execute support** li
 
 | Area | Parsed (today) | Executed |
 |------|----------------|----------|
-| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2)** — `NOT NULL`; literal/`NULL` `DEFAULT`; sole `INTEGER`/`INT PRIMARY KEY` (column or table-level); `IF NOT EXISTS` / `IF EXISTS`; rejects composite PK, non-integer PK, UNIQUE/CHECK/FK until later |
-| `INSERT` … `VALUES` | yes | **yes (E2 + S1)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; **declared-type kind check (S1):** recognized types (`INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/… → Text; `BLOB` → Blob) reject mismatched literal kinds with `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5) |
+| `CREATE`/`DROP TABLE` | yes | **yes (E1/E2 + S3)** — `NOT NULL`; literal/`NULL` `DEFAULT`; **two PK shapes (S3):** (A) sole `INTEGER`/`INT PRIMARY KEY` = IPK/rowid alias (named extension); (B) single-column non-IPK PK (`TEXT`/`VARCHAR`/`UUID`/…) = `NOT NULL` + system unique index `strix_autoindex_<table>_<n>`; column/table `UNIQUE` → system unique indexes; `DROP TABLE` auto-drops system autoindexes (user indexes still block); `IF NOT EXISTS` / `IF EXISTS`; rejects **composite** PK; CHECK/FK still unsupported |
+| `INSERT` … `VALUES` | yes | **yes (E2 + S1 + S3)** — multi-row (one txn; mid-statement failure rolls back in auto-commit); optional column list; IPK rowid alias for sole `INTEGER`/`INT` PK; non-IPK PK / UNIQUE duplicates → `Constraint`; NULL PK → `Constraint`; UNIQUE allows multiple NULLs; **declared-type kind check (S1):** recognized types (`INT`/`INTEGER` → Integer; `REAL`/`FLOAT`/`DOUBLE` → Float; `TEXT`/`VARCHAR`/…/`UUID` → Text; `BLOB` → Blob) reject mismatched literal kinds with `Constraint` (no soft coerce / affinity); empty/unknown type names store the bound kind as-is; rejects `INSERT…SELECT` / `OR REPLACE`/`OR IGNORE` / `DEFAULT VALUES`; maintains secondary indexes (E5/S3) |
 | Single-table `SELECT` | yes | **yes (E3 + S1 + S2)** — `*` / columns / simple exprs; FROM + optional alias; WHERE (literals, cols, comparisons, AND/OR/NOT, arith, `IS NULL`, `IN` list, **`CAST` (S2)**); **strict boolean context (S1):** Integer/Float `0` = false, `≠0` = true; NULL unknown (3VL for AND/OR); Text/Blob (and other non-numeric non-null) in `WHERE`/`AND`/`OR`/`NOT` → `Unsupported_Ast`; **compare (S1):** Integer–Integer exact `i64`; mixed int/float via `f64`; same-kind Text/Blob byte/lex; Text/Blob↔numeric without `CAST` → `Unsupported_Ast`; **`CAST(expr AS type)` (S2)** in projection/WHERE — see [Scalar CAST](#scalar-cast-execute--s2); ORDER BY / LIMIT / OFFSET (in-memory; incompatible ORDER BY kinds → error); rejects DISTINCT / JOIN / GROUP BY / BETWEEN / subqueries with `Unsupported_Ast`; CLI aligned text table; optional index point lookup for **text/blob** `WHERE col = const` only (E5; numeric eq stays on seq scan) |
 | `UPDATE` / `DELETE` | yes | **yes (E4/E5 + S1 + S2)** — seq scan; `SET` / `WHERE` via E3 `eval_expr` / `Row_Env` (same S1 boolean/compare rules; **`CAST` in SET/WHERE (S2)**); `SET` values checked against declared column kinds (same as INSERT); row rewrite / delete-by-rowid; `rows_affected`; maintains indexes when catalog has column metadata; rejects mutate on legacy indexes without columns (`Has_Indexes`); rejects updating IPK (rowid); NOT NULL / type mismatch on SET → `Constraint` |
-| `CREATE`/`DROP INDEX` | yes | **yes (E5)** — register + backfill; `IF NOT EXISTS` / `IF EXISTS`; catalog index v2 column list; `DESC` on index columns is **catalog metadata only** (key bytes are always ASC-encoded for v1); `DROP TABLE` still rejects while indexes exist (no cascade) |
+| `CREATE`/`DROP INDEX` | yes | **yes (E5 + S3)** — `CREATE INDEX` / `CREATE UNIQUE INDEX`; register + backfill; unique indexes probe for collisions (`Constraint`); `IF NOT EXISTS` / `IF EXISTS`; catalog index v2 column list + Unique flag (bit1 of index column flags); `DESC` on index columns is **catalog metadata only** (key bytes are always ASC-encoded for v1); index names starting with `strix_autoindex_` (case-insensitive) are reserved → `Invalid_Schema`; `DROP TABLE` auto-drops `strix_autoindex_*` then still rejects while user indexes exist |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | yes (E6) | **yes (E6)** — explicit txn mode; nested `BEGIN` → `In_Txn`; statements inside txn do not auto-commit until `COMMIT`; `ROLLBACK` undoes; `COMMIT`/`ROLLBACK` without `BEGIN` → `No_Txn`; **write failure inside explicit txn aborts the whole txn** (no savepoints; clears `explicit_txn`, sets `txn_aborted`); **flush-fence recovery:** retry `COMMIT` on the still-open session (auto-commit fence promotes to `explicit_txn`; shell close/quit/EOF/`--bail` exit refused until recovered; batch process exit **forfeits** recovery) |
 | Scripts | yes | **yes (E6)** — stop-on-error default; optional `continue_on_error` / CLI `--continue-on-error`; **after an explicit-txn abort, the script always stops** (even with `continue_on_error`) so later statements cannot auto-commit outside the aborted txn; **after a flush fence, only recovery `COMMIT` and `SELECT` may run** (other stmts hard-stop; with `continue_on_error`, intervening non-allowed stmts are skipped until `COMMIT`); errors format as `file:line:col: message` when path+span known |
 | Joins, `GROUP BY`, `ALTER`, … | yes (subset) | reject at bind/exec until later plans |
@@ -194,7 +205,7 @@ Update this table as execute phases land.
 
 ## Known gaps
 
-- No index cascade on `DROP TABLE` (drop indexes first)
+- No cascade for **user** indexes on `DROP TABLE` (drop indexes first); system `strix_autoindex_*` indexes are auto-dropped; users cannot create indexes with that reserved prefix
 - No CTEs, set ops, windows, UPSERT, triggers/views/PRAGMA
 - No FROM subqueries / correlated subqueries
 - `token_kind_string(.NotEq)` prints `!=` even for `<>`

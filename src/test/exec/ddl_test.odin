@@ -31,10 +31,11 @@ test_create_preserves_type_names_and_table_pk :: proc(t: ^testing.T) {
 
 @(test)
 test_bind_rejects_empty_columns :: proc(t: ^testing.T) {
-	cols, err := exec.bind_create_table_columns(sql.Create_Table_Stmt{name = "t", elements = nil})
+	cols, uniq, err := exec.bind_create_table_columns(sql.Create_Table_Stmt{name = "t", elements = nil})
 	testing.expect(t, exec.has_error(err))
 	testing.expect_value(t, err.code, exec.Exec_Error_Code.Invalid_Schema)
 	testing.expect(t, cols == nil)
+	testing.expect(t, uniq == nil)
 	exec.free_error(err)
 }
 
@@ -104,7 +105,6 @@ test_bind_rejects_unsupported_column_constraints :: proc(t: ^testing.T) {
 	s := exec.session_adopt(&e)
 
 	cases := []string{
-		"CREATE TABLE t (a INT UNIQUE);",
 		"CREATE TABLE t (a INT CHECK (a > 0));",
 		"CREATE TABLE t (a INT REFERENCES other(a));",
 		"CREATE TABLE t (a INT DEFAULT (a + 1));",
@@ -149,7 +149,6 @@ test_bind_rejects_unsupported_table_constraints :: proc(t: ^testing.T) {
 	s := exec.session_adopt(&e)
 
 	cases := []string{
-		"CREATE TABLE t (a INT, UNIQUE (a));",
 		"CREATE TABLE t (a INT, CHECK (a > 0));",
 		"CREATE TABLE t (a INT, FOREIGN KEY (a) REFERENCES other(a));",
 	}
@@ -197,25 +196,35 @@ test_create_rejects_composite_primary_key :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_create_rejects_non_integer_primary_key :: proc(t: ^testing.T) {
+test_create_accepts_non_integer_primary_key :: proc(t: ^testing.T) {
 	e, err := engine.engine_open_memory()
 	testing.expect(t, engine.ok(err))
 	defer engine.engine_close(&e)
 	s := exec.session_adopt(&e)
 
 	cases := []string{
-		"CREATE TABLE t (id TEXT PRIMARY KEY);",
-		"CREATE TABLE t (id REAL PRIMARY KEY);",
-		"CREATE TABLE t (id VARCHAR(32) PRIMARY KEY);",
-		"CREATE TABLE t (id TEXT, PRIMARY KEY (id));",
+		"CREATE TABLE t_text (id TEXT PRIMARY KEY);",
+		"CREATE TABLE t_real (id REAL PRIMARY KEY);",
+		"CREATE TABLE t_vc (id VARCHAR(32) PRIMARY KEY);",
+		"CREATE TABLE t_tbl (id TEXT, PRIMARY KEY (id));",
 	}
 	for sql_text in cases {
 		r, eerr := exec.exec_statement(&s, sql_text)
-		testing.expectf(t, exec.has_error(eerr), "expected error for %s", sql_text)
-		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Unsupported_Ast)
+		testing.expectf(t, !exec.has_error(eerr), "%s → %s", sql_text, eerr.message)
 		exec.free_error(eerr)
 		exec.free_result(r)
 	}
+
+	entry, gerr := engine.catalog_get_table_entry(&e, "t_text")
+	testing.expect(t, engine.ok(gerr))
+	testing.expect(t, .Primary_Key in entry.columns[0].flags)
+	testing.expect(t, .Not_Null in entry.columns[0].flags)
+	engine.free_catalog_entry(entry)
+
+	idx, ierr := engine.catalog_get_index_entry(&e, "strix_autoindex_t_text_1")
+	testing.expect(t, engine.ok(ierr))
+	testing.expect(t, engine.catalog_index_is_unique(idx))
+	engine.free_catalog_entry(idx)
 }
 
 @(test)

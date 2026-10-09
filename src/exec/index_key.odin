@@ -155,6 +155,50 @@ table_indexes_maintained :: proc(
 	return refs, ok_error()
 }
 
+// index_key_has_null reports whether any indexed value is NULL (UNIQUE allows multiple NULLs).
+index_key_has_null :: proc(
+	row_vals: []Value,
+	table_columns: []engine.Catalog_Column,
+	index_columns: []engine.Catalog_Column,
+) -> (has_null: bool, err: Exec_Error) {
+	for ic in index_columns {
+		idx := find_column_index(table_columns, ic.name)
+		if idx < 0 {
+			return false, make_error(.Unknown_Column, "index column %q missing from table", ic.name)
+		}
+		if row_vals[idx].kind == .Null {
+			return true, ok_error()
+		}
+	}
+	return false, ok_error()
+}
+
+// check_unique_index_collision fails with Constraint if another row already owns this key.
+check_unique_index_collision :: proc(
+	tree: ^engine.Btree,
+	ikey: []u8,
+	rowid: u64,
+	index_name: string,
+	span: sql.Span,
+) -> Exec_Error {
+	existing, cerr := engine.index_collect_rowids(tree, ikey)
+	if cerr != .None {
+		return from_engine_error(cerr, span)
+	}
+	defer delete(existing)
+	for er in existing {
+		if er != rowid {
+			return make_error(
+				.Constraint,
+				"UNIQUE constraint failed: index %q",
+				index_name,
+				span = span,
+			)
+		}
+	}
+	return ok_error()
+}
+
 index_insert_for_row :: proc(
 	e: ^engine.Engine,
 	refs: []engine.Catalog_Index_Ref,
@@ -173,8 +217,29 @@ index_insert_for_row :: proc(
 			delete(ikey)
 			return from_engine_error(oerr, span)
 		}
+		if engine.catalog_index_is_unique(r.entry) {
+			has_null, nerr := index_key_has_null(row_vals, table_columns, r.entry.columns)
+			if has_error(nerr) {
+				delete(ikey)
+				return nerr
+			}
+			if !has_null {
+				if uerr := check_unique_index_collision(&tree, ikey, rowid, r.name, span); has_error(uerr) {
+					delete(ikey)
+					return uerr
+				}
+			}
+		}
 		ierr := engine.index_insert_entry(&tree, ikey, rowid)
 		delete(ikey)
+		if ierr == .Exists {
+			return make_error(
+				.Constraint,
+				"UNIQUE constraint failed: index %q",
+				r.name,
+				span = span,
+			)
+		}
 		if ierr != .None {
 			return from_engine_error(ierr, span)
 		}

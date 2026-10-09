@@ -114,17 +114,10 @@ find_ipk_column :: proc(columns: []engine.Catalog_Column) -> int {
 	return -1
 }
 
-// validate_primary_key_shape rejects unsupported PK forms until UNIQUE enforcement exists.
-// Allowed: zero PK columns, or exactly one PK column whose type is INTEGER/INT (IPK rowid alias).
+// validate_primary_key_shape rejects composite / multi-column PRIMARY KEY.
+// Allowed: zero PK columns, or exactly one PK column (IPK rowid alias or unique-index PK).
 validate_primary_key_shape :: proc(columns: []engine.Catalog_Column) -> Exec_Error {
-	pk_count := 0
-	pk_idx := -1
-	for c, i in columns {
-		if .Primary_Key in c.flags {
-			pk_count += 1
-			pk_idx = i
-		}
-	}
+	pk_count := count_primary_key_columns(columns)
 	if pk_count == 0 {
 		return ok_error()
 	}
@@ -132,13 +125,6 @@ validate_primary_key_shape :: proc(columns: []engine.Catalog_Column) -> Exec_Err
 		return make_error(
 			.Unsupported_Ast,
 			"composite PRIMARY KEY is not supported yet",
-		)
-	}
-	if !is_ipk_type_name(columns[pk_idx].type_name) {
-		return make_error(
-			.Unsupported_Ast,
-			"PRIMARY KEY column type must be INTEGER or INT until UNIQUE enforcement exists (got %q)",
-			columns[pk_idx].type_name,
 		)
 	}
 	return ok_error()

@@ -1,7 +1,7 @@
 # Strix Storage Format
 
-**Version:** 0.4.5  
-**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1); heap row payload (E2); index catalog payload **v2** + index key tags (E5)  
+**Version:** 0.4.6  
+**Status:** B+tree pages (S3); `table_prime` catalog + mandatory root ownership (S4); table catalog payload **v2** (E1); heap row payload (E2); index catalog payload **v2** + index key tags (E5); Unique flag on index/table columns (SQL-compliance S3)  
 **Companion:** [`storage-engine.md`](storage-engine.md), [`btrees.md`](btrees.md), [`sql-execute.md`](sql-execute.md)
 
 Strix uses a **native** single-file, page-oriented format. It is **not** SQLite-compatible.
@@ -186,7 +186,7 @@ Each index column record:
 |-------|------|-------|
 | `name_len` | u16 LE | |
 | `name` | `name_len` | UTF-8 column name (must exist on parent table) |
-| `flags` | u8 | bit0 = `DESC` (catalog only; key bytes are always ASC-encoded for v1 keys) |
+| `flags` | u8 | bit0 = `DESC` (catalog only; key bytes are always ASC-encoded for v1 keys); bit1 = `Unique` (index is UNIQUE — S3) |
 
 #### Table rows v1 (legacy)
 
@@ -217,7 +217,7 @@ Each column record:
 | `name` | `name_len` | UTF-8 column name |
 | `type_name_len` | u16 | `0` if type omitted |
 | `type_name` | `type_name_len` | UTF-8 declared type name (no affinity; INSERT/UPDATE kind-check recognized names) |
-| `flags` | u8 | bit0 = `NOT NULL`, bit1 = `PRIMARY KEY`, bit2 = `Has_Default` |
+| `flags` | u8 | bit0 = `NOT NULL`, bit1 = `PRIMARY KEY`, bit2 = `Has_Default`, bit4 = `UNIQUE` (S3; column-level UNIQUE constraint) |
 | `default` | … | Present only when `Has_Default` is set (see below) |
 
 Default payload (when `Has_Default`):
@@ -258,7 +258,7 @@ Non-NULL field encoding:
 | `3` Text | u32 LE byte length + UTF-8 bytes |
 | `4` Blob | u32 LE byte length + bytes |
 
-NULL columns appear only in the null bitmap (no tag/payload). A sole `INTEGER` or `INT PRIMARY KEY` column (IPK) aliases the btree rowid key; the column value is still stored in the payload when present. Composite / non-integer PRIMARY KEY shapes are rejected by the executor until UNIQUE enforcement exists.
+NULL columns appear only in the null bitmap (no tag/payload). A sole `INTEGER` or `INT PRIMARY KEY` column (IPK) aliases the btree rowid key; the column value is still stored in the payload when present. Non-IPK single-column PRIMARY KEY / UNIQUE constraints are enforced via unique secondary indexes (`strix_autoindex_*`, Unique flag on index columns). Composite PRIMARY KEY remains rejected by the executor.
 
 ### Secondary index btree
 

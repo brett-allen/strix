@@ -43,6 +43,7 @@ backfill_index :: proc(
 	table_name: string,
 	table_columns: []engine.Catalog_Column,
 	index_columns: []engine.Catalog_Column,
+	unique: bool,
 	span: sql.Span,
 ) -> Exec_Error {
 	tbl, terr := engine.catalog_open_table(e, table_name)
@@ -74,12 +75,36 @@ backfill_index :: proc(
 			return derr
 		}
 		ikey, enc_err := encode_index_key_from_row(vals, table_columns, index_columns)
-		free_values(vals)
 		if has_error(enc_err) {
+			free_values(vals)
 			return enc_err
 		}
+		if unique {
+			has_null, nerr := index_key_has_null(vals, table_columns, index_columns)
+			if has_error(nerr) {
+				free_values(vals)
+				delete(ikey)
+				return nerr
+			}
+			if !has_null {
+				if uerr := check_unique_index_collision(&idx, ikey, rowid, index_name, span); has_error(uerr) {
+					free_values(vals)
+					delete(ikey)
+					return uerr
+				}
+			}
+		}
+		free_values(vals)
 		ins := engine.index_insert_entry(&idx, ikey, rowid)
 		delete(ikey)
+		if ins == .Exists {
+			return make_error(
+				.Constraint,
+				"UNIQUE constraint failed: index %q",
+				index_name,
+				span = span,
+			)
+		}
 		if ins != .None {
 			return from_engine_error(ins, span)
 		}
@@ -97,6 +122,15 @@ exec_create_index :: proc(s: ^Exec_Session, stmt: sql.Create_Index_Stmt, span: s
 	}
 	if stmt.name == "" {
 		return {}, make_error(.Invalid_Schema, "CREATE INDEX requires an index name", span = span)
+	}
+	if is_system_autoindex_name(stmt.name) {
+		return {}, make_error(
+			.Invalid_Schema,
+			"index name %q is reserved (prefix %s)",
+			stmt.name,
+			SYSTEM_AUTOINDEX_PREFIX,
+			span = span,
+		)
 	}
 	if stmt.table_name == "" {
 		return {}, make_error(.Invalid_Schema, "CREATE INDEX requires a table name", span = span)
@@ -127,7 +161,7 @@ exec_create_index :: proc(s: ^Exec_Session, stmt: sql.Create_Index_Stmt, span: s
 		return {}, btxn
 	}
 
-	_, rerr := engine.catalog_register_index(e, stmt.name, stmt.table_name, idx_cols)
+	_, rerr := engine.catalog_register_index(e, stmt.name, stmt.table_name, idx_cols, unique = stmt.unique)
 	if rerr == .Exists {
 		if stmt.if_not_exists {
 			if serr := soft_rollback_started(s, e, started, span); has_error(serr) {
@@ -144,7 +178,7 @@ exec_create_index :: proc(s: ^Exec_Session, stmt: sql.Create_Index_Stmt, span: s
 		return {}, finish_write_error(s, e, started, from_engine_error(rerr, span), span)
 	}
 
-	if ferr := backfill_index(e, stmt.name, stmt.table_name, entry.columns, idx_cols, span); has_error(ferr) {
+	if ferr := backfill_index(e, stmt.name, stmt.table_name, entry.columns, idx_cols, stmt.unique, span); has_error(ferr) {
 		return {}, finish_write_error(s, e, started, ferr, span)
 	}
 
