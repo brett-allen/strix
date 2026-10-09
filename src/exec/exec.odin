@@ -47,7 +47,15 @@ exec_script :: proc(
 		return {}, err
 	}
 
-	last := ok_result()
+	// Accumulate every statement result so callers (shell `.read`, `strix sql`)
+	// can print each one. Primary return fields remain the last statement.
+	parts := make([dynamic]Exec_Result, 0, len(script.statements))
+	defer {
+		for part in parts {
+			free_result(part)
+		}
+		delete(parts)
+	}
 	first_err := ok_error()
 	aborted_this_script := false
 	skipped_for_fence := false
@@ -63,7 +71,6 @@ exec_script :: proc(
 				"flush recovery required — retry COMMIT; script stopped",
 				span = stmt.span,
 			)
-			free_result(last)
 			free_error(first_err)
 			return {}, fence_err
 		}
@@ -84,12 +91,10 @@ exec_script :: proc(
 					span = err.span,
 				)
 				free_error(err)
-				free_result(last)
 				free_error(first_err)
 				return {}, annotated
 			}
 			if !opts.continue_on_error {
-				free_result(last)
 				free_error(first_err)
 				return {}, err
 			}
@@ -100,22 +105,32 @@ exec_script :: proc(
 			}
 			continue
 		}
-		free_result(last)
-		last = result
+		append(&parts, result)
 	}
 	if has_error(first_err) {
-		free_result(last)
 		return {}, first_err
 	}
 	// Skipped non-recovery stmts under continue_on_error but never cleared the fence.
 	if skipped_for_fence && session_flush_fence(s) {
-		free_result(last)
 		return {}, make_error(
 			.Engine,
 			"flush recovery required — retry COMMIT; script stopped",
 		)
 	}
-	return last, ok_error()
+	if len(parts) == 0 {
+		return ok_result(), ok_error()
+	}
+	// Transfer ownership out of `parts` into the returned aggregate.
+	out := parts[len(parts) - 1]
+	if len(parts) > 1 {
+		preceding := make([]Exec_Result, len(parts) - 1)
+		for i in 0 ..< len(parts) - 1 {
+			preceding[i] = parts[i]
+		}
+		out.preceding = preceding
+	}
+	clear(&parts) // emptied; defer must not free transferred results
+	return out, ok_error()
 }
 
 // exec_statement parses and executes a single SQL statement (auto-commit unless in explicit txn).

@@ -296,6 +296,7 @@ test_multi_statement_create_drop_script :: proc(t: ^testing.T) {
 	r, eerr := exec.exec_script(&s, "CREATE TABLE a (x INT); CREATE TABLE b (y TEXT); DROP TABLE a;")
 	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
 	testing.expect_value(t, r.kind, exec.Result_Kind.Ok)
+	testing.expect_value(t, len(r.preceding), 2) // two earlier Ok results retained
 	exec.free_error(eerr)
 	exec.free_result(r)
 
@@ -305,6 +306,41 @@ test_multi_statement_create_drop_script :: proc(t: ^testing.T) {
 	testing.expect(t, engine.ok(gerr_b))
 	testing.expect_value(t, entry_b.columns[0].name, "y")
 	engine.free_catalog_entry(entry_b)
+}
+
+@(test)
+test_exec_script_preceding_multi_select :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	r, eerr := exec.exec_script(
+		&s,
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);" +
+		"INSERT INTO t (name) VALUES ('first'), ('second');" +
+		"SELECT name FROM t WHERE id = 1;" +
+		"SELECT name FROM t WHERE id = 2;",
+	)
+	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+	defer exec.free_error(eerr)
+	defer exec.free_result(r)
+
+	// Last result is the second SELECT; first SELECT is in preceding.
+	testing.expect_value(t, r.kind, exec.Result_Kind.Result_Set)
+	testing.expect_value(t, len(r.rows), 1)
+	testing.expect_value(t, r.rows[0][0], "second")
+	testing.expect(t, len(r.preceding) >= 1)
+	first_sel: ^exec.Exec_Result
+	for i in 0 ..< len(r.preceding) {
+		if r.preceding[i].kind == .Result_Set {
+			first_sel = &r.preceding[i]
+			break
+		}
+	}
+	testing.expect(t, first_sel != nil)
+	testing.expect_value(t, len(first_sel.rows), 1)
+	testing.expect_value(t, first_sel.rows[0][0], "first")
 }
 
 @(test)

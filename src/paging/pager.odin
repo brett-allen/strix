@@ -54,12 +54,18 @@ pager_attach :: proc(file: dbfile.Db_File, opts: Pager_Options, owns_file: bool)
 		freelist_head           = boot.freelist_head,
 		committed_page_count    = boot.page_count,
 		committed_freelist_head = boot.freelist_head,
+		free_pages              = make(map[dbfile.Page_No]bool),
 		frames                  = make([]Frame, nframes),
 		page_index              = make(map[dbfile.Page_No]int),
 	}
 
 	for i in 0 ..< nframes {
 		p.frames[i].data = make([]u8, p.page_size)
+	}
+	// Validate freelist once at open; membership checks are O(1) thereafter.
+	if verr := freelist_rebuild_set(&p); verr != .None {
+		_ = pager_close(&p)
+		return {}, verr
 	}
 	return p, .None
 }
@@ -82,6 +88,7 @@ pager_close :: proc(p: ^Pager) -> Page_Error {
 	delete(p.frames)
 	p.frames = nil
 	delete(p.page_index)
+	delete(p.free_pages)
 
 	err: Page_Error = .None
 	if p.owns_file {
@@ -307,7 +314,8 @@ discard_dirty :: proc(p: ^Pager) -> Page_Error {
 
 	p.page_count = p.committed_page_count
 	p.freelist_head = p.committed_freelist_head
-	return .None
+	// Rebuild membership from the restored chain (aborted frees dropped with dirty frames).
+	return freelist_rebuild_set(p)
 }
 
 page_size :: proc(p: ^Pager) -> u32 {

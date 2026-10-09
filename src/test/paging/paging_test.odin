@@ -262,6 +262,65 @@ test_free_page_rejects_double_free :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_freelist_membership_set_tracks_many_frees :: proc(t: ^testing.T) {
+	// Membership set stays consistent through many free/alloc cycles (O(1) contains).
+	p, err := paging.pager_open_memory()
+	testing.expect(t, paging.ok(err))
+	defer paging.pager_close(&p)
+
+	pages: [32]dbfile.Page_No
+	for i in 0 ..< len(pages) {
+		n, aerr := paging.alloc_page(&p)
+		testing.expect(t, paging.ok(aerr))
+		pages[i] = n
+	}
+	for i in 0 ..< len(pages) {
+		testing.expect(t, paging.ok(paging.free_page(&p, pages[i])))
+		found, cerr := paging.freelist_contains(&p, pages[i])
+		testing.expect(t, paging.ok(cerr))
+		testing.expect(t, found)
+		testing.expect_value(t, len(p.free_pages), i + 1)
+	}
+	// Double-free of a deep list member must still be O(1)-rejected.
+	testing.expect_value(t, paging.free_page(&p, pages[0]), paging.Page_Error.Already_Free)
+	testing.expect_value(t, len(p.free_pages), len(pages))
+
+	for i in 0 ..< len(pages) {
+		reused, rerr := paging.alloc_page(&p)
+		testing.expect(t, paging.ok(rerr))
+		found, cerr := paging.freelist_contains(&p, reused)
+		testing.expect(t, paging.ok(cerr))
+		testing.expect(t, !found)
+		testing.expect_value(t, len(p.free_pages), len(pages) - 1 - i)
+	}
+	testing.expect_value(t, p.freelist_head, dbfile.Page_No(0))
+}
+
+@(test)
+test_freelist_set_rebuilds_on_discard :: proc(t: ^testing.T) {
+	p, err := paging.pager_open_memory()
+	testing.expect(t, paging.ok(err))
+	defer paging.pager_close(&p)
+
+	a, _ := paging.alloc_page(&p)
+	b, _ := paging.alloc_page(&p)
+	testing.expect(t, paging.ok(paging.flush(&p, {})))
+
+	testing.expect(t, paging.ok(paging.free_page(&p, b)))
+	found, cerr := paging.freelist_contains(&p, b)
+	testing.expect(t, paging.ok(cerr))
+	testing.expect(t, found)
+
+	testing.expect(t, paging.ok(paging.discard_dirty(&p)))
+	found2, cerr2 := paging.freelist_contains(&p, b)
+	testing.expect(t, paging.ok(cerr2))
+	testing.expect(t, !found2)
+	testing.expect_value(t, p.freelist_head, dbfile.Page_No(0))
+	testing.expect_value(t, len(p.free_pages), 0)
+	_ = a
+}
+
+@(test)
 test_discard_refused_after_partial_flush_failure :: proc(t: ^testing.T) {
 	// H2: after a mid-flush failure, discard_dirty is fenced until flush succeeds.
 	p, err := paging.pager_open_memory()

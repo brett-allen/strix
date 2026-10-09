@@ -200,6 +200,80 @@ test_shell_read_missing_file_continues :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_shell_read_path_with_spaces :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-read-space-%d.strix", os.get_pid())
+	sql_path := fmt.tprintf("/tmp/strix read script %d.sql", os.get_pid())
+	defer os.remove(path)
+	defer os.remove(sql_path)
+
+	testing.expect_value(t, cli.init_database(path), 0)
+	script := "CREATE TABLE spaced (id INTEGER PRIMARY KEY);\n"
+	werr := os.write_entire_file(sql_path, transmute([]byte)string(script))
+	testing.expect(t, werr == nil)
+
+	code := cli.shell_run_lines(
+		path,
+		[]string{
+			fmt.tprintf(`.read "%s"`, sql_path),
+			".quit",
+		},
+	)
+	testing.expect_value(t, code, 0)
+
+	session, err := exec.session_open(path)
+	testing.expect(t, !exec.has_error(err))
+	defer exec.free_error(err)
+	defer exec.session_close(&session)
+	names, lerr := exec.list_tables(&session)
+	testing.expectf(t, !exec.has_error(lerr), "%s", lerr.message)
+	defer exec.free_error(lerr)
+	defer exec.free_table_names(names)
+	testing.expect_value(t, len(names), 1)
+	testing.expect_value(t, names[0], "spaced")
+}
+
+@(test)
+test_shell_read_prints_all_select_results :: proc(t: ^testing.T) {
+	path := fmt.tprintf("/tmp/strix-read-multi-%d.strix", os.get_pid())
+	sql_path := fmt.tprintf("/tmp/strix-read-multi-%d.sql", os.get_pid())
+	defer os.remove(path)
+	defer os.remove(sql_path)
+
+	testing.expect_value(t, cli.init_database(path), 0)
+	script :=
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);\n" +
+		"INSERT INTO t (name) VALUES ('alpha'), ('beta');\n" +
+		"SELECT name FROM t WHERE id = 1;\n" +
+		"SELECT name FROM t WHERE id = 2;\n"
+	werr := os.write_entire_file(sql_path, transmute([]byte)string(script))
+	testing.expect(t, werr == nil)
+
+	r, w, perr := os.pipe()
+	testing.expect(t, perr == nil)
+	old_stdout := os.stdout
+	os.stdout = w
+	code := cli.shell_run_lines(
+		path,
+		[]string{
+			".headers off",
+			".mode list",
+			fmt.tprintf(".read %s", sql_path),
+			".quit",
+		},
+	)
+	os.close(w)
+	os.stdout = old_stdout
+	data, rerr := os.read_entire_file_from_file(r, context.allocator)
+	os.close(r)
+	testing.expect(t, rerr == nil)
+	out := string(data)
+	defer delete(out)
+	testing.expect_value(t, code, 0)
+	testing.expect(t, strings.contains(out, "alpha"))
+	testing.expect(t, strings.contains(out, "beta"))
+}
+
+@(test)
 test_shell_headers_mode_usage_rejects_invalid :: proc(t: ^testing.T) {
 	path := fmt.tprintf("/tmp/strix-c3-usage-%d.strix", os.get_pid())
 	defer os.remove(path)

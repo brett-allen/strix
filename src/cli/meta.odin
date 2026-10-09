@@ -38,6 +38,35 @@ meta_strip_trailing_semi :: proc(line: string) -> string {
 	return t
 }
 
+// meta_parse_path_arg extracts a single file path from meta-command args.
+// SQLite-ish: the remainder of the line is the path (spaces allowed), or a
+// single- or double-quoted path. Trailing junk after a quoted path is rejected.
+// The returned path is a slice into `args` (not allocated).
+meta_parse_path_arg :: proc(args: string) -> (path: string, ok: bool) {
+	t := strings.trim_space(args)
+	if t == "" {
+		return "", false
+	}
+	if t[0] == '"' || t[0] == '\'' {
+		quote := t[0]
+		end := -1
+		for i := 1; i < len(t); i += 1 {
+			if t[i] == quote {
+				end = i
+				break
+			}
+		}
+		if end < 0 {
+			return "", false
+		}
+		if strings.trim_space(t[end + 1:]) != "" {
+			return "", false
+		}
+		return t[1:end], true
+	}
+	return t, true
+}
+
 // meta_parse parses a meta-command line (leading '.'). Pure; no I/O.
 meta_parse :: proc(line: string) -> Meta_Cmd {
 	t := meta_strip_trailing_semi(line)
@@ -99,10 +128,10 @@ meta_help_text :: proc() -> string {
 		"  .mode column|list  Set SELECT output mode\n" +
 		"  .separator STR     Set list-mode column separator (default |)\n" +
 		"  .nullvalue STR     Set display string for NULL cells (default NULL)\n" +
-		"  .output FILE       Redirect stdout prints to FILE\n" +
+		"  .output FILE       Redirect stdout prints to FILE (quoted path OK)\n" +
 		"  .output stdout     Restore stdout\n" +
-		"  .read FILE         Execute SQL from FILE (SQL only; no .commands)\n" +
-		"  .open [path]       Show current DB path, or switch to path\n"
+		"  .read FILE         Execute SQL from FILE (SQL only; no .commands; quoted path OK)\n" +
+		"  .open [path]       Show current DB path, or switch to path (quoted path OK)\n"
 }
 
 // meta_dispatch runs a parsed meta-command against shell state.
@@ -242,27 +271,25 @@ meta_run_open :: proc(s: ^Shell_State, cmd: Meta_Cmd) {
 		fmt.println(s.db_path)
 		return
 	}
-	parts := strings.fields(cmd.args)
-	defer delete(parts)
-	if len(parts) != 1 {
+	path, ok := meta_parse_path_arg(cmd.args)
+	if !ok {
 		fmt.eprintln("usage: .open [path]")
 		return
 	}
-	_ = shell_switch_path(s, parts[0])
+	_ = shell_switch_path(s, path)
 }
 
 meta_run_output :: proc(s: ^Shell_State, cmd: Meta_Cmd) {
-	parts := strings.fields(cmd.args)
-	defer delete(parts)
-	if len(parts) != 1 {
+	path, ok := meta_parse_path_arg(cmd.args)
+	if !ok {
 		fmt.eprintln("usage: .output FILE|stdout")
 		return
 	}
-	if parts[0] == "stdout" {
+	if path == "stdout" {
 		shell_output_restore(s)
 		return
 	}
-	_ = shell_output_set(s, parts[0])
+	_ = shell_output_set(s, path)
 }
 
 meta_run_separator :: proc(s: ^Shell_State, cmd: Meta_Cmd) {
@@ -300,13 +327,11 @@ meta_run_nullvalue :: proc(s: ^Shell_State, cmd: Meta_Cmd) {
 // meta_run_read executes a SQL-only script file on the current session.
 // Dot-commands inside the file are not interpreted (passed to exec as SQL).
 meta_run_read :: proc(s: ^Shell_State, cmd: Meta_Cmd) {
-	parts := strings.fields(cmd.args)
-	defer delete(parts)
-	if len(parts) != 1 {
+	path, ok := meta_parse_path_arg(cmd.args)
+	if !ok {
 		fmt.eprintln("usage: .read FILE")
 		return
 	}
-	path := parts[0]
 	data, err := os.read_entire_file_from_path(path, context.allocator)
 	if err != os.ERROR_NONE {
 		fmt.eprintf("strix shell: failed to read %s\n", path)

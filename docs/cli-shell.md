@@ -176,14 +176,14 @@ Usage text must list `shell` alongside `init` / `sql`.
 
 | Command | Arguments | Behavior | AC (summary) |
 |---------|-----------|----------|--------------|
-| `.help` | none or `[cmd]` | List commands (and short help for one) | User sees every v1 command documented |
+| `.help` | none | List all shipped commands (v1 has no per-command `.help cmd` topic) | User sees every v1 command documented |
 | `.quit` / `.exit` | none | Close session; exit process **0** | Synonyms; both work; **refuse** while flush fence live (retry `COMMIT` first) — no exit 0 over uncleared fence |
 | `.tables` | none | List user table names (catalog), one per line or spaced like SQLite | After `CREATE TABLE`, name appears; empty DB → empty/no tables message |
 | `.schema` | `[table]` | Print synthesized `CREATE TABLE` (and indexes if cheap) from **catalog meta**, not a second SQL dialect | No arg → all tables; with arg → that table or clear “no such table” |
-| `.read` | `FILE` | Read file as SQL text; execute via `exec_script` on current session | Relative path; errors formatted; REPL continues; incomplete/meta mix in file: SQL only (files are SQL scripts, not dot-commands) unless a later phase says otherwise |
+| `.read` | `FILE` | Read file as SQL text; execute via `exec_script` on current session | Path may contain spaces (remainder of line, or `'…'` / `"…"` quotes); errors formatted; REPL continues; **prints each statement result** in script order (not only the last); incomplete/meta mix in file: SQL only (files are SQL scripts, not dot-commands) unless a later phase says otherwise |
 | `.headers` | `on` \| `off` | Toggle column-name header row for result sets | Default **on**; affects shell SELECT print; batch `strix sql` stays headers-on unless later shared |
 | `.mode` | `column` \| `list` | `column` = aligned table (today); `list` = separator-delimited (`\|` default, SQLite-like) | Switching modes changes subsequent SELECT output only |
-| `.open` | `[path]` | Close current session; open path (`ensure_strix_path`); no arg → print current path; `.open path` switches | Failed open → stderr, **keep previous session**; **refuse early** while `explicit_txn` or engine `in_txn` (COMMIT/ROLLBACK first — no silent rollback; covers flush-fence recovery; the late “close refused after opening the new path” branch is defensive/dead under that early check); on success reset `sql_buf`, restore `.output` to stdout, clear `had_sql_error`/`quit` (keep `--bail`); startup open failure → exit 1 |
+| `.open` | `[path]` | Close current session; open path (`ensure_strix_path`); no arg → print current path; `.open path` switches | Path may contain spaces (remainder of line, or quoted); failed open → stderr, **keep previous session**; **refuse early** while `explicit_txn` or engine `in_txn` (COMMIT/ROLLBACK first — no silent rollback; covers flush-fence recovery; the late “close refused after opening the new path” branch is defensive/dead under that early check); on success reset `sql_buf`, restore `.output` to stdout, clear `had_sql_error`/`quit` (keep `--bail`); startup open failure → exit 1 |
 
 ### Out of scope for v1 (stretch / later)
 
@@ -239,6 +239,10 @@ Do **not** break existing CLI tests or `parse_sql_command_args` contracts while 
 | `.mode list` | off | `col1\|col2\|…` per row; header line when headers on |
 
 DDL/DML non-result output stays `ok` / `N rows` on stdout (not mode-sensitive).
+
+**Multi-statement scripts** (`.read` and batch `strix sql`): `exec_script` keeps every statement result; the CLI prints them in order (`ok` / `N rows` / each result set), not only the last statement. Interactive typed SQL still runs one complete statement at a time via `exec_statement`.
+
+**Paths with spaces:** `.open`, `.read`, and `.output` take the remainder of the line as the path, or a single-quoted / double-quoted path (trailing junk after a quoted path is rejected).
 
 ---
 

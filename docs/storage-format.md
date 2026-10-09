@@ -87,6 +87,7 @@ Rules:
 - `alloc_page`: pop `freelist_head` if non-zero; else extend logical `page_count`.
 - `free_page`: push page onto the list (write `next_free = old head`, set head = page).
 - Freelist trunk bytes are persisted with other dirty data pages on flush.
+- **In-memory membership:** the pager keeps a `free_pages` set rebuilt from the chain at open and after `discard_dirty`. Double-free checks are O(1); full-chain validation runs at rebuild time (not on every `alloc_page` / `free_page`). On-disk format is unchanged.
 
 ---
 

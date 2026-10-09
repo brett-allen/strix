@@ -80,6 +80,35 @@ test_meta_parse_headers_mode_read :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_meta_parse_path_arg_spaces_and_quotes :: proc(t: ^testing.T) {
+	// Remainder of line (SQLite-ish) preserves spaces.
+	p, ok := cli.meta_parse_path_arg("/tmp/my db/file.sql")
+	testing.expect(t, ok)
+	testing.expect_value(t, p, "/tmp/my db/file.sql")
+
+	p2, ok2 := cli.meta_parse_path_arg(`"/tmp/my db/file.sql"`)
+	testing.expect(t, ok2)
+	testing.expect_value(t, p2, "/tmp/my db/file.sql")
+
+	p3, ok3 := cli.meta_parse_path_arg("'/tmp/my db/file.sql'")
+	testing.expect(t, ok3)
+	testing.expect_value(t, p3, "/tmp/my db/file.sql")
+
+	_, bad := cli.meta_parse_path_arg(`"/tmp/a.sql" trailing`)
+	testing.expect(t, !bad)
+	_, bare := cli.meta_parse_path_arg("")
+	testing.expect(t, !bare)
+
+	// meta_parse keeps the full args string; path extraction is at dispatch.
+	r := cli.meta_parse(`.read "/tmp/my db/script.sql"`)
+	testing.expect(t, r.ok)
+	testing.expect_value(t, r.kind, cli.Meta_Kind.Read)
+	path, pok := cli.meta_parse_path_arg(r.args)
+	testing.expect(t, pok)
+	testing.expect_value(t, path, "/tmp/my db/script.sql")
+}
+
+@(test)
 test_meta_dispatch_unknown_stays :: proc(t: ^testing.T) {
 	s: cli.Shell_State
 	cli.shell_state_init(&s)

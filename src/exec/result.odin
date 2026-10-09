@@ -11,9 +11,23 @@ Exec_Result :: struct {
 	rows_affected: int,
 	column_names:  []string, // Result_Set: owned names
 	rows:          [][]string, // Result_Set: owned cell strings
+	// preceding: earlier statement results from exec_script (owned).
+	// Primary fields are the last statement; single-statement APIs leave this nil.
+	preceding:     []Exec_Result,
 }
 
 free_result :: proc(result: Exec_Result, allocator := context.allocator) {
+	for part in result.preceding {
+		// Parts never nest preceding; free leaf fields only.
+		free_result_leaf(part, allocator)
+	}
+	if result.preceding != nil {
+		delete(result.preceding, allocator)
+	}
+	free_result_leaf(result, allocator)
+}
+
+free_result_leaf :: proc(result: Exec_Result, allocator := context.allocator) {
 	for name in result.column_names {
 		if name != "" {
 			delete(name, allocator)

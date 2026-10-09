@@ -334,6 +334,14 @@ shell_display_opts :: proc(s: ^Shell_State) -> Display_Opts {
 }
 
 print_exec_result :: proc(result: exec.Exec_Result, opts := DEFAULT_DISPLAY_OPTS) {
+	// Script aggregates: print each statement result in order (preceding then last).
+	for part in result.preceding {
+		print_exec_result_one(part, opts)
+	}
+	print_exec_result_one(result, opts)
+}
+
+print_exec_result_one :: proc(result: exec.Exec_Result, opts := DEFAULT_DISPLAY_OPTS) {
 	switch result.kind {
 	case .Ok:
 		fmt.println("ok")
@@ -370,6 +378,11 @@ shell_exec_sql :: proc(s: ^Shell_State, sql_text: string) {
 		formatted := exec.format_error(err)
 		defer delete(formatted)
 		fmt.eprintf("%s\n", formatted)
+		// Explicit-txn write abort: surface a clear note (scripts annotate via exec_script).
+		if s.session.txn_aborted && !s.session.explicit_txn {
+			fmt.eprintln("transaction aborted")
+			s.session.txn_aborted = false // settled; don't poison later independent errors
+		}
 		exec.free_error(err)
 		exec.free_result(result)
 		shell_note_sql_error(s)
