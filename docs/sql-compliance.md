@@ -28,8 +28,8 @@ Already landed (do not re-implement):
 | Layer | Status | Notes |
 |-------|--------|--------|
 | `src/sql` | Parser v1 | Parses `CAST`, `JOIN`, `GROUP BY`/`HAVING`, aggregates-as-calls, UNIQUE/PK constraints — many reject at bind/exec |
-| `src/exec` | E1–E6 + **S5** | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; rejects composite PK; whole-query aggregates (S4) + single-table `GROUP BY` / `HAVING` (S5) |
-| Expression eval | E3 + **S1** + **S2** + **S4** + **S5** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2); whole-query aggregates (S4); grouped aggregates (S5) |
+| `src/exec` | E1–E6 + **S6** | CRUD, indexes, scripts/txns; sole `INTEGER`/`INT` PK = IPK (rowid alias); TEXT/UUID-style single-column PK + UNIQUE via system unique indexes; rejects composite PK; whole-query aggregates (S4) + `GROUP BY` / `HAVING` (S5) + two-table `INNER`/`CROSS` joins (S6) |
+| Expression eval | E3 + **S1** + **S2** + **S4** + **S5** + **S6** | Strict boolean context (Text/Blob rejected); Integer–Integer exact `i64`; mixed int/float via `f64`; Text/Blob↔numeric without `CAST` → error; scalar `CAST(expr AS type)` executed (S2); whole-query aggregates (S4); grouped aggregates (S5); multi-table column bind / ambiguity (S6) |
 | Catalog / rows | v2 tables, heap codec | `columns[]` + `next_rowid`; btree key = internal rowid |
 | CLI / shell | `strix sql` / `strix shell` | Batch + REPL; `.dot` meta-commands are **not** SQL |
 
@@ -87,7 +87,7 @@ SQLite-isms to **remove**, **tighten**, or **demote to a named extension**. Defa
 | `CAST` parsed, exec rejects | Scalar `CAST` executed | **S2** | **Implement** |
 | `COUNT` / aggregates rejected | `COUNT(*)` then richer aggs | **S4** | **Implement** |
 | `GROUP BY` / `HAVING` rejected | Whole-query then grouped aggs | **S5** | **Implement** (done) |
-| `JOIN` rejected | `INNER JOIN` first | **S6** | **Implement** |
+| `JOIN` rejected | `INNER JOIN` first | **S6** | **Implement** (done) |
 | Bracket / backtick identifiers | Keep as **extension** (parser already accepts) | — | **Extension** |
 | `IF NOT EXISTS` / `IF EXISTS` | Keep as **extension** | — | **Extension** |
 | `.dot` shell commands | Not SQL — stay shell-only | — | **Extension** (non-SQL) |
@@ -255,12 +255,12 @@ User-visible: predicates stop lying; type mismatches fail clearly.
 
 ### Phase S6 — `JOIN` (INNER first)
 
-- [ ] `INNER JOIN` … `ON expr` (two tables); column binding with optional aliases / `t.col`
-- [ ] `CROSS JOIN` / comma-join if already parsed — only if same pipeline is cheap; else reject clearly until follow-on
-- [ ] Defer `LEFT OUTER` unless trivial once INNER is solid (default: **INNER only** in S6)
-- [ ] Tests: equi-join filter; unknown column; ambiguous column errors
-- [ ] Coverage inventory: [`sql-compliance-s6-coverage.md`](sql-compliance-s6-coverage.md) ≥80%
-- [ ] Update dialect “Executed vs parsed only” for joins
+- [x] `INNER JOIN` … `ON expr` (two tables); column binding with optional aliases / `t.col`
+- [x] `CROSS JOIN` / comma-join if already parsed — only if same pipeline is cheap; else reject clearly until follow-on
+- [x] Defer `LEFT OUTER` unless trivial once INNER is solid (default: **INNER only** in S6) — `LEFT` / `USING` / 3+ tables rejected clearly
+- [x] Tests: equi-join filter; unknown column; ambiguous column errors
+- [x] Coverage inventory: [`sql-compliance-s6-coverage.md`](sql-compliance-s6-coverage.md) ≥80%
+- [x] Update dialect “Executed vs parsed only” for joins
 
 **Exit:** Two-table inner joins runnable via CLI/shell.
 
@@ -295,11 +295,11 @@ User-visible: predicates stop lying; type mismatches fail clearly.
 
 Not a single ship gate — **each phase has its own exit**. Program-level success looks like:
 
-- [ ] S0 docs live; dialect/execute framing updated
+- [x] S0 docs live; dialect/execute framing updated
 - [x] S1–S3 landed → TEXT/UUID PK + strict eval + `CAST` (minimum product arc)
-- [ ] S4–S6 landed → aggregates, groups, inner joins (query arc) — **S4–S5 done**; S6 remains
-- [ ] Dialect matrix honest; extensions named; no affinity claims
-- [ ] Coverage inventories ≥80% per implemented phase
+- [x] S4–S6 landed → aggregates, groups, inner joins (query arc)
+- [x] Dialect matrix honest; extensions named; no affinity claims
+- [x] Coverage inventories ≥80% per implemented phase
 
 ---
 
@@ -328,4 +328,5 @@ Defaults stand unless overridden before/during the relevant phase:
 5. ~~Implement **S3** (UNIQUE + TEXT PK) with `sql-compliance-s3-coverage.md`.~~
 6. ~~Implement **S4** (`COUNT(*)` / aggregates) with `sql-compliance-s4-coverage.md`.~~
 7. ~~Implement **S5** (`GROUP BY` / `HAVING`) with `sql-compliance-s5-coverage.md`.~~
-8. Next: **S6** (`INNER JOIN`).
+8. ~~Implement **S6** (`INNER JOIN`) with `sql-compliance-s6-coverage.md`.~~
+9. Compliance query arc complete through S6; remaining open questions (LEFT OUTER, 3+ tables, composite PK, …) are follow-on work.

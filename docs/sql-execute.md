@@ -50,7 +50,7 @@ Already landed (do not re-implement):
 ## Non-goals (execute v1)
 
 - Query planner / cost-based optimizer (trivial plans only: seq scan, point insert, etc.).
-- Joins, subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore). `GROUP BY`/`HAVING` executed for single-table selects (S5).
+- Subqueries, views, triggers, CTEs — parser may accept some; executor returns a clear “not supported” error (never silent ignore). `GROUP BY`/`HAVING` executed (S5). Two-table `INNER`/`CROSS` joins executed (S6); `LEFT OUTER` / `USING` / 3+ tables still rejected.
 - Prepared statements and parameter binding (`?` / `?N`): **defer**; literals only for v1 DML.
 - Concurrent sessions / MVCC.
 - WAL (still deferred at storage layer).
@@ -271,7 +271,7 @@ First milestone. Package scaffolding is whatever E1 needs to compile — it is *
 - [x] `FROM` single table; optional alias
 - [x] `WHERE` on bound columns (expression eval over row values — see [Expression evaluation](#expression-evaluation-binderexecutor))
 - [x] `ORDER BY` / `LIMIT` / `OFFSET` in executor (in-memory sort OK for v1)
-- [x] Reject joins / subqueries / `DISTINCT` (unless trivial) clearly; `GROUP BY`/`HAVING` later executed in S5
+- [x] Reject subqueries / `DISTINCT` clearly; `GROUP BY`/`HAVING` executed in S5; two-table `INNER`/`CROSS` joins executed in S6 (`LEFT` / `USING` / 3+ tables still rejected)
 - [x] CLI prints result sets
 - [x] Tests: filter/sort/limit; create/insert/select round-trip; negatives with codes
 - [x] Coverage inventory: [`exec-e3-coverage.md`](exec-e3-coverage.md)
@@ -321,10 +321,11 @@ For `WHERE` / `SET` / projections (mainly E3–E4):
 - Eval AST `Expr` against a **row environment** (column name/index → `Value`).
 - Support parser Phase 1 exprs that are meaningful on scalars: literals, column refs, comparisons, `AND`/`OR`/`NOT`, arithmetic, `IS NULL`, `IN` list (see [`sql-parser.md`](sql-parser.md) Phase 1).
 - **Integer–Integer** comparisons use exact `i64` ordering (not `f64`); mixed integer/float still coerces via `f64`.
-- Fail clearly on unbound names, type conflicts, or unsupported nodes (`BETWEEN` optional; joins later).
+- Fail clearly on unbound names, type conflicts, or unsupported nodes (`BETWEEN` optional).
 - **S2:** scalar `CAST(expr AS type)` is executed — supported pairs and Text→INTEGER rules live in [`sql-dialect.md`](sql-dialect.md) § Scalar CAST and [`sql-compliance.md`](sql-compliance.md) Phase S2. Invalid casts error (not NULL-by-affinity).
-- **S4:** whole-query aggregates (`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) on single-table `SELECT` without `GROUP BY` — see [`sql-dialect.md`](sql-dialect.md) § Aggregates and [`sql-compliance.md`](sql-compliance.md) Phase S4. Mix of aggregates with bare columns without `GROUP BY` → `Unsupported_Ast` (strict).
-- **S5:** single-table `GROUP BY` (column refs) + `HAVING`; strict select list; empty groups → 0 rows — see [`sql-dialect.md`](sql-dialect.md) § GROUP BY / HAVING and [`sql-compliance.md`](sql-compliance.md) Phase S5.
+- **S4:** whole-query aggregates (`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) on `SELECT` without `GROUP BY` — see [`sql-dialect.md`](sql-dialect.md) § Aggregates and [`sql-compliance.md`](sql-compliance.md) Phase S4. Mix of aggregates with bare columns without `GROUP BY` → `Unsupported_Ast` (strict).
+- **S5:** `GROUP BY` (column refs) + `HAVING`; strict select list; empty groups → 0 rows — see [`sql-dialect.md`](sql-dialect.md) § GROUP BY / HAVING and [`sql-compliance.md`](sql-compliance.md) Phase S5.
+- **S6:** two-table `INNER JOIN` … `ON` / `CROSS JOIN` / comma-join (nested-loop); multi-table column bind with aliases / `t.col`; ambiguous unqualified → `Unknown_Column`; aggs/`GROUP BY` over joins supported — see [`sql-dialect.md`](sql-dialect.md) § JOIN and [`sql-compliance.md`](sql-compliance.md) Phase S6.
 
 Do **not** implement a full SQL type system in E1–E3 — use a small runtime `Value` tagged union; conversion is explicit via `CAST`.
 
@@ -356,7 +357,7 @@ Exec_Error :: struct {
 | `exec` unit | Bind failures; schema meta; CREATE/DROP; later row codec + DML |
 | Integration | Temp `.strix` via `engine_create`; SQL → reopen catalog/rows |
 | CLI | Smoke from E1: `init` + `sql -c 'CREATE TABLE …'`; pure `parse_sql_command_args` unit tests |
-| Negative | Unsupported AST (join, etc.) → stable error code |
+| Negative | Unsupported AST (`LEFT JOIN`, `DISTINCT`, etc.) → stable error code |
 
 Wire `src/test/exec` into `./build.sh test` as part of E1.
 

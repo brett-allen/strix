@@ -422,6 +422,7 @@ resolve_group_by_columns :: proc(
 	stmt: sql.Select_Stmt,
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
+	sides: []Join_Side = nil,
 	allocator := context.allocator,
 ) -> ([]int, Exec_Error) {
 	if len(stmt.group_by) == 0 {
@@ -443,6 +444,7 @@ resolve_group_by_columns :: proc(
 			table_name,
 			alias,
 			expr.span,
+			sides,
 		)
 		if has_error(rerr) {
 			delete(out, allocator)
@@ -474,6 +476,7 @@ validate_expr_group_cols :: proc(
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
 	in_agg_arg: bool = false,
+	sides: []Join_Side = nil,
 ) -> Exec_Error {
 	if expr == nil {
 		return ok_error()
@@ -491,6 +494,7 @@ validate_expr_group_cols :: proc(
 			table_name,
 			alias,
 			expr.span,
+			sides,
 		)
 		if has_error(rerr) {
 			return rerr
@@ -511,13 +515,14 @@ validate_expr_group_cols :: proc(
 			table_name,
 			alias,
 			in_agg_arg,
+			sides,
 		)
 	case .Binary:
 		d := expr.data.(sql.Binary_Data)
-		if err := validate_expr_group_cols(d.left, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+		if err := validate_expr_group_cols(d.left, group_idxs, columns, table_name, alias, in_agg_arg, sides); has_error(err) {
 			return err
 		}
-		return validate_expr_group_cols(d.right, group_idxs, columns, table_name, alias, in_agg_arg)
+		return validate_expr_group_cols(d.right, group_idxs, columns, table_name, alias, in_agg_arg, sides)
 	case .Is_Null:
 		return validate_expr_group_cols(
 			expr.data.(sql.Is_Null_Data).expr,
@@ -526,27 +531,28 @@ validate_expr_group_cols :: proc(
 			table_name,
 			alias,
 			in_agg_arg,
+			sides,
 		)
 	case .In_List:
 		d := expr.data.(sql.In_List_Data)
-		if err := validate_expr_group_cols(d.expr, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+		if err := validate_expr_group_cols(d.expr, group_idxs, columns, table_name, alias, in_agg_arg, sides); has_error(err) {
 			return err
 		}
 		for v in d.values {
-			if err := validate_expr_group_cols(v, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+			if err := validate_expr_group_cols(v, group_idxs, columns, table_name, alias, in_agg_arg, sides); has_error(err) {
 				return err
 			}
 		}
 		return ok_error()
 	case .Between:
 		d := expr.data.(sql.Between_Data)
-		if err := validate_expr_group_cols(d.expr, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+		if err := validate_expr_group_cols(d.expr, group_idxs, columns, table_name, alias, in_agg_arg, sides); has_error(err) {
 			return err
 		}
-		if err := validate_expr_group_cols(d.low, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+		if err := validate_expr_group_cols(d.low, group_idxs, columns, table_name, alias, in_agg_arg, sides); has_error(err) {
 			return err
 		}
-		return validate_expr_group_cols(d.high, group_idxs, columns, table_name, alias, in_agg_arg)
+		return validate_expr_group_cols(d.high, group_idxs, columns, table_name, alias, in_agg_arg, sides)
 	case .Cast:
 		return validate_expr_group_cols(
 			expr.data.(sql.Cast_Data).expr,
@@ -555,6 +561,7 @@ validate_expr_group_cols :: proc(
 			table_name,
 			alias,
 			in_agg_arg,
+			sides,
 		)
 	case .Call:
 		d := expr.data.(sql.Call_Data)
@@ -571,14 +578,14 @@ validate_expr_group_cols :: proc(
 				return rerr
 			}
 			for arg in d.args {
-				if err := validate_expr_group_cols(arg, group_idxs, columns, table_name, alias, true); has_error(err) {
+				if err := validate_expr_group_cols(arg, group_idxs, columns, table_name, alias, true, sides); has_error(err) {
 					return err
 				}
 			}
 			return ok_error()
 		}
 		for arg in d.args {
-			if err := validate_expr_group_cols(arg, group_idxs, columns, table_name, alias, in_agg_arg); has_error(err) {
+			if err := validate_expr_group_cols(arg, group_idxs, columns, table_name, alias, in_agg_arg, sides); has_error(err) {
 				return err
 			}
 		}
@@ -594,9 +601,10 @@ prepare_grouped_select :: proc(
 	stmt: sql.Select_Stmt,
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
+	sides: []Join_Side = nil,
 	allocator := context.allocator,
 ) -> (group_idxs: []int, slots: []Agg_Slot, err: Exec_Error) {
-	gidxs, gerr := resolve_group_by_columns(stmt, columns, table_name, alias, allocator)
+	gidxs, gerr := resolve_group_by_columns(stmt, columns, table_name, alias, sides, allocator)
 	if has_error(gerr) {
 		return nil, nil, gerr
 	}
@@ -625,6 +633,8 @@ prepare_grouped_select :: proc(
 				columns,
 				table_name,
 				alias,
+				false,
+				sides,
 			); has_error(verr) {
 				delete(gidxs, allocator)
 				return nil, nil, verr
@@ -639,6 +649,8 @@ prepare_grouped_select :: proc(
 			columns,
 			table_name,
 			alias,
+			false,
+			sides,
 		); has_error(verr) {
 			delete(gidxs, allocator)
 			return nil, nil, verr
@@ -655,6 +667,8 @@ prepare_grouped_select :: proc(
 			columns,
 			table_name,
 			alias,
+			false,
+			sides,
 		); has_error(verr) {
 			delete(gidxs, allocator)
 			return nil, nil, verr
@@ -1167,6 +1181,8 @@ validate_agg_projection_exprs :: proc(
 	slots: []Agg_Slot,
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
+	sides: []Join_Side = nil,
+	on_expr: ^sql.Expr = nil,
 ) -> Exec_Error {
 	nulls := make([]Value, len(columns))
 	defer delete(nulls)
@@ -1178,6 +1194,14 @@ validate_agg_projection_exprs :: proc(
 		alias   = alias,
 		columns = columns,
 		values  = nulls,
+		sides   = sides,
+	}
+	if on_expr != nil {
+		v, err := eval_expr(on_expr, &env)
+		free_value(v)
+		if has_error(err) {
+			return err
+		}
 	}
 	if stmt.where_expr != nil {
 		v, err := eval_expr(stmt.where_expr, &env)

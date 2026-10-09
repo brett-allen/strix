@@ -27,7 +27,8 @@ free_bound_projs :: proc(projs: []Bound_Proj, allocator := context.allocator) {
 	}
 }
 
-// exec_select runs a single-table SELECT (seq scan + in-memory filter/sort/limit).
+// exec_select runs SELECT: single-table seq scan, or two-table nested-loop JOIN
+// (S6), then in-memory filter/sort/limit (and optional aggregates / GROUP BY).
 exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> (Exec_Result, Exec_Error) {
 	e := session_engine(s)
 	if e == nil {
@@ -43,6 +44,8 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		return {}, make_error(.Invalid_Schema, "SELECT requires a FROM table", span = span)
 	}
 
+	is_join := len(stmt.joins) > 0
+
 	entry, gerr := engine.catalog_get_table_entry(e, table_name)
 	if gerr == .Not_Found {
 		return {}, make_error(.Unknown_Table, "no such table: %q", table_name, span = span)
@@ -56,7 +59,58 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		return {}, make_error(.Invalid_Schema, "table %q has no columns", table_name, span = span)
 	}
 
-	projs, perr := bind_select_projection(stmt, entry.columns, table_name, stmt.from.alias)
+	right_entry: engine.Catalog_Entry
+	flat_cols: []engine.Catalog_Column = entry.columns
+	join_sides: []Join_Side = nil
+	right_table := ""
+	right_alias := ""
+	on_expr: ^sql.Expr = nil
+
+	if is_join {
+		j := stmt.joins[0]
+		right_table = j.table.table
+		right_alias = j.table.alias
+		on_expr = j.on
+		rentry, rgerr := engine.catalog_get_table_entry(e, right_table)
+		if rgerr == .Not_Found {
+			return {}, make_error(.Unknown_Table, "no such table: %q", right_table, span = j.span)
+		}
+		if rgerr != .None {
+			return {}, from_engine_error(rgerr, j.span)
+		}
+		right_entry = rentry
+		if len(right_entry.columns) == 0 {
+			engine.free_catalog_entry(right_entry)
+			return {}, make_error(.Invalid_Schema, "table %q has no columns", right_table, span = j.span)
+		}
+		fc, sides, ferr := build_flat_join_columns(
+			entry.columns,
+			right_entry.columns,
+			table_name,
+			stmt.from.alias,
+			right_table,
+			right_alias,
+		)
+		if has_error(ferr) {
+			engine.free_catalog_entry(right_entry)
+			return {}, ferr
+		}
+		flat_cols = fc
+		join_sides = sides
+	}
+	defer {
+		if is_join {
+			engine.free_catalog_entry(right_entry)
+			if flat_cols != nil {
+				delete(flat_cols)
+			}
+			if join_sides != nil {
+				delete(join_sides)
+			}
+		}
+	}
+
+	projs, perr := bind_select_projection(stmt, flat_cols, table_name, stmt.from.alias, join_sides)
 	if has_error(perr) {
 		return {}, perr
 	}
@@ -68,14 +122,15 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 	is_agg := false
 
 	if is_grouped {
-		gidxs, gslots, gerr := prepare_grouped_select(
+		gidxs, gslots, gerr2 := prepare_grouped_select(
 			stmt,
-			entry.columns,
+			flat_cols,
 			table_name,
 			stmt.from.alias,
+			join_sides,
 		)
-		if has_error(gerr) {
-			return {}, gerr
+		if has_error(gerr2) {
+			return {}, gerr2
 		}
 		group_idxs = gidxs
 		agg_slots = gslots
@@ -98,14 +153,24 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		if verr := validate_agg_projection_exprs(
 			stmt,
 			agg_slots,
-			entry.columns,
+			flat_cols,
 			table_name,
 			stmt.from.alias,
+			join_sides,
+			on_expr,
 		); has_error(verr) {
 			return {}, verr
 		}
 	} else {
-		if verr := validate_select_exprs(stmt, projs, entry.columns, table_name, stmt.from.alias); has_error(verr) {
+		if verr := validate_select_exprs(
+			stmt,
+			projs,
+			flat_cols,
+			table_name,
+			stmt.from.alias,
+			join_sides,
+			on_expr,
+		); has_error(verr) {
 			return {}, verr
 		}
 	}
@@ -127,122 +192,166 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		offset_n = int(n)
 	}
 
-	tree, oerr := engine.catalog_open_table(e, table_name)
-	if oerr != .None {
-		return {}, from_engine_error(oerr, span)
-	}
-
-	matched := make([dynamic][]Value, 0, 16)
-	defer {
-		free_scanned_rows(matched[:])
-		delete(matched)
-	}
-
 	env := Row_Env{
 		table   = table_name,
 		alias   = stmt.from.alias,
-		columns = entry.columns,
+		columns = flat_cols,
+		sides   = join_sides,
 	}
 
-	// Index point lookup: fail hard on Engine/Io/encode errors; seq-scan only when
-	// there is cleanly no usable index (no sargable eq, or no matching single-col index).
-	used_index := false
-	if stmt.where_expr != nil {
-		col_idx, const_val, is_eq := find_single_column_eq_const(
-			stmt.where_expr,
-			entry.columns,
-			table_name,
-			stmt.from.alias,
-		)
-		if is_eq {
-			defer free_value(const_val)
-			idx_refs, ixerr := engine.catalog_indexes_on_table(e, table_name)
-			if ixerr != .None {
-				return {}, from_engine_error(ixerr, span)
-			}
-			defer engine.free_catalog_index_refs(idx_refs)
-			if iname, iok := find_usable_eq_index(idx_refs, entry.columns, col_idx); iok {
-				ikey_vals := []Value{const_val}
-				ikey, kerr := encode_index_key(ikey_vals)
-				if has_error(kerr) {
-					return {}, kerr
+	matched := make([dynamic][]Value, 0, 16)
+	if is_join {
+		left_rows, lerr := scan_table_rows(e, table_name, span)
+		if has_error(lerr) {
+			delete(matched)
+			return {}, lerr
+		}
+		defer {
+			free_scanned_rows(left_rows)
+			delete(left_rows)
+		}
+		right_rows, rerr := scan_table_rows(e, right_table, span)
+		if has_error(rerr) {
+			delete(matched)
+			return {}, rerr
+		}
+		defer {
+			free_scanned_rows(right_rows)
+			delete(right_rows)
+		}
+		if jerr := nested_loop_join(&matched, left_rows, right_rows, on_expr, stmt.where_expr, &env); has_error(jerr) {
+			free_scanned_rows(matched[:])
+			delete(matched)
+			return {}, jerr
+		}
+	} else {
+		tree, oerr := engine.catalog_open_table(e, table_name)
+		if oerr != .None {
+			delete(matched)
+			return {}, from_engine_error(oerr, span)
+		}
+
+		// Index point lookup: fail hard on Engine/Io/encode errors; seq-scan only when
+		// there is cleanly no usable index (no sargable eq, or no matching single-col index).
+		used_index := false
+		if stmt.where_expr != nil {
+			col_idx, const_val, is_eq := find_single_column_eq_const(
+				stmt.where_expr,
+				entry.columns,
+				table_name,
+				stmt.from.alias,
+			)
+			if is_eq {
+				defer free_value(const_val)
+				idx_refs, ixerr := engine.catalog_indexes_on_table(e, table_name)
+				if ixerr != .None {
+					delete(matched)
+					return {}, from_engine_error(ixerr, span)
 				}
-				itree, ioerr := engine.catalog_open_index(e, iname)
-				if ioerr != .None {
+				defer engine.free_catalog_index_refs(idx_refs)
+				if iname, iok := find_usable_eq_index(idx_refs, entry.columns, col_idx); iok {
+					ikey_vals := []Value{const_val}
+					ikey, kerr := encode_index_key(ikey_vals)
+					if has_error(kerr) {
+						delete(matched)
+						return {}, kerr
+					}
+					itree, ioerr := engine.catalog_open_index(e, iname)
+					if ioerr != .None {
+						delete(ikey)
+						delete(matched)
+						return {}, from_engine_error(ioerr, span)
+					}
+					rowids, rerr := engine.index_collect_rowids(&itree, ikey)
 					delete(ikey)
-					return {}, from_engine_error(ioerr, span)
-				}
-				rowids, rerr := engine.index_collect_rowids(&itree, ikey)
-				delete(ikey)
-				if rerr != .None {
-					return {}, from_engine_error(rerr, span)
-				}
-				defer delete(rowids)
-				for rowid in rowids {
-					payload, gerr := engine.table_get_row(&tree, rowid)
-					if gerr != .None {
-						return {}, from_engine_error(gerr, span)
+					if rerr != .None {
+						delete(matched)
+						return {}, from_engine_error(rerr, span)
 					}
-					vals, derr := decode_heap_row(payload)
-					delete(payload)
-					if has_error(derr) {
-						return {}, derr
+					defer delete(rowids)
+					for rowid in rowids {
+						payload, gerr3 := engine.table_get_row(&tree, rowid)
+						if gerr3 != .None {
+							free_scanned_rows(matched[:])
+							delete(matched)
+							return {}, from_engine_error(gerr3, span)
+						}
+						vals, derr := decode_heap_row(payload)
+						delete(payload)
+						if has_error(derr) {
+							free_scanned_rows(matched[:])
+							delete(matched)
+							return {}, derr
+						}
+						env.values = vals
+						ok, werr := eval_expr_bool(stmt.where_expr, &env)
+						if has_error(werr) {
+							free_values(vals)
+							free_scanned_rows(matched[:])
+							delete(matched)
+							return {}, werr
+						}
+						if ok {
+							append(&matched, vals)
+						} else {
+							free_values(vals)
+						}
 					}
-					// Re-check WHERE (handles non-sargable extras if we ever widen matcher).
-					env.values = vals
+					used_index = true
+				}
+			}
+		}
+
+		if !used_index {
+			cur := engine.btree_cursor_init(&tree)
+			defer engine.btree_cursor_close(&cur)
+
+			start_key: [8]u8
+			_ = engine.rowid_key(0, start_key[:])
+			if serr := engine.btree_seek_ge(&cur, start_key[:]); serr != .None {
+				free_scanned_rows(matched[:])
+				delete(matched)
+				return {}, from_engine_error(serr, span)
+			}
+
+			for engine.btree_cursor_valid(&cur) {
+				payload := engine.btree_cursor_payload(&cur)
+				vals, derr := decode_heap_row(payload)
+				if has_error(derr) {
+					free_scanned_rows(matched[:])
+					delete(matched)
+					return {}, derr
+				}
+
+				env.values = vals
+				keep := true
+				if stmt.where_expr != nil {
 					ok, werr := eval_expr_bool(stmt.where_expr, &env)
 					if has_error(werr) {
 						free_values(vals)
+						free_scanned_rows(matched[:])
+						delete(matched)
 						return {}, werr
 					}
-					if ok {
-						append(&matched, vals)
-					} else {
-						free_values(vals)
-					}
+					keep = ok
 				}
-				used_index = true
+				if keep {
+					append(&matched, vals)
+				} else {
+					free_values(vals)
+				}
+
+				if nerr := engine.btree_next(&cur); nerr != .None {
+					free_scanned_rows(matched[:])
+					delete(matched)
+					return {}, from_engine_error(nerr, span)
+				}
 			}
 		}
 	}
-
-	if !used_index {
-		cur := engine.btree_cursor_init(&tree)
-		defer engine.btree_cursor_close(&cur)
-
-		start_key: [8]u8
-		_ = engine.rowid_key(0, start_key[:])
-		if serr := engine.btree_seek_ge(&cur, start_key[:]); serr != .None {
-			return {}, from_engine_error(serr, span)
-		}
-
-		for engine.btree_cursor_valid(&cur) {
-			payload := engine.btree_cursor_payload(&cur)
-			vals, derr := decode_heap_row(payload)
-			if has_error(derr) {
-				return {}, derr
-			}
-
-			env.values = vals
-			keep := true
-			if stmt.where_expr != nil {
-				ok, werr := eval_expr_bool(stmt.where_expr, &env)
-				if has_error(werr) {
-					free_values(vals)
-					return {}, werr
-				}
-				keep = ok
-			}
-			if keep {
-				append(&matched, vals)
-			} else {
-				free_values(vals)
-			}
-
-			if nerr := engine.btree_next(&cur); nerr != .None {
-				return {}, from_engine_error(nerr, span)
-			}
-		}
+	defer {
+		free_scanned_rows(matched[:])
+		delete(matched)
 	}
 
 	if is_grouped {
@@ -298,7 +407,6 @@ exec_select :: proc(s: ^Exec_Session, stmt: sql.Select_Stmt, span: sql.Span) -> 
 		for p, ci in projs {
 			cell, cerr := project_cell(p, &env)
 			if has_error(cerr) {
-				// clean up partial
 				for j in 0 ..< ci {
 					delete(cells[j])
 				}
@@ -689,13 +797,15 @@ sort_grouped_out_rows :: proc(
 	return ok_error()
 }
 
-// validate_select_exprs dry-runs WHERE / ORDER BY / non-column projections on a null row
+// validate_select_exprs dry-runs WHERE / ON / ORDER BY / non-column projections on a null row
 // so unbound names and unsupported nodes fail even when the table is empty.
 validate_select_exprs :: proc(
 	stmt: sql.Select_Stmt,
 	projs: []Bound_Proj,
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
+	sides: []Join_Side = nil,
+	on_expr: ^sql.Expr = nil,
 ) -> Exec_Error {
 	nulls := make([]Value, len(columns))
 	defer delete(nulls)
@@ -707,6 +817,14 @@ validate_select_exprs :: proc(
 		alias   = alias,
 		columns = columns,
 		values  = nulls,
+		sides   = sides,
+	}
+	if on_expr != nil {
+		v, err := eval_expr(on_expr, &env)
+		free_value(v)
+		if has_error(err) {
+			return err
+		}
 	}
 	if stmt.where_expr != nil {
 		v, err := eval_expr(stmt.where_expr, &env)
@@ -738,8 +856,8 @@ validate_select_supported :: proc(stmt: sql.Select_Stmt, span: sql.Span) -> Exec
 	if stmt.is_distinct {
 		return make_error(.Unsupported_Ast, "SELECT DISTINCT is not supported yet", span = span)
 	}
-	if len(stmt.joins) > 0 {
-		return make_error(.Unsupported_Ast, "JOINs are not supported yet", span = span)
+	if err := validate_select_joins(stmt, span); has_error(err) {
+		return err
 	}
 	// GROUP BY / HAVING executed (S5). Parser already rejects HAVING without GROUP BY.
 	_ = span
@@ -751,6 +869,7 @@ bind_select_projection :: proc(
 	columns: []engine.Catalog_Column,
 	table_name: string,
 	alias: string,
+	sides: []Join_Side = nil,
 	allocator := context.allocator,
 ) -> ([]Bound_Proj, Exec_Error) {
 	if len(stmt.projection) == 0 {
@@ -768,27 +887,55 @@ bind_select_projection :: proc(
 				})
 			}
 		case .Table_Star:
-			if !table_star_matches(item.table, table_name, alias) {
-				free_bound_projs(out[:], allocator)
-				return nil, make_error(
-					.Unknown_Table,
-					"no such table/alias %q in SELECT",
-					item.table,
-					span = item.span,
-				)
-			}
-			for c, i in columns {
-				append(&out, Bound_Proj{
-					kind    = .Column,
-					col_idx = i,
-					name    = strings.clone(c.name, allocator),
-				})
+			if len(sides) > 0 {
+				side_i := -1
+				for side, si in sides {
+					if side_qualifier_matches(item.table, side) {
+						side_i = si
+						break
+					}
+				}
+				if side_i < 0 {
+					free_bound_projs(out[:], allocator)
+					return nil, make_error(
+						.Unknown_Table,
+						"no such table/alias %q in SELECT",
+						item.table,
+						span = item.span,
+					)
+				}
+				side := sides[side_i]
+				for i in 0 ..< side.ncols {
+					cidx := side.offset + i
+					append(&out, Bound_Proj{
+						kind    = .Column,
+						col_idx = cidx,
+						name    = strings.clone(columns[cidx].name, allocator),
+					})
+				}
+			} else {
+				if !table_star_matches(item.table, table_name, alias) {
+					free_bound_projs(out[:], allocator)
+					return nil, make_error(
+						.Unknown_Table,
+						"no such table/alias %q in SELECT",
+						item.table,
+						span = item.span,
+					)
+				}
+				for c, i in columns {
+					append(&out, Bound_Proj{
+						kind    = .Column,
+						col_idx = i,
+						name    = strings.clone(c.name, allocator),
+					})
+				}
 			}
 		case .Expr:
 			name := projection_name(item, allocator)
 			if item.expr != nil && item.expr.kind == .Column_Ref {
 				ref := item.expr.data.(sql.Column_Ref_Data)
-				idx, ok, rerr := resolve_proj_column(ref, columns, table_name, alias, item.span)
+				idx, ok, rerr := resolve_proj_column(ref, columns, table_name, alias, item.span, sides)
 				if has_error(rerr) {
 					delete(name, allocator)
 					free_bound_projs(out[:], allocator)
@@ -828,32 +975,11 @@ resolve_proj_column :: proc(
 	columns: []engine.Catalog_Column,
 	table_name, alias: string,
 	span: sql.Span,
+	sides: []Join_Side = nil,
 ) -> (idx: int, ok: bool, err: Exec_Error) {
-	segs := ref.segments
-	col_name: string
-	if len(segs) == 1 {
-		col_name = segs[0]
-	} else if len(segs) == 2 {
-		env := Row_Env{table = table_name, alias = alias, columns = columns}
-		if !qualifier_matches(segs[0], &env) {
-			return -1, false, make_error(
-				.Unknown_Column,
-				"no such table/alias %q in FROM",
-				segs[0],
-				span = span,
-			)
-		}
-		col_name = segs[1]
-	} else {
-		return -1, false, make_error(
-			.Unsupported_Ast,
-			"multi-part column references are not supported",
-			span = span,
-		)
-	}
-	idx = find_column_index(columns, col_name)
-	if idx < 0 {
-		return -1, false, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+	idx, err = resolve_column_index(ref, columns, table_name, alias, span, sides)
+	if has_error(err) {
+		return -1, false, err
 	}
 	return idx, true, ok_error()
 }

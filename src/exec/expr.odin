@@ -7,13 +7,25 @@ import "core:strings"
 import engine "../engine"
 import sql "../sql"
 
+// Join_Side describes one FROM/JOIN input in a multi-table Row_Env.
+// Column indices in env.columns / env.values are [offset, offset+ncols).
+Join_Side :: struct {
+	table:  string, // catalog table name
+	alias:  string, // optional correlation name (may be "")
+	offset: int,
+	ncols:  int,
+}
+
 // Row_Env binds table/alias + column names to the current decoded row values.
 // Used by SELECT WHERE/projection/ORDER BY and UPDATE/DELETE SET/WHERE.
+// When sides is non-empty, columns/values are the flattened join row and
+// column resolution uses multi-table rules (qualified names + ambiguity).
 Row_Env :: struct {
-	table:   string, // catalog table name
+	table:   string, // catalog table name (single-table)
 	alias:   string, // optional FROM alias (may be "")
 	columns: []engine.Catalog_Column,
 	values:  []Value,
+	sides:   []Join_Side, // nil/empty → single-table mode
 }
 
 // eval_expr evaluates an AST expression against a row environment.
@@ -407,17 +419,104 @@ eval_column_ref :: proc(
 	if env == nil || len(env.columns) == 0 {
 		return {}, make_error(.Unknown_Column, "column reference outside of a row context", span = span)
 	}
+	idx, rerr := resolve_column_index(
+		ref,
+		env.columns,
+		env.table,
+		env.alias,
+		span,
+		env.sides,
+	)
+	if has_error(rerr) {
+		return {}, rerr
+	}
+	if idx < 0 || idx >= len(env.values) {
+		return {}, make_error(.Engine, "row value missing resolved column", span = span)
+	}
+	return clone_value(env.values[idx], allocator), ok_error()
+}
+
+// resolve_column_index maps a column ref to a flat index in columns.
+// Multi-table (sides non-empty): unqualified names error if ambiguous;
+// qualified names must match a side table/alias.
+resolve_column_index :: proc(
+	ref: sql.Column_Ref_Data,
+	columns: []engine.Catalog_Column,
+	table_name, alias: string,
+	span: sql.Span,
+	sides: []Join_Side = nil,
+) -> (idx: int, err: Exec_Error) {
 	segs := ref.segments
 	if len(segs) == 0 {
-		return {}, make_error(.Unknown_Column, "empty column reference", span = span)
+		return -1, make_error(.Unknown_Column, "empty column reference", span = span)
 	}
+	if len(sides) > 0 {
+		if len(segs) == 1 {
+			col_name := segs[0]
+			found := -1
+			n_hits := 0
+			for side in sides {
+				for i in 0 ..< side.ncols {
+					cidx := side.offset + i
+					if cidx < 0 || cidx >= len(columns) {
+						continue
+					}
+					if strings.equal_fold(columns[cidx].name, col_name) {
+						n_hits += 1
+						found = cidx
+					}
+				}
+			}
+			if n_hits == 0 {
+				return -1, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+			}
+			if n_hits > 1 {
+				return -1, make_error(.Unknown_Column, "ambiguous column: %q", col_name, span = span)
+			}
+			return found, ok_error()
+		}
+		if len(segs) == 2 {
+			qual := segs[0]
+			col_name := segs[1]
+			side_i := -1
+			for side, si in sides {
+				if side_qualifier_matches(qual, side) {
+					side_i = si
+					break
+				}
+			}
+			if side_i < 0 {
+				return -1, make_error(
+					.Unknown_Column,
+					"no such table/alias %q in FROM",
+					qual,
+					span = span,
+				)
+			}
+			side := sides[side_i]
+			for i in 0 ..< side.ncols {
+				cidx := side.offset + i
+				if cidx >= 0 && cidx < len(columns) && strings.equal_fold(columns[cidx].name, col_name) {
+					return cidx, ok_error()
+				}
+			}
+			return -1, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+		}
+		return -1, make_error(
+			.Unsupported_Ast,
+			"multi-part column references are not supported",
+			span = span,
+		)
+	}
+
+	// Single-table
 	col_name: string
 	if len(segs) == 1 {
 		col_name = segs[0]
 	} else if len(segs) == 2 {
 		qual := segs[0]
-		if !qualifier_matches(qual, env) {
-			return {}, make_error(
+		if !(strings.equal_fold(qual, table_name) || (alias != "" && strings.equal_fold(qual, alias))) {
+			return -1, make_error(
 				.Unknown_Column,
 				"no such table/alias %q in FROM",
 				qual,
@@ -426,19 +525,48 @@ eval_column_ref :: proc(
 		}
 		col_name = segs[1]
 	} else {
-		return {}, make_error(.Unsupported_Ast, "multi-part column references are not supported", span = span)
+		return -1, make_error(
+			.Unsupported_Ast,
+			"multi-part column references are not supported",
+			span = span,
+		)
 	}
-	idx := find_column_index(env.columns, col_name)
+	idx = find_column_index(columns, col_name)
 	if idx < 0 {
-		return {}, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
+		return -1, make_error(.Unknown_Column, "no such column: %q", col_name, span = span)
 	}
-	if idx >= len(env.values) {
-		return {}, make_error(.Engine, "row value missing column %q", col_name, span = span)
+	return idx, ok_error()
+}
+
+side_qualifier_matches :: proc(qual: string, side: Join_Side) -> bool {
+	if strings.equal_fold(qual, side.table) {
+		return true
 	}
-	return clone_value(env.values[idx], allocator), ok_error()
+	if side.alias != "" && strings.equal_fold(qual, side.alias) {
+		return true
+	}
+	return false
+}
+
+side_exposed_name :: proc(side: Join_Side) -> string {
+	if side.alias != "" {
+		return side.alias
+	}
+	return side.table
 }
 
 qualifier_matches :: proc(qual: string, env: ^Row_Env) -> bool {
+	if env == nil {
+		return false
+	}
+	if len(env.sides) > 0 {
+		for side in env.sides {
+			if side_qualifier_matches(qual, side) {
+				return true
+			}
+		}
+		return false
+	}
 	if strings.equal_fold(qual, env.table) {
 		return true
 	}

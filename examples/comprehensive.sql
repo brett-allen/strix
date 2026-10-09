@@ -12,8 +12,8 @@
 --
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
 -- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK,
--- S4 whole-query aggregates, and S5 GROUP BY / HAVING.
--- Intentionally omits JOINs, DISTINCT, CHECK/FK, ALTER,
+-- S4 whole-query aggregates, S5 GROUP BY / HAVING, and S6 INNER/CROSS JOIN.
+-- Intentionally omits LEFT OUTER JOIN, DISTINCT, CHECK/FK, ALTER,
 -- INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
 
 -- ---------------------------------------------------------------------------
@@ -194,6 +194,18 @@ SELECT COUNT(*) FROM orders WHERE paid = 1;
 -- GROUP BY / HAVING (S5; single table; strict select list)
 SELECT tag, COUNT(*) AS n, SUM(qty) FROM orders GROUP BY tag ORDER BY tag;
 SELECT tag, COUNT(*) AS n FROM orders GROUP BY tag HAVING COUNT(*) >= 1 ORDER BY COUNT(*) DESC;
+
+-- INNER JOIN (S6; two tables; qualified names / aliases)
+SELECT c.name, o.id AS order_id, o.qty
+  FROM customers AS c
+  INNER JOIN orders AS o ON c.id = o.customer_id
+  WHERE o.paid = 1
+  ORDER BY c.name, o.id;
+SELECT c.name, COUNT(*) AS n_orders
+  FROM customers AS c
+  JOIN orders AS o ON c.id = o.customer_id
+  GROUP BY c.name
+  ORDER BY c.name;
 
 -- ---------------------------------------------------------------------------
 -- Explicit transactions

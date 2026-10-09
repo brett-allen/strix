@@ -267,9 +267,10 @@ test_select_negatives_codes :: proc(t: ^testing.T) {
 	exec.free_error(e4)
 	exec.free_result(r4)
 
+	// INNER JOIN is executed (S6); LEFT OUTER still rejected.
 	r5, e5 := exec.exec_statement(
 		&s,
-		"SELECT * FROM people JOIN people AS q ON people.id = q.id;",
+		"SELECT * FROM people LEFT JOIN people AS q ON people.id = q.id;",
 	)
 	testing.expect(t, exec.has_error(e5))
 	testing.expect_value(t, e5.code, exec.Exec_Error_Code.Unsupported_Ast)
