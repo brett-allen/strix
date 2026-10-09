@@ -4,87 +4,107 @@ import "core:strings"
 import engine "../engine"
 import sql "../sql"
 
-// S6: two-table INNER / CROSS joins via nested loop.
-// LEFT OUTER, USING, and >2 tables are rejected with clear errors.
+// F1: left-deep nested-loop joins — INNER / CROSS / LEFT OUTER, N tables.
+// USING, RIGHT / FULL / NATURAL remain rejected (NATURAL/RIGHT/FULL at parse).
 
 validate_select_joins :: proc(stmt: sql.Select_Stmt, span: sql.Span) -> Exec_Error {
+	_ = span
 	if len(stmt.joins) == 0 {
 		return ok_error()
 	}
-	if len(stmt.joins) > 1 {
-		return make_error(
-			.Unsupported_Ast,
-			"only two-table JOINs are supported (multiple JOIN clauses not supported yet)",
-			span = span,
-		)
-	}
-	j := stmt.joins[0]
-	if len(j.using_cols) > 0 {
-		return make_error(
-			.Unsupported_Ast,
-			"JOIN ... USING is not supported yet (use ON)",
-			span = j.span,
-		)
-	}
-	switch j.kind {
-	case .Left:
-		return make_error(
-			.Unsupported_Ast,
-			"LEFT OUTER JOIN is not supported yet",
-			span = j.span,
-		)
-	case .Inner:
-		if j.on == nil {
+	for j in stmt.joins {
+		if len(j.using_cols) > 0 {
 			return make_error(
 				.Unsupported_Ast,
-				"INNER JOIN requires an ON condition",
+				"JOIN ... USING is not supported yet (use ON)",
 				span = j.span,
 			)
 		}
-	case .Cross:
-		// CROSS JOIN / comma-join: no ON required (cartesian, then WHERE).
-		if j.on != nil {
-			return make_error(
-				.Unsupported_Ast,
-				"CROSS JOIN must not have an ON condition",
-				span = j.span,
-			)
+		switch j.kind {
+		case .Left:
+			if j.on == nil {
+				return make_error(
+					.Unsupported_Ast,
+					"LEFT OUTER JOIN requires an ON condition",
+					span = j.span,
+				)
+			}
+		case .Inner:
+			if j.on == nil {
+				return make_error(
+					.Unsupported_Ast,
+					"INNER JOIN requires an ON condition",
+					span = j.span,
+				)
+			}
+		case .Cross:
+			// CROSS JOIN / comma-join: no ON required (cartesian, then WHERE).
+			if j.on != nil {
+				return make_error(
+					.Unsupported_Ast,
+					"CROSS JOIN must not have an ON condition",
+					span = j.span,
+				)
+			}
 		}
-	}
-	if j.table.table == "" {
-		return make_error(.Invalid_Schema, "JOIN requires a table name", span = j.span)
+		if j.table.table == "" {
+			return make_error(.Invalid_Schema, "JOIN requires a table name", span = j.span)
+		}
 	}
 	return ok_error()
 }
 
+// build_flat_join_columns flattens N table column lists into one schema + Join_Side meta.
+// tables / aliases / col_lists must be the same length (≥2 for joins).
 build_flat_join_columns :: proc(
-	left_cols, right_cols: []engine.Catalog_Column,
-	left_table, left_alias, right_table, right_alias: string,
+	tables: []string,
+	aliases: []string,
+	col_lists: [][]engine.Catalog_Column,
 	allocator := context.allocator,
 ) -> (columns: []engine.Catalog_Column, sides: []Join_Side, err: Exec_Error) {
-	nL := len(left_cols)
-	nR := len(right_cols)
-	columns = make([]engine.Catalog_Column, nL + nR, allocator)
-	for c, i in left_cols {
-		columns[i] = c
+	n := len(tables)
+	if n == 0 || len(aliases) != n || len(col_lists) != n {
+		return nil, nil, make_error(.Engine, "join column build arity mismatch")
 	}
-	for c, i in right_cols {
-		columns[nL + i] = c
+	total := 0
+	for cols in col_lists {
+		total += len(cols)
 	}
-	sides = make([]Join_Side, 2, allocator)
-	sides[0] = Join_Side{table = left_table, alias = left_alias, offset = 0, ncols = nL}
-	sides[1] = Join_Side{table = right_table, alias = right_alias, offset = nL, ncols = nR}
+	columns = make([]engine.Catalog_Column, total, allocator)
+	sides = make([]Join_Side, n, allocator)
+	off := 0
+	for i in 0 ..< n {
+		ncols := len(col_lists[i])
+		for c, ci in col_lists[i] {
+			columns[off + ci] = c
+		}
+		sides[i] = Join_Side{
+			table  = tables[i],
+			alias  = aliases[i],
+			offset = off,
+			ncols  = ncols,
+		}
+		off += ncols
+	}
 
-	left_exp := side_exposed_name(sides[0])
-	right_exp := side_exposed_name(sides[1])
-	if left_exp != "" && right_exp != "" && strings.equal_fold(left_exp, right_exp) {
-		delete(columns, allocator)
-		delete(sides, allocator)
-		return nil, nil, make_error(
-			.Invalid_Schema,
-			"duplicate table/alias %q in FROM/JOIN",
-			left_exp,
-		)
+	// Duplicate exposed table/alias names are illegal (S6 / F1).
+	for i in 0 ..< n {
+		ei := side_exposed_name(sides[i])
+		if ei == "" {
+			continue
+		}
+		for j in i + 1 ..< n {
+			ej := side_exposed_name(sides[j])
+			if ej != "" && strings.equal_fold(ei, ej) {
+				delete(columns, allocator)
+				delete(sides, allocator)
+				return nil, nil, make_error(
+					.Invalid_Schema,
+					"duplicate table/alias %q in FROM/JOIN",
+					ei,
+				)
+			}
+		}
 	}
 	return columns, sides, ok_error()
 }
@@ -139,17 +159,38 @@ concat_join_row :: proc(left, right: []Value, allocator := context.allocator) ->
 	return out
 }
 
-// nested_loop_join builds the joined row stream for INNER (ON) or CROSS (no ON).
-// Appends owned rows into matched; on error, frees rows already appended.
-nested_loop_join :: proc(
-	matched:^[dynamic][]Value,
+null_extend_join_row :: proc(left: []Value, right_ncols: int, allocator := context.allocator) -> []Value {
+	out := make([]Value, len(left) + right_ncols, allocator)
+	for v, i in left {
+		out[i] = clone_value(v, allocator)
+	}
+	for i in 0 ..< right_ncols {
+		out[len(left) + i] = value_null()
+	}
+	return out
+}
+
+// nested_loop_join_step joins left_rows with right_rows for one JOIN clause.
+// INNER / CROSS: emit matching pairs only. LEFT: NULL-extend right when no ON match.
+// Does not apply WHERE (caller filters after the full left-deep chain).
+// Appends owned rows into out; on error, frees rows already appended to out.
+nested_loop_join_step :: proc(
+	out: ^[dynamic][]Value,
 	left_rows, right_rows: [][]Value,
+	kind: sql.Join_Kind,
 	on_expr: ^sql.Expr,
-	where_expr: ^sql.Expr,
 	env: ^Row_Env,
 	allocator := context.allocator,
 ) -> Exec_Error {
+	right_ncols := 0
+	if len(right_rows) > 0 {
+		right_ncols = len(right_rows[0])
+	} else if env != nil && len(env.sides) > 0 {
+		right_ncols = env.sides[len(env.sides) - 1].ncols
+	}
+
 	for lrow in left_rows {
+		matched_any := false
 		for rrow in right_rows {
 			joined := concat_join_row(lrow, rrow, allocator)
 			env.values = joined
@@ -162,19 +203,52 @@ nested_loop_join :: proc(
 				}
 				keep = ok
 			}
-			if keep && where_expr != nil {
-				ok, werr := eval_expr_bool(where_expr, env, allocator)
-				if has_error(werr) {
-					free_values(joined, allocator)
-					return werr
-				}
-				keep = ok
-			}
 			if keep {
-				append(matched, joined)
+				matched_any = true
+				append(out, joined)
 			} else {
 				free_values(joined, allocator)
 			}
+		}
+		if kind == .Left && !matched_any {
+			padded := null_extend_join_row(lrow, right_ncols, allocator)
+			append(out, padded)
+		}
+	}
+	return ok_error()
+}
+
+// filter_rows_where keeps rows for which WHERE is true (or all rows if where_expr is nil).
+// Moves kept rows into out; frees dropped rows. On eval error, frees the current row and
+// all not-yet-processed input rows (rows already appended to out remain for the caller).
+filter_rows_where :: proc(
+	out: ^[dynamic][]Value,
+	rows: [][]Value,
+	where_expr: ^sql.Expr,
+	env: ^Row_Env,
+	allocator := context.allocator,
+) -> Exec_Error {
+	if where_expr == nil {
+		for row in rows {
+			append(out, row)
+		}
+		return ok_error()
+	}
+	for i in 0 ..< len(rows) {
+		row := rows[i]
+		env.values = row
+		ok, werr := eval_expr_bool(where_expr, env, allocator)
+		if has_error(werr) {
+			free_values(row, allocator)
+			for j in i + 1 ..< len(rows) {
+				free_values(rows[j], allocator)
+			}
+			return werr
+		}
+		if ok {
+			append(out, row)
+		} else {
+			free_values(row, allocator)
 		}
 	}
 	return ok_error()

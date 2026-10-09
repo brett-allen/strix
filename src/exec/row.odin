@@ -9,6 +9,8 @@ ROW_TAG_INTEGER :: u8(1)
 ROW_TAG_FLOAT :: u8(2)
 ROW_TAG_TEXT :: u8(3)
 ROW_TAG_BLOB :: u8(4)
+ROW_TAG_BOOLEAN :: u8(5)
+ROW_TAG_UUID :: u8(6)
 
 null_bitmap_len :: proc(col_count: int) -> int {
 	if col_count <= 0 {
@@ -33,6 +35,10 @@ field_payload_size :: proc(v: Value) -> int {
 		return 1 + 8
 	case .Float:
 		return 1 + 8
+	case .Boolean:
+		return 1 + 1
+	case .Uuid:
+		return 1 + UUID_BYTE_LEN
 	case .Text, .Blob:
 		return 1 + 4 + len(v.bytes)
 	}
@@ -73,6 +79,20 @@ encode_heap_row :: proc(values: []Value, allocator := context.allocator) -> ([]u
 			off += 1
 			endian.put_f64(buf[off:off + 8], .Little, v.f)
 			off += 8
+		case .Boolean:
+			buf[off] = ROW_TAG_BOOLEAN
+			off += 1
+			buf[off] = u8(1 if v.i != 0 else 0)
+			off += 1
+		case .Uuid:
+			if len(v.bytes) != UUID_BYTE_LEN {
+				delete(buf, allocator)
+				return nil, error_at(.Engine, "uuid value must be 16 bytes")
+			}
+			buf[off] = ROW_TAG_UUID
+			off += 1
+			copy(buf[off:off + UUID_BYTE_LEN], v.bytes)
+			off += UUID_BYTE_LEN
 		case .Text:
 			buf[off] = ROW_TAG_TEXT
 			off += 1
@@ -152,6 +172,30 @@ decode_heap_row :: proc(payload: []u8, allocator := context.allocator) -> ([]Val
 			}
 			vals[i] = value_float(f)
 			off += 8
+		case ROW_TAG_BOOLEAN:
+			if off >= len(payload) {
+				free_values(vals, allocator)
+				return nil, error_at(.Engine, "heap row truncated boolean")
+			}
+			b := payload[off]
+			off += 1
+			if b > 1 {
+				free_values(vals, allocator)
+				return nil, make_error(.Engine, "corrupt heap boolean %d", b)
+			}
+			vals[i] = value_boolean(b != 0)
+		case ROW_TAG_UUID:
+			if off + UUID_BYTE_LEN > len(payload) {
+				free_values(vals, allocator)
+				return nil, error_at(.Engine, "heap row truncated uuid")
+			}
+			u, uok := value_uuid(payload[off:off + UUID_BYTE_LEN], allocator)
+			if !uok {
+				free_values(vals, allocator)
+				return nil, error_at(.Engine, "corrupt heap uuid")
+			}
+			vals[i] = u
+			off += UUID_BYTE_LEN
 		case ROW_TAG_TEXT, ROW_TAG_BLOB:
 			if off + 4 > len(payload) {
 				free_values(vals, allocator)

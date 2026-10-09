@@ -12,9 +12,14 @@
 --
 -- Stays within what Strix execute supports today (see docs/sql-dialect.md
 -- "Executed vs parsed only"). Includes S2 CAST, S3 UNIQUE / TEXT PK,
--- S4 whole-query aggregates, S5 GROUP BY / HAVING, and S6 INNER/CROSS JOIN.
--- Intentionally omits LEFT OUTER JOIN, DISTINCT, CHECK/FK, ALTER,
--- INSERT…SELECT, OR REPLACE/IGNORE, composite PK.
+-- S4 whole-query aggregates, S5 GROUP BY / HAVING, S6 INNER/CROSS JOIN,
+-- F1 LEFT OUTER + 3-table joins, F2 composite PRIMARY KEY, F3
+-- BOOLEAN + typed UUID.
+-- F4 prepared `?` binding is a session API (exec_statement_params /
+-- session_bind*) — not expressible as literal SQL in this file; smoke is
+-- src/test/exec/bind_test.odin (strix sql / shell take literals only).
+-- Intentionally omits USING / RIGHT / FULL / NATURAL, DISTINCT, CHECK/FK,
+-- ALTER, INSERT…SELECT, OR REPLACE/IGNORE.
 
 -- ---------------------------------------------------------------------------
 -- Clean slate (idempotent-ish: drop children before parents)
@@ -29,6 +34,8 @@ DROP TABLE IF EXISTS products;
 DROP TABLE IF EXISTS customers;
 DROP TABLE IF EXISTS scratch;
 DROP TABLE IF EXISTS tags;
+DROP TABLE IF EXISTS line_items;
+DROP TABLE IF EXISTS accounts;
 
 -- ---------------------------------------------------------------------------
 -- Schema: tables
@@ -54,6 +61,14 @@ CREATE TABLE tags (
   label TEXT NOT NULL
 );
 
+-- Composite PRIMARY KEY (F2): NOT NULL on all PK cols + composite unique autoindex
+CREATE TABLE line_items (
+  order_id INTEGER NOT NULL,
+  sku TEXT NOT NULL,
+  qty INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (order_id, sku)
+);
+
 CREATE TABLE orders (
   id INTEGER PRIMARY KEY,
   customer_id INTEGER NOT NULL,
@@ -67,6 +82,13 @@ CREATE TABLE IF NOT EXISTS scratch (
   id INTEGER PRIMARY KEY,
   blob_col BLOB,
   text_col TEXT
+);
+
+-- Native BOOLEAN + typed UUID (F3)
+CREATE TABLE accounts (
+  id UUID PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  active BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 -- ---------------------------------------------------------------------------
@@ -106,6 +128,17 @@ INSERT INTO orders (id, customer_id, product_id, qty, paid, tag) VALUES
   (104, 3, 40, 1, 0, 'vip'),
   (105, 4, 20, 2, 1, 'retail');
 
+INSERT INTO accounts (id, email, active) VALUES
+  ('550e8400-e29b-41d4-a716-446655440000', 'acct@example.com', TRUE),
+  ('550e8400-e29b-41d4-a716-446655440001', 'off@example.com', FALSE);
+-- DEFAULT TRUE for omitted active
+INSERT INTO accounts (id, email) VALUES
+  ('550e8400-e29b-41d4-a716-446655440002', 'def@example.com');
+
+SELECT id, email, active FROM accounts WHERE active ORDER BY email;
+SELECT id FROM accounts WHERE id = '550e8400-e29b-41d4-a716-446655440001';
+SELECT CAST(active AS INTEGER), CAST(id AS TEXT) FROM accounts WHERE email = 'acct@example.com';
+
 INSERT INTO scratch (id, blob_col, text_col) VALUES
   (1, X'DEADBEEF', 'hex blob'),
   (2, X'00', 'nul byte'),
@@ -114,6 +147,11 @@ INSERT INTO scratch (id, blob_col, text_col) VALUES
 INSERT INTO tags (id, label) VALUES
   ('tag-retail', 'retail'),
   ('tag-vip', 'vip');
+
+INSERT INTO line_items (order_id, sku, qty) VALUES
+  (100, 'W-10', 2),
+  (100, 'G-20', 1),
+  (101, 'W-10', 1);
 
 -- ---------------------------------------------------------------------------
 -- SELECT: projection, alias, WHERE, exprs, IN, IS NULL, ORDER/LIMIT/OFFSET
@@ -164,6 +202,9 @@ SELECT id, tag || '-paid' AS label, qty * 10 AS scaled
 
 SELECT * FROM scratch ORDER BY id;
 
+-- Composite PRIMARY KEY (F2)
+SELECT order_id, sku, qty FROM line_items ORDER BY order_id, sku;
+
 -- Scalar CAST (S2): projection, WHERE, SET — no affinity; Text↔numeric needs CAST
 SELECT id, CAST(price AS TEXT) AS price_text, CAST(price AS INTEGER) AS price_int
   FROM products
@@ -207,6 +248,20 @@ SELECT c.name, COUNT(*) AS n_orders
   GROUP BY c.name
   ORDER BY c.name;
 
+-- LEFT OUTER JOIN (F1; unmatched left preserved with NULL right cols)
+SELECT c.name, o.id AS order_id, o.qty
+  FROM customers AS c
+  LEFT JOIN orders AS o ON c.id = o.customer_id
+  ORDER BY c.name, o.id;
+
+-- 3-table left-deep join (F1)
+SELECT c.name, o.id AS order_id, p.name AS product, o.qty
+  FROM customers AS c
+  INNER JOIN orders AS o ON c.id = o.customer_id
+  INNER JOIN products AS p ON p.id = o.product_id
+  WHERE o.paid = 1
+  ORDER BY c.name, o.id;
+
 -- ---------------------------------------------------------------------------
 -- Explicit transactions
 -- ---------------------------------------------------------------------------
@@ -239,9 +294,11 @@ DROP INDEX IF EXISTS idx_products_name;
 DROP INDEX IF EXISTS idx_customers_email;
 DROP INDEX IF EXISTS idx_tags_label;
 
+DROP TABLE line_items;
 DROP TABLE orders;
 DROP TABLE products;
 DROP TABLE customers;
+DROP TABLE IF EXISTS accounts;
 DROP TABLE IF EXISTS scratch;
 DROP TABLE IF EXISTS tags;
 

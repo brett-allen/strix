@@ -11,6 +11,8 @@ IDX_TAG_INTEGER :: u8(1)
 IDX_TAG_FLOAT :: u8(2)
 IDX_TAG_TEXT :: u8(3)
 IDX_TAG_BLOB :: u8(4)
+IDX_TAG_BOOLEAN :: u8(5)
+IDX_TAG_UUID :: u8(6)
 
 index_field_size :: proc(v: Value) -> int {
 	switch v.kind {
@@ -18,6 +20,10 @@ index_field_size :: proc(v: Value) -> int {
 		return 1
 	case .Integer, .Float:
 		return 1 + 8
+	case .Boolean:
+		return 1 + 1
+	case .Uuid:
+		return 1 + UUID_BYTE_LEN
 	case .Text, .Blob:
 		return 1 + 4 + len(v.bytes) + 1 // tag | len | bytes | 0x00
 	}
@@ -87,6 +93,20 @@ encode_index_key :: proc(vals: []Value, allocator := context.allocator) -> ([]u8
 			off += len(v.bytes)
 			buf[off] = 0
 			off += 1
+		case .Boolean:
+			buf[off] = IDX_TAG_BOOLEAN
+			off += 1
+			buf[off] = u8(1 if v.i != 0 else 0)
+			off += 1
+		case .Uuid:
+			if len(v.bytes) != UUID_BYTE_LEN {
+				delete(buf, allocator)
+				return nil, error_at(.Engine, "uuid index key must be 16 bytes")
+			}
+			buf[off] = IDX_TAG_UUID
+			off += 1
+			copy(buf[off:off + UUID_BYTE_LEN], v.bytes)
+			off += UUID_BYTE_LEN
 		}
 	}
 	if off != len(buf) {
@@ -329,6 +349,16 @@ find_single_column_eq_const :: proc(
 		if v.kind == .Integer || v.kind == .Float {
 			free_value(v)
 			return -1, {}, false
+		}
+		// UUID columns: Text string literals coerce to typed Uuid for tag-exact lookup.
+		expected, enforced := declared_storage_kind(table_columns[idx].type_name)
+		if enforced && expected == .Uuid && v.kind == .Text {
+			u, uok := value_uuid_from_text(string(v.bytes))
+			free_value(v)
+			if !uok {
+				return -1, {}, false
+			}
+			v = u
 		}
 		return idx, v, true
 	}

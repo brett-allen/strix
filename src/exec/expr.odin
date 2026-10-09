@@ -49,7 +49,8 @@ eval_expr :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator
 	case .In_List:
 		return eval_in_list(expr.data.(sql.In_List_Data), expr.span, env, allocator)
 	case .Placeholder:
-		return {}, make_error(.Unsupported_Ast, "parameter placeholders are not supported yet", span = expr.span)
+		ph := expr.data.(sql.Placeholder_Data)
+		return lookup_active_bind(ph.index, expr.span, allocator)
 	case .Star:
 		return {}, make_error(.Unsupported_Ast, "bare * is not valid in this expression", span = expr.span)
 	case .Call:
@@ -62,9 +63,9 @@ eval_expr :: proc(expr: ^sql.Expr, env: ^Row_Env, allocator := context.allocator
 	return {}, make_error(.Unsupported_Ast, "unsupported expression", span = expr.span)
 }
 
-// eval_cast implements CAST(expr AS type) (S2). NULL → NULL. Invalid casts error
+// eval_cast implements CAST(expr AS type) (S2/F3). NULL → NULL. Invalid casts error
 // (never NULL-by-affinity). Target types: INTEGER/INT, REAL/FLOAT/DOUBLE,
-// TEXT/VARCHAR/…/UUID, BLOB — see cast_target_kind / sql-dialect.md.
+// TEXT/VARCHAR/…, BLOB, BOOLEAN, UUID — see cast_target_kind / sql-dialect.md.
 eval_cast :: proc(
 	d: sql.Cast_Data,
 	span: sql.Span,
@@ -98,7 +99,7 @@ cast_target_kind :: proc(type_name: string) -> (kind: Value_Kind, ok: bool) {
 }
 
 // cast_value converts a non-NULL value to target. Caller retains ownership of `v`
-// (may free after); returned Value is newly owned when Text/Blob.
+// (may free after); returned Value is newly owned when Text/Blob/Uuid.
 cast_value :: proc(
 	v: Value,
 	target: Value_Kind,
@@ -118,6 +119,10 @@ cast_value :: proc(
 		return cast_to_text(v, type_name, span, allocator)
 	case .Blob:
 		return cast_to_blob(v, type_name, span, allocator)
+	case .Boolean:
+		return cast_to_boolean(v, type_name, span)
+	case .Uuid:
+		return cast_to_uuid(v, type_name, span, allocator)
 	case .Null:
 		return {}, make_error(.Unsupported_Ast, "invalid CAST target", span = span)
 	}
@@ -172,7 +177,9 @@ cast_to_integer :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, 
 			)
 		}
 		return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
-	case .Blob, .Null:
+	case .Boolean:
+		return value_integer(i64(1 if v.i != 0 else 0)), ok_error()
+	case .Blob, .Uuid, .Null:
 		return {}, make_error(
 			.Unsupported_Ast,
 			"cannot CAST %v to %s",
@@ -212,7 +219,9 @@ cast_to_float :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, Ex
 			)
 		}
 		return value_float(f), ok_error()
-	case .Blob, .Null:
+	case .Boolean:
+		return value_float(f64(1 if v.i != 0 else 0)), ok_error()
+	case .Blob, .Uuid, .Null:
 		return {}, make_error(
 			.Unsupported_Ast,
 			"cannot CAST %v to %s",
@@ -239,6 +248,10 @@ cast_to_text :: proc(
 	case .Float:
 		s := fmt.aprintf("%g", v.f, allocator = allocator)
 		return Value{kind = .Text, bytes = transmute([]u8)s}, ok_error()
+	case .Boolean:
+		return value_text("TRUE" if v.i != 0 else "FALSE", allocator), ok_error()
+	case .Uuid:
+		return Value{kind = .Text, bytes = transmute([]u8)format_uuid_canonical(v.bytes, allocator)}, ok_error()
 	case .Blob:
 		// Interpret blob bytes as UTF-8 text (no hex encoding).
 		return value_text(string(v.bytes), allocator), ok_error()
@@ -259,10 +272,95 @@ cast_to_blob :: proc(
 		return clone_value(v, allocator), ok_error()
 	case .Text:
 		return value_blob(v.bytes, allocator), ok_error()
-	case .Integer, .Float, .Null:
+	case .Uuid:
+		return value_blob(v.bytes, allocator), ok_error()
+	case .Integer, .Float, .Boolean, .Null:
 		return {}, make_error(
 			.Unsupported_Ast,
 			"cannot CAST %v to %s; cast to TEXT first if needed",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_boolean :: proc(v: Value, type_name: string, span: sql.Span) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Boolean:
+		return value_boolean(v.i != 0), ok_error()
+	case .Integer:
+		return value_boolean(v.i != 0), ok_error()
+	case .Float:
+		return value_boolean(v.f != 0), ok_error()
+	case .Text:
+		s := strings.trim_space(string(v.bytes))
+		if ascii_equal_fold_lit(s, "TRUE") {
+			return value_boolean(true), ok_error()
+		}
+		if ascii_equal_fold_lit(s, "FALSE") {
+			return value_boolean(false), ok_error()
+		}
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %q to %s: expected TRUE or FALSE",
+			string(v.bytes),
+			type_name,
+			span = span,
+		)
+	case .Blob, .Uuid, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s",
+			v.kind,
+			type_name,
+			span = span,
+		)
+	}
+	return {}, make_error(.Unsupported_Ast, "cannot CAST to %s", type_name, span = span)
+}
+
+cast_to_uuid :: proc(
+	v: Value,
+	type_name: string,
+	span: sql.Span,
+	allocator := context.allocator,
+) -> (Value, Exec_Error) {
+	switch v.kind {
+	case .Uuid:
+		return clone_value(v, allocator), ok_error()
+	case .Text:
+		u, ok := value_uuid_from_text(string(v.bytes), allocator)
+		if !ok {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST %q to %s: invalid UUID",
+				string(v.bytes),
+				type_name,
+				span = span,
+			)
+		}
+		return u, ok_error()
+	case .Blob:
+		if len(v.bytes) != UUID_BYTE_LEN {
+			return {}, make_error(
+				.Unsupported_Ast,
+				"cannot CAST BLOB to %s: expected 16 bytes, got %d",
+				type_name,
+				len(v.bytes),
+				span = span,
+			)
+		}
+		u, ok := value_uuid(v.bytes, allocator)
+		if !ok {
+			return {}, make_error(.Unsupported_Ast, "cannot CAST BLOB to %s", type_name, span = span)
+		}
+		return u, ok_error()
+	case .Integer, .Float, .Boolean, .Null:
+		return {}, make_error(
+			.Unsupported_Ast,
+			"cannot CAST %v to %s",
 			v.kind,
 			type_name,
 			span = span,
@@ -361,12 +459,11 @@ eval_const_integer :: proc(expr: ^sql.Expr, what: string, allocator := context.a
 	return v.i, ok_error()
 }
 
-// Strict boolean context (S1 / sql-compliance): Integer/Float 0 = false, ≠0 = true;
-// NULL is unknown (neither). Text/Blob must be rejected via require_bool_operand
-// before calling these — they treat non-numeric as neither true nor false.
+// Strict boolean context (S1/F3): Integer/Float 0 = false, ≠0 = true;
+// Boolean TRUE/FALSE; NULL is unknown (neither). Text/Blob/Uuid rejected.
 value_is_true :: proc(v: Value) -> bool {
 	#partial switch v.kind {
-	case .Integer:
+	case .Integer, .Boolean:
 		return v.i != 0
 	case .Float:
 		return v.f != 0
@@ -376,7 +473,7 @@ value_is_true :: proc(v: Value) -> bool {
 
 value_is_false :: proc(v: Value) -> bool {
 	#partial switch v.kind {
-	case .Integer:
+	case .Integer, .Boolean:
 		return v.i == 0
 	case .Float:
 		return v.f == 0
@@ -388,23 +485,23 @@ value_is_null :: proc(v: Value) -> bool {
 	return v.kind == .Null
 }
 
-// require_bool_operand rejects Text/Blob (and other non-numeric non-null kinds)
-// in WHERE / AND / OR / NOT. NULL is allowed (three-valued unknown).
+// require_bool_operand rejects Text/Blob/Uuid in WHERE / AND / OR / NOT.
+// NULL is allowed (three-valued unknown). Boolean participates as true/false.
 require_bool_operand :: proc(v: Value, span: sql.Span = {}) -> Exec_Error {
 	#partial switch v.kind {
-	case .Null, .Integer, .Float:
+	case .Null, .Integer, .Float, .Boolean:
 		return ok_error()
-	case .Text, .Blob:
+	case .Text, .Blob, .Uuid:
 		return make_error(
 			.Unsupported_Ast,
-			"boolean context requires a numeric value (got %v); use a comparison",
+			"boolean context requires a boolean or numeric value (got %v); use a comparison",
 			v.kind,
 			span = span,
 		)
 	}
 	return make_error(
 		.Unsupported_Ast,
-		"boolean context requires a numeric value (got %v)",
+		"boolean context requires a boolean or numeric value (got %v)",
 		v.kind,
 		span = span,
 	)
@@ -600,7 +697,7 @@ eval_unary :: proc(
 		#partial switch inner.kind {
 		case .Null, .Integer, .Float:
 			return inner, ok_error()
-		case .Text, .Blob:
+		case .Text, .Blob, .Boolean, .Uuid:
 			free_value(inner, allocator)
 			return {}, make_error(.Unsupported_Ast, "unary + requires a numeric value", span = span)
 		}
@@ -612,7 +709,7 @@ eval_unary :: proc(
 			return value_integer(-inner.i), ok_error()
 		case .Float:
 			return value_float(-inner.f), ok_error()
-		case .Text, .Blob:
+		case .Text, .Blob, .Boolean, .Uuid:
 			free_value(inner, allocator)
 			return {}, make_error(.Unsupported_Ast, "unary - requires a numeric value", span = span)
 		}
@@ -752,11 +849,13 @@ eval_compare :: proc(op: sql.Binary_Op, left, right: Value, span: sql.Span) -> (
 }
 
 // compare_values returns -1 / 0 / 1. NULL handling is caller's responsibility.
-// Policy (S1 / sql-compliance north star):
+// Policy (S1/F3):
 //   - Integer–Integer: exact i64
 //   - Mixed int/float: allow via f64
+//   - Boolean–Boolean: false < true
+//   - Uuid–Uuid: byte compare; Uuid↔Text: parse Text as UUID string form
 //   - Same-kind Text/Blob: byte/lex compare
-//   - Text/Blob ↔ numeric (or other kind mismatch): Unsupported_Ast (use CAST)
+//   - Other kind mismatches: Unsupported_Ast (use CAST)
 compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Error) {
 	if left.kind == .Null && right.kind == .Null {
 		return 0, ok_error()
@@ -780,6 +879,39 @@ compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Er
 		if lf > rf do return 1, ok_error()
 		return 0, ok_error()
 	}
+	if left.kind == .Boolean && right.kind == .Boolean {
+		if left.i < right.i do return -1, ok_error()
+		if left.i > right.i do return 1, ok_error()
+		return 0, ok_error()
+	}
+	// UUID string literal form in comparisons (typed storage still Uuid on disk).
+	if left.kind == .Uuid || right.kind == .Uuid {
+		lb: [UUID_BYTE_LEN]u8
+		rb: [UUID_BYTE_LEN]u8
+		lok, rok := false, false
+		if left.kind == .Uuid && len(left.bytes) == UUID_BYTE_LEN {
+			copy(lb[:], left.bytes)
+			lok = true
+		} else if left.kind == .Text {
+			lok = parse_uuid_text(string(left.bytes), lb[:])
+		}
+		if right.kind == .Uuid && len(right.bytes) == UUID_BYTE_LEN {
+			copy(rb[:], right.bytes)
+			rok = true
+		} else if right.kind == .Text {
+			rok = parse_uuid_text(string(right.bytes), rb[:])
+		}
+		if lok && rok {
+			return bytes_compare(lb[:], rb[:]), ok_error()
+		}
+		return {}, make_error(
+			.Unsupported_Ast,
+			"type mismatch in comparison (%v vs %v)",
+			left.kind,
+			right.kind,
+			span = span,
+		)
+	}
 	if left.kind != right.kind {
 		return {}, make_error(
 			.Unsupported_Ast,
@@ -800,7 +932,11 @@ compare_values :: proc(left, right: Value, span: sql.Span = {}) -> (int, Exec_Er
 		if left.f < right.f do return -1, ok_error()
 		if left.f > right.f do return 1, ok_error()
 		return 0, ok_error()
-	case .Text, .Blob:
+	case .Boolean:
+		if left.i < right.i do return -1, ok_error()
+		if left.i > right.i do return 1, ok_error()
+		return 0, ok_error()
+	case .Text, .Blob, .Uuid:
 		return bytes_compare(left.bytes, right.bytes), ok_error()
 	}
 	return 0, ok_error()
@@ -910,6 +1046,10 @@ value_as_text :: proc(v: Value, span: sql.Span, allocator := context.allocator) 
 		return fmt.aprintf("%d", v.i, allocator = allocator), ok_error()
 	case .Float:
 		return fmt.aprintf("%g", v.f, allocator = allocator), ok_error()
+	case .Boolean:
+		return strings.clone("TRUE" if v.i != 0 else "FALSE", allocator), ok_error()
+	case .Uuid:
+		return format_uuid_canonical(v.bytes, allocator), ok_error()
 	case .Blob:
 		return {}, make_error(.Unsupported_Ast, "cannot concatenate BLOB", span = span)
 	}
@@ -983,8 +1123,12 @@ format_value_cell :: proc(v: Value, allocator := context.allocator) -> string {
 		return fmt.aprintf("%d", v.i, allocator = allocator)
 	case .Float:
 		return fmt.aprintf("%g", v.f, allocator = allocator)
+	case .Boolean:
+		return strings.clone("TRUE" if v.i != 0 else "FALSE", allocator)
 	case .Text:
 		return strings.clone(string(v.bytes), allocator)
+	case .Uuid:
+		return format_uuid_canonical(v.bytes, allocator)
 	case .Blob:
 		return format_blob_hex(v.bytes, allocator)
 	}

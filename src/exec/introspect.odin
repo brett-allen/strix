@@ -86,21 +86,63 @@ schema_sql_one :: proc(
 	strings.builder_init(&b, allocator)
 	defer strings.builder_destroy(&b)
 
-	fmt.sbprintf(&b, "CREATE TABLE %s (\n", table_name)
-	for col, i in entry.columns {
-		if i > 0 {
-			strings.write_string(&b, ",\n")
-		}
-		strings.write_string(&b, "  ")
-		write_column_def(&b, col)
-	}
-	strings.write_string(&b, "\n);\n")
+	pk_count := count_primary_key_columns(entry.columns)
+	composite_pk := pk_count > 1
 
 	idx_refs, ixerr := engine.catalog_indexes_on_table(e, table_name, allocator)
 	if ixerr != .None {
 		return "", from_engine_error(ixerr)
 	}
 	defer engine.free_catalog_index_refs(idx_refs, allocator)
+
+	// Composite PK column order from the matching system unique autoindex when present.
+	pk_index_names: []string
+	if composite_pk {
+		for ref in idx_refs {
+			if !is_system_autoindex_name(ref.name) || !engine.catalog_index_is_unique(ref.entry) {
+				continue
+			}
+			if index_columns_match_pk_set(ref.entry.columns, entry.columns) {
+				pk_index_names = make([]string, len(ref.entry.columns), allocator)
+				for c, i in ref.entry.columns {
+					pk_index_names[i] = c.name
+				}
+				break
+			}
+		}
+		if pk_index_names == nil {
+			// Fallback: table column order.
+			pk_index_names = make([]string, pk_count, allocator)
+			j := 0
+			for c in entry.columns {
+				if .Primary_Key in c.flags {
+					pk_index_names[j] = c.name
+					j += 1
+				}
+			}
+		}
+	}
+	defer if pk_index_names != nil { delete(pk_index_names, allocator) }
+
+	fmt.sbprintf(&b, "CREATE TABLE %s (\n", table_name)
+	for col, i in entry.columns {
+		if i > 0 {
+			strings.write_string(&b, ",\n")
+		}
+		strings.write_string(&b, "  ")
+		write_column_def(&b, col, omit_primary_key = composite_pk)
+	}
+	if composite_pk && len(pk_index_names) > 0 {
+		strings.write_string(&b, ",\n  PRIMARY KEY (")
+		for n, i in pk_index_names {
+			if i > 0 {
+				strings.write_string(&b, ", ")
+			}
+			strings.write_string(&b, n)
+		}
+		strings.write_string(&b, ")")
+	}
+	strings.write_string(&b, "\n);\n")
 
 	// Stable lexical order by index name.
 	if len(idx_refs) > 1 {
@@ -112,10 +154,15 @@ schema_sql_one :: proc(
 		if len(ref.entry.columns) == 0 {
 			continue // v1 rows without column meta — skip awkwardly empty INDEX
 		}
-		// Single-column system autoindexes are implied by PRIMARY KEY / UNIQUE on columns.
-		// Multi-column UNIQUE only exists as an autoindex — still emit those.
-		if is_system_autoindex_name(ref.name) && len(ref.entry.columns) == 1 {
-			continue
+		// System autoindexes implied by PRIMARY KEY / UNIQUE: hide single-col always;
+		// hide multi-col when it is the composite PRIMARY KEY (emitted in CREATE TABLE).
+		if is_system_autoindex_name(ref.name) {
+			if len(ref.entry.columns) == 1 {
+				continue
+			}
+			if composite_pk && index_columns_match_pk_set(ref.entry.columns, entry.columns) {
+				continue
+			}
 		}
 		if engine.catalog_index_is_unique(ref.entry) {
 			fmt.sbprintf(&b, "CREATE UNIQUE INDEX %s ON %s (", ref.name, table_name)
@@ -137,16 +184,41 @@ schema_sql_one :: proc(
 	return strings.clone(strings.to_string(b), allocator), ok_error()
 }
 
-write_column_def :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
+// index_columns_match_pk_set reports whether index cols are exactly the PK columns (any order).
+index_columns_match_pk_set :: proc(
+	index_cols: []engine.Catalog_Column,
+	table_cols: []engine.Catalog_Column,
+) -> bool {
+	pk_count := count_primary_key_columns(table_cols)
+	if pk_count == 0 || len(index_cols) != pk_count {
+		return false
+	}
+	for ic in index_cols {
+		found := false
+		for tc in table_cols {
+			if .Primary_Key in tc.flags && strings.equal_fold(tc.name, ic.name) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+write_column_def :: proc(b: ^strings.Builder, col: engine.Catalog_Column, omit_primary_key := false) {
 	strings.write_string(b, col.name)
 	if col.type_name != "" {
 		fmt.sbprintf(b, " %s", col.type_name)
 	}
-	// PRIMARY KEY implies NOT NULL; avoid redundant NOT NULL before PK.
+	show_pk := .Primary_Key in col.flags && !omit_primary_key
+	// PRIMARY KEY implies NOT NULL; avoid redundant NOT NULL (incl. composite table PK).
 	if .Not_Null in col.flags && .Primary_Key not_in col.flags {
 		strings.write_string(b, " NOT NULL")
 	}
-	if .Primary_Key in col.flags {
+	if show_pk {
 		strings.write_string(b, " PRIMARY KEY")
 	} else if .Unique in col.flags {
 		strings.write_string(b, " UNIQUE")
@@ -165,6 +237,8 @@ write_default_literal :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
 		fmt.sbprintf(b, "%d", col.default_i)
 	case .Float:
 		fmt.sbprintf(b, "%g", col.default_f)
+	case .Boolean:
+		strings.write_string(b, "TRUE" if col.default_i != 0 else "FALSE")
 	case .Text:
 		strings.write_byte(b, '\'')
 		for i in 0 ..< len(col.default_bytes) {
@@ -181,6 +255,12 @@ write_default_literal :: proc(b: ^strings.Builder, col: engine.Catalog_Column) {
 		for i in 0 ..< len(col.default_bytes) {
 			fmt.sbprintf(b, "%02X", col.default_bytes[i])
 		}
+		strings.write_byte(b, '\'')
+	case .Uuid:
+		canon := format_uuid_canonical(transmute([]u8)col.default_bytes)
+		defer delete(canon)
+		strings.write_byte(b, '\'')
+		strings.write_string(b, canon)
 		strings.write_byte(b, '\'')
 	}
 }

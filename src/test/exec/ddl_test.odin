@@ -31,11 +31,12 @@ test_create_preserves_type_names_and_table_pk :: proc(t: ^testing.T) {
 
 @(test)
 test_bind_rejects_empty_columns :: proc(t: ^testing.T) {
-	cols, uniq, err := exec.bind_create_table_columns(sql.Create_Table_Stmt{name = "t", elements = nil})
+	cols, uniq, pk, err := exec.bind_create_table_columns(sql.Create_Table_Stmt{name = "t", elements = nil})
 	testing.expect(t, exec.has_error(err))
 	testing.expect_value(t, err.code, exec.Exec_Error_Code.Invalid_Schema)
 	testing.expect(t, cols == nil)
 	testing.expect(t, uniq == nil)
+	testing.expect(t, pk == nil)
 	exec.free_error(err)
 }
 
@@ -176,23 +177,48 @@ test_bind_rejects_table_pk_unknown_column :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_create_rejects_composite_primary_key :: proc(t: ^testing.T) {
+test_create_accepts_composite_primary_key :: proc(t: ^testing.T) {
 	e, err := engine.engine_open_memory()
 	testing.expect(t, engine.ok(err))
 	defer engine.engine_close(&e)
 	s := exec.session_adopt(&e)
 
-	cases := []string{
-		"CREATE TABLE c (a INTEGER, b INTEGER, PRIMARY KEY (a, b));",
-		"CREATE TABLE c (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY);",
-	}
-	for sql_text in cases {
-		r, eerr := exec.exec_statement(&s, sql_text)
-		testing.expectf(t, exec.has_error(eerr), "expected error for %s", sql_text)
-		testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Unsupported_Ast)
-		exec.free_error(eerr)
-		exec.free_result(r)
-	}
+	r, eerr := exec.exec_statement(&s, "CREATE TABLE c (a INTEGER, b INTEGER, PRIMARY KEY (a, b));")
+	testing.expectf(t, !exec.has_error(eerr), "%s", eerr.message)
+	exec.free_error(eerr)
+	exec.free_result(r)
+
+	entry, gerr := engine.catalog_get_table_entry(&e, "c")
+	testing.expect(t, engine.ok(gerr))
+	testing.expect(t, .Primary_Key in entry.columns[0].flags)
+	testing.expect(t, .Primary_Key in entry.columns[1].flags)
+	testing.expect(t, .Not_Null in entry.columns[0].flags)
+	testing.expect(t, .Not_Null in entry.columns[1].flags)
+	engine.free_catalog_entry(entry)
+
+	idx, ierr := engine.catalog_get_index_entry(&e, "strix_autoindex_c_1")
+	testing.expect(t, engine.ok(ierr))
+	testing.expect(t, engine.catalog_index_is_unique(idx))
+	testing.expect_value(t, len(idx.columns), 2)
+	engine.free_catalog_entry(idx)
+}
+
+@(test)
+test_create_rejects_conflicting_primary_key :: proc(t: ^testing.T) {
+	e, err := engine.engine_open_memory()
+	testing.expect(t, engine.ok(err))
+	defer engine.engine_close(&e)
+	s := exec.session_adopt(&e)
+
+	// Column IPK + different composite table PK.
+	r, eerr := exec.exec_statement(
+		&s,
+		"CREATE TABLE c (id INTEGER PRIMARY KEY, a TEXT, b TEXT, PRIMARY KEY (a, b));",
+	)
+	testing.expect(t, exec.has_error(eerr))
+	testing.expect_value(t, eerr.code, exec.Exec_Error_Code.Invalid_Schema)
+	exec.free_error(eerr)
+	exec.free_result(r)
 }
 
 @(test)

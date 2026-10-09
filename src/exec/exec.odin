@@ -67,7 +67,7 @@ exec_script :: proc(
 			free_error(first_err)
 			return {}, fence_err
 		}
-		result, err := exec_statement_ast(s, stmt)
+		result, err := exec_statement_ast(s, stmt) // activates session binds for Placeholder eval
 		if has_error(err) {
 			free_result(result)
 			if s.txn_aborted {
@@ -144,6 +144,14 @@ exec_statement_ast :: proc(s: ^Exec_Session, stmt: sql.Statement) -> (Exec_Resul
 			span = stmt.span,
 		)
 	}
+	// Activate session bind table for Placeholder eval (F4). Nested calls restore.
+	prev_binds: ^Bind_Table
+	if s != nil {
+		prev_binds = bind_table_activate(&s.binds)
+	}
+	defer if s != nil {
+		bind_table_restore(prev_binds)
+	}
 	switch stmt.kind {
 	case .Create_Table:
 		return exec_create_table(s, stmt.data.(sql.Create_Table_Stmt), stmt.span)
@@ -176,6 +184,39 @@ exec_statement_ast :: proc(s: ^Exec_Session, stmt: sql.Statement) -> (Exec_Resul
 		)
 	}
 	return {}, make_error(.Unsupported_Ast, "unsupported statement", span = stmt.span)
+}
+
+// exec_statement_params binds `params` at 0..len-1 (cloned), checks arity against
+// placeholders in the statement, executes once, then clears session binds.
+// Caller retains ownership of `params` (and must free_value each if owned).
+exec_statement_params :: proc(
+	s: ^Exec_Session,
+	sql_text: string,
+	params: []Value,
+) -> (Exec_Result, Exec_Error) {
+	if s == nil || s.closed || s.eng == nil {
+		return {}, error_at(.Closed, "session is closed")
+	}
+
+	stmt, perr := sql.parse_statement(sql_text)
+	if sql.has_error(perr) {
+		err := from_parse_error(perr)
+		sql.free_error(perr)
+		return {}, err
+	}
+	defer sql.free_statement(stmt)
+
+	max_ph := collect_placeholder_max_statement(stmt)
+	if aerr := validate_bind_arity(max_ph, len(params), stmt.span); has_error(aerr) {
+		return {}, aerr
+	}
+
+	if berr := session_bind_all(s, params); has_error(berr) {
+		return {}, berr
+	}
+	defer session_clear_binds(s)
+
+	return exec_statement_ast(s, stmt)
 }
 
 statement_kind_label :: proc(kind: sql.Statement_Kind) -> string {

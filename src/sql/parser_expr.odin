@@ -377,12 +377,15 @@ parse_primary_expr :: proc(p: ^Parser) -> (^Expr, Parse_Error) {
 	case .Kw_Null:
 		next(p)
 		return make_literal(p, .Null, tok.text, tok.span), ok_error()
+	case .Kw_True, .Kw_False:
+		next(p)
+		return make_literal(p, .Boolean, tok.text, tok.span), ok_error()
 	case .Question:
 		next(p)
 		node := new(Expr, p.allocator)
 		node.kind = .Placeholder
 		node.span = tok.span
-		node.data = Placeholder_Data{index = placeholder_index_from_text(tok.text)}
+		node.data = Placeholder_Data{index = assign_placeholder_index(p, tok.text)}
 		return node, ok_error()
 	case .Star:
 		next(p)

@@ -33,6 +33,14 @@ column_from_def :: proc(col: sql.Column_Def) -> (engine.Catalog_Column, Exec_Err
 				)
 			}
 			flags += {.Has_Default}
+			// Typed bind for DEFAULT: UUID string → Uuid; BOOLEAN TRUE/FALSE already Boolean.
+			if cerr := coerce_value_for_column(
+				engine.Catalog_Column{name = col.name, type_name = col.type_name},
+				&def_val,
+			); has_error(cerr) {
+				free_value(def_val)
+				return {}, cerr
+			}
 			switch def_val.kind {
 			case .Null:
 				out.default_kind = .Null
@@ -42,12 +50,19 @@ column_from_def :: proc(col: sql.Column_Def) -> (engine.Catalog_Column, Exec_Err
 			case .Float:
 				out.default_kind = .Float
 				out.default_f = def_val.f
+			case .Boolean:
+				out.default_kind = .Boolean
+				out.default_i = def_val.i
 			case .Text:
 				out.default_kind = .Text
 				out.default_bytes = string(def_val.bytes) // owned; Catalog_Column takes ownership
 				def_val.bytes = nil
 			case .Blob:
 				out.default_kind = .Blob
+				out.default_bytes = string(def_val.bytes)
+				def_val.bytes = nil
+			case .Uuid:
+				out.default_kind = .Uuid
 				out.default_bytes = string(def_val.bytes)
 				def_val.bytes = nil
 			}
@@ -122,22 +137,20 @@ append_unique_set_if_new :: proc(
 }
 
 // collect_create_table_unique_sets builds unique index column sets for non-IPK PK and UNIQUE.
+// pk_ordered is the PRIMARY KEY column list in constraint order (empty if no PK).
 collect_create_table_unique_sets :: proc(
 	cols: []engine.Catalog_Column,
 	table_unique: []Unique_Col_Set,
+	pk_ordered: []string,
 	allocator := context.allocator,
 ) -> []Unique_Col_Set {
 	out := make([dynamic]Unique_Col_Set, 0, 4, allocator)
 	ipk := find_ipk_column(cols)
 
-	// Non-IPK single-column PRIMARY KEY → unique index.
-	if pk_count := count_primary_key_columns(cols); pk_count == 1 {
-		for c, i in cols {
-			if .Primary_Key in c.flags && i != ipk {
-				append_unique_set_if_new(&out, []string{c.name}, allocator)
-				break
-			}
-		}
+	// Non-IPK PRIMARY KEY (single-column or composite) → unique index.
+	// Sole INTEGER/INT PK aliases rowid — no secondary unique index.
+	if len(pk_ordered) > 0 && !(len(pk_ordered) == 1 && ipk >= 0) {
+		append_unique_set_if_new(&out, pk_ordered, allocator)
 	}
 
 	// Column-level UNIQUE (skip IPK — rowid already enforces uniqueness).
@@ -178,10 +191,12 @@ is_system_autoindex_name :: proc(name: string) -> bool {
 bind_create_table_columns :: proc(
 	stmt: sql.Create_Table_Stmt,
 	allocator := context.allocator,
-) -> ([]engine.Catalog_Column, []Unique_Col_Set, Exec_Error) {
+) -> ([]engine.Catalog_Column, []Unique_Col_Set, []string, Exec_Error) {
 	cols := make([dynamic]engine.Catalog_Column, 0, len(stmt.elements), allocator)
 	pk_from_table: [dynamic]string
 	defer delete(pk_from_table)
+	table_pk_span: sql.Span
+	saw_table_pk := false
 	table_unique := make([dynamic]Unique_Col_Set, 0, 2, allocator)
 
 	for el in stmt.elements {
@@ -191,21 +206,32 @@ bind_create_table_columns :: proc(
 			if has_error(err) {
 				free_bound_columns(cols[:], allocator)
 				free_unique_col_sets(table_unique[:], allocator)
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			append(&cols, col)
 		case .Table_Constraint:
 			#partial switch el.table_constraint.kind {
 			case .Primary_Key:
-				if len(el.table_constraint.columns) > 1 {
+				if saw_table_pk {
 					free_bound_columns(cols[:], allocator)
 					free_unique_col_sets(table_unique[:], allocator)
-					return nil, nil, make_error(
-						.Unsupported_Ast,
-						"composite PRIMARY KEY is not supported yet",
+					return nil, nil, nil, make_error(
+						.Invalid_Schema,
+						"multiple PRIMARY KEY constraints",
 						span = el.table_constraint.span,
 					)
 				}
+				if len(el.table_constraint.columns) == 0 {
+					free_bound_columns(cols[:], allocator)
+					free_unique_col_sets(table_unique[:], allocator)
+					return nil, nil, nil, make_error(
+						.Invalid_Schema,
+						"PRIMARY KEY requires at least one column",
+						span = el.table_constraint.span,
+					)
+				}
+				saw_table_pk = true
+				table_pk_span = el.table_constraint.span
 				for name in el.table_constraint.columns {
 					append(&pk_from_table, name)
 				}
@@ -213,7 +239,7 @@ bind_create_table_columns :: proc(
 				if len(el.table_constraint.columns) == 0 {
 					free_bound_columns(cols[:], allocator)
 					free_unique_col_sets(table_unique[:], allocator)
-					return nil, nil, make_error(
+					return nil, nil, nil, make_error(
 						.Invalid_Schema,
 						"UNIQUE constraint requires at least one column",
 						span = el.table_constraint.span,
@@ -227,7 +253,7 @@ bind_create_table_columns :: proc(
 			case:
 				free_bound_columns(cols[:], allocator)
 				free_unique_col_sets(table_unique[:], allocator)
-				return nil, nil, make_error(
+				return nil, nil, nil, make_error(
 					.Unsupported_Ast,
 					"table constraint %v is not supported yet",
 					el.table_constraint.kind,
@@ -240,11 +266,50 @@ bind_create_table_columns :: proc(
 	if len(cols) == 0 {
 		free_bound_columns(cols[:], allocator)
 		free_unique_col_sets(table_unique[:], allocator)
-		return nil, nil, error_at(.Invalid_Schema, "CREATE TABLE requires at least one column")
+		return nil, nil, nil, error_at(.Invalid_Schema, "CREATE TABLE requires at least one column")
+	}
+
+	// Reject column-level PK mixed with a different / composite table PRIMARY KEY.
+	// Allowed: sole column `c PRIMARY KEY` with `PRIMARY KEY (c)` (same column).
+	n_col_pk := 0
+	sole_col_pk := ""
+	for c in cols {
+		if .Primary_Key in c.flags {
+			n_col_pk += 1
+			sole_col_pk = c.name
+		}
+	}
+	if saw_table_pk && n_col_pk > 0 {
+		same_sole :=
+			n_col_pk == 1 &&
+			len(pk_from_table) == 1 &&
+			strings.equal_fold(sole_col_pk, pk_from_table[0])
+		if !same_sole {
+			free_bound_columns(cols[:], allocator)
+			free_unique_col_sets(table_unique[:], allocator)
+			return nil, nil, nil, make_error(
+				.Invalid_Schema,
+				"conflicting PRIMARY KEY constraints",
+				span = table_pk_span,
+			)
+		}
 	}
 
 	// Apply table-level PRIMARY KEY to matching columns (case-insensitive).
-	for pk_name in pk_from_table {
+	for i in 0 ..< len(pk_from_table) {
+		pk_name := pk_from_table[i]
+		for j in i + 1 ..< len(pk_from_table) {
+			if strings.equal_fold(pk_name, pk_from_table[j]) {
+				free_bound_columns(cols[:], allocator)
+				free_unique_col_sets(table_unique[:], allocator)
+				return nil, nil, nil, make_error(
+					.Invalid_Schema,
+					"duplicate column %q in PRIMARY KEY",
+					pk_name,
+					span = table_pk_span,
+				)
+			}
+		}
 		found := false
 		for &c in cols {
 			if strings.equal_fold(c.name, pk_name) {
@@ -256,7 +321,7 @@ bind_create_table_columns :: proc(
 		if !found {
 			free_bound_columns(cols[:], allocator)
 			free_unique_col_sets(table_unique[:], allocator)
-			return nil, nil, make_error(
+			return nil, nil, nil, make_error(
 				.Invalid_Schema,
 				"PRIMARY KEY column %q not found",
 				pk_name,
@@ -282,7 +347,7 @@ bind_create_table_columns :: proc(
 			if !found {
 				free_bound_columns(cols[:], allocator)
 				free_unique_col_sets(table_unique[:], allocator)
-				return nil, nil, make_error(
+				return nil, nil, nil, make_error(
 					.Invalid_Schema,
 					"UNIQUE column %q not found",
 					name,
@@ -291,7 +356,7 @@ bind_create_table_columns :: proc(
 		}
 	}
 
-	// PRIMARY KEY implies NOT NULL (including non-IPK TEXT/UUID-style PKs).
+	// PRIMARY KEY implies NOT NULL (including composite and non-IPK TEXT/UUID-style PKs).
 	for &c in cols {
 		if .Primary_Key in c.flags {
 			c.flags += {.Not_Null}
@@ -305,19 +370,39 @@ bind_create_table_columns :: proc(
 				name := cols[i].name
 				free_bound_columns(cols[:], allocator)
 				free_unique_col_sets(table_unique[:], allocator)
-				return nil, nil, make_error(.Invalid_Schema, "duplicate column name %q", name)
+				return nil, nil, nil, make_error(.Invalid_Schema, "duplicate column name %q", name)
 			}
 		}
 	}
 
-	// Reject composite PK before cataloguing.
-	if pkerr := validate_primary_key_shape(cols[:]); has_error(pkerr) {
-		free_bound_columns(cols[:], allocator)
-		free_unique_col_sets(table_unique[:], allocator)
-		return nil, nil, pkerr
+	// Ordered PK column names: table constraint order, else table column order.
+	pk_ordered: []string
+	if len(pk_from_table) > 0 {
+		pk_ordered = make([]string, len(pk_from_table), allocator)
+		for n, i in pk_from_table {
+			// Use catalog column name casing.
+			for c in cols {
+				if strings.equal_fold(c.name, n) {
+					pk_ordered[i] = c.name
+					break
+				}
+			}
+		}
+	} else {
+		pk_count := count_primary_key_columns(cols[:])
+		if pk_count > 0 {
+			pk_ordered = make([]string, pk_count, allocator)
+			j := 0
+			for c in cols {
+				if .Primary_Key in c.flags {
+					pk_ordered[j] = c.name
+					j += 1
+				}
+			}
+		}
 	}
 
-	return cols[:], table_unique[:], ok_error()
+	return cols[:], table_unique[:], pk_ordered, ok_error()
 }
 
 register_system_unique_indexes :: proc(
@@ -325,10 +410,11 @@ register_system_unique_indexes :: proc(
 	table_name: string,
 	cols: []engine.Catalog_Column,
 	table_unique: []Unique_Col_Set,
+	pk_ordered: []string,
 	span: sql.Span,
 	allocator := context.allocator,
 ) -> Exec_Error {
-	sets := collect_create_table_unique_sets(cols, table_unique, allocator)
+	sets := collect_create_table_unique_sets(cols, table_unique, pk_ordered, allocator)
 	defer free_unique_col_sets(sets, allocator)
 
 	for s, i in sets {
@@ -388,12 +474,13 @@ exec_create_table :: proc(s: ^Exec_Session, stmt: sql.Create_Table_Stmt, span: s
 		return {}, error_at(.Closed, "session is closed", span)
 	}
 
-	columns, table_unique, berr := bind_create_table_columns(stmt)
+	columns, table_unique, pk_ordered, berr := bind_create_table_columns(stmt)
 	if has_error(berr) {
 		return {}, berr
 	}
 	defer free_bound_columns(columns)
 	defer free_unique_col_sets(table_unique)
+	defer if pk_ordered != nil { delete(pk_ordered) }
 
 	started, btxn := stmt_write_begin(s, e, span)
 	if has_error(btxn) {
@@ -415,7 +502,7 @@ exec_create_table :: proc(s: ^Exec_Session, stmt: sql.Create_Table_Stmt, span: s
 		return {}, finish_write_error(s, e, started, from_engine_error(rerr, span), span)
 	}
 
-	if ierr := register_system_unique_indexes(e, stmt.name, columns, table_unique, span); has_error(ierr) {
+	if ierr := register_system_unique_indexes(e, stmt.name, columns, table_unique, pk_ordered, span); has_error(ierr) {
 		return {}, finish_write_error(s, e, started, ierr, span)
 	}
 

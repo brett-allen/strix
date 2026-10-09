@@ -54,6 +54,7 @@ Already landed (do not re-implement):
 - A second SQL dialect, `PRAGMA` execution, or inventing SQL for introspection when a `.command` is the right tool.
 - Changing batch `strix sql` semantics (exit codes, `-c`, stdin) except shared helpers refactored without behavior change.
 - GUI / web console.
+- Prepared-parameter UX (`.param` / bind helpers): execute **F4** provides a session API (`session_bind*` / `exec_statement_params`); shell/batch remain literals-in-SQL until a later shell plan.
 
 ---
 

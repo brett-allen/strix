@@ -440,7 +440,7 @@ collect_update_rewrites :: proc(
 				delete(out)
 				return nil, eerr
 			}
-			if cerr := check_value_matches_column_type(columns[a.col_idx], new_v); has_error(cerr) {
+			if cerr := check_value_matches_column_type(columns[a.col_idx], &new_v); has_error(cerr) {
 				free_value(new_v)
 				free_values(vals)
 				delete(old_payload, allocator)

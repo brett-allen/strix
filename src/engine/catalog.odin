@@ -32,6 +32,8 @@ Catalog_Default_Kind :: enum u8 {
 	Float   = 3,
 	Text    = 4,
 	Blob    = 5,
+	Boolean = 6,
+	Uuid    = 7, // 16-byte default in default_bytes
 }
 
 Catalog_Column :: struct {
@@ -92,6 +94,10 @@ catalog_default_payload_size :: proc(c: Catalog_Column) -> int {
 		return 1 // kind byte only
 	case .Integer, .Float:
 		return 1 + 8
+	case .Boolean:
+		return 1 + 1
+	case .Uuid:
+		return 1 + 16
 	case .Text, .Blob:
 		return 1 + 4 + len(c.default_bytes)
 	}
@@ -206,6 +212,16 @@ encode_catalog_row :: proc(
 			case .Float:
 				endian.put_f64(buf[off:off + 8], .Little, c.default_f)
 				off += 8
+			case .Boolean:
+				buf[off] = u8(1 if c.default_i != 0 else 0)
+				off += 1
+			case .Uuid:
+				n := len(c.default_bytes)
+				if n > 16 {
+					n = 16
+				}
+				copy(buf[off:off + n], transmute([]u8)c.default_bytes[:n])
+				off += 16
 			case .Text, .Blob:
 				endian.put_u32(buf[off:off + 4], .Little, u32(len(c.default_bytes)))
 				off += 4
@@ -407,6 +423,24 @@ decode_catalog_row :: proc(payload: []u8, allocator := context.allocator) -> (Ca
 				}
 				col.default_f = f
 				off += 8
+			case .Boolean:
+				if off >= len(payload) {
+					delete(name, allocator)
+					delete(type_name, allocator)
+					free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+					return {}, .Corrupt
+				}
+				col.default_i = i64(1 if payload[off] != 0 else 0)
+				off += 1
+			case .Uuid:
+				if off + 16 > len(payload) {
+					delete(name, allocator)
+					delete(type_name, allocator)
+					free_catalog_entry(Catalog_Entry{columns = cols[:i]})
+					return {}, .Corrupt
+				}
+				col.default_bytes = strings.clone(string(payload[off:off + 16]), allocator)
+				off += 16
 			case .Text, .Blob:
 				if off + 4 > len(payload) {
 					delete(name, allocator)
